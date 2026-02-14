@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -66,7 +66,7 @@ pub struct BucketState {
     /// Validated bucket name.
     pub name: String,
     /// Absolute path to the bucket root directory.
-    pub root: std::path::PathBuf,
+    pub root: PathBuf,
     /// Persisted config.
     pub config: BucketConfig,
 }
@@ -154,4 +154,169 @@ pub fn derive_bucket_name(path: &Path) -> Result<String, BucketNameError> {
 
     validate_bucket_name(&result)?;
     Ok(result)
+}
+
+// ── Config loading / generation ───────────────────────────────────────────
+
+/// Load a bucket config from `.shoebox/config.toml`, or generate a default one.
+///
+/// If the file doesn't exist, creates it with a generated admin credential.
+/// Returns the loaded or generated config.
+pub async fn load_or_create_bucket_config(bucket_root: &Path) -> std::io::Result<BucketConfig> {
+    let shoebox_dir = bucket_root.join(SHOEBOX_DIR);
+    let config_path = shoebox_dir.join(CONFIG_FILE);
+
+    if config_path.exists() {
+        let contents = tokio::fs::read_to_string(&config_path).await?;
+        let config: BucketConfig = toml::from_str(&contents).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to parse {}: {e}", config_path.display()),
+            )
+        })?;
+        return Ok(config);
+    }
+
+    // Generate default config
+    tokio::fs::create_dir_all(&shoebox_dir).await?;
+
+    let config = BucketConfig {
+        bucket_name: None,
+        versioning_enabled: false,
+        credentials: vec![Credential {
+            access_key_id: generate_access_key_id(),
+            secret_access_key: generate_secret_access_key(),
+            description: Some("Full access (admin)".to_string()),
+            permissions: None,
+        }],
+    };
+
+    let toml_str = toml::to_string_pretty(&config).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to serialize config: {e}"),
+        )
+    })?;
+
+    tokio::fs::write(&config_path, &toml_str).await?;
+
+    // Set file permissions to 0600 (owner read/write only) since it contains secrets
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        tokio::fs::set_permissions(&config_path, perms).await?;
+    }
+
+    Ok(config)
+}
+
+/// Resolve a directory path into a full `BucketState`.
+pub async fn resolve_bucket(path: &Path) -> Result<BucketState, Box<dyn std::error::Error>> {
+    let root = tokio::fs::canonicalize(path).await?;
+    let config = load_or_create_bucket_config(&root).await?;
+
+    let name = match &config.bucket_name {
+        Some(n) => {
+            validate_bucket_name(n)?;
+            n.clone()
+        }
+        None => derive_bucket_name(&root)?,
+    };
+
+    Ok(BucketState {
+        name,
+        root,
+        config,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_derive_bucket_name_simple() {
+        let path = Path::new("/home/user/photos");
+        assert_eq!(derive_bucket_name(path).unwrap(), "photos");
+    }
+
+    #[test]
+    fn test_derive_bucket_name_uppercase() {
+        let path = Path::new("/home/user/My-Photos");
+        assert_eq!(derive_bucket_name(path).unwrap(), "my-photos");
+    }
+
+    #[test]
+    fn test_derive_bucket_name_special_chars() {
+        let path = Path::new("/home/user/my_cool_photos!");
+        assert_eq!(derive_bucket_name(path).unwrap(), "my-cool-photos");
+    }
+
+    #[test]
+    fn test_derive_bucket_name_short() {
+        let path = Path::new("/home/user/ab");
+        let name = derive_bucket_name(path).unwrap();
+        assert!(name.len() >= 3);
+    }
+
+    #[test]
+    fn test_generate_access_key_id_format() {
+        let key = generate_access_key_id();
+        assert!(key.starts_with("AKIA"));
+        assert_eq!(key.len(), 20);
+    }
+
+    #[test]
+    fn test_generate_secret_access_key_length() {
+        let key = generate_secret_access_key();
+        assert_eq!(key.len(), 40);
+    }
+
+    #[tokio::test]
+    async fn test_load_or_create_bucket_config_creates_new() {
+        let tmp = TempDir::new().unwrap();
+        let config = load_or_create_bucket_config(tmp.path()).await.unwrap();
+
+        assert!(!config.versioning_enabled);
+        assert_eq!(config.credentials.len(), 1);
+        assert!(config.credentials[0].access_key_id.starts_with("AKIA"));
+
+        // File should exist now
+        let config_path = tmp.path().join(SHOEBOX_DIR).join(CONFIG_FILE);
+        assert!(config_path.exists());
+
+        // Verify 0600 permissions on unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&config_path).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_or_create_bucket_config_loads_existing() {
+        let tmp = TempDir::new().unwrap();
+        let shoebox_dir = tmp.path().join(SHOEBOX_DIR);
+        std::fs::create_dir_all(&shoebox_dir).unwrap();
+
+        let config_toml = r#"
+bucket_name = "my-custom-bucket"
+versioning_enabled = true
+
+[[credentials]]
+access_key_id = "AKIATEST1234567890AB"
+secret_access_key = "testSecretKey1234567890123456789012345678"
+description = "Test credential"
+"#;
+        std::fs::write(shoebox_dir.join(CONFIG_FILE), config_toml).unwrap();
+
+        let config = load_or_create_bucket_config(tmp.path()).await.unwrap();
+        assert_eq!(config.bucket_name.as_deref(), Some("my-custom-bucket"));
+        assert!(config.versioning_enabled);
+        assert_eq!(config.credentials.len(), 1);
+        assert_eq!(config.credentials[0].access_key_id, "AKIATEST1234567890AB");
+    }
 }
