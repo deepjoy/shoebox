@@ -109,7 +109,11 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// Update an existing object record (upsert by key).
+    /// Insert or update an object record, keyed by `key`.
+    ///
+    /// On conflict the existing row's `id` and `created_at` are preserved
+    /// (i.e. the values in the supplied `ObjectRecord` are ignored for those
+    /// two columns on update). All other fields are overwritten.
     pub async fn upsert_object(&self, obj: &ObjectRecord) -> Result<(), S3Error> {
         sqlx::query(
             r#"INSERT INTO objects (
@@ -197,6 +201,11 @@ impl MetadataStore {
         .await?;
 
         Ok(records)
+    }
+
+    /// Gracefully close the metadata store, flushing WAL to the main database.
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 
     /// Get the total count of objects in the store.

@@ -46,11 +46,28 @@ note "Point shoebox at any directory to serve it as an S3 bucket."
 note "Credentials are generated automatically on first run."
 sleep "$DELAY"
 
-step "Serving a single directory"
+step "Serving a single directory (first run)"
+note "On first run, credentials are generated and displayed automatically."
 run "SHOEBOX_LOG=off $SHOEBOX '$DEMO_ROOT/Photos'"
 
 # ============================================================================
-# Part 2 — Multiple buckets
+# Part 2 — Subsequent run hides secrets
+# ============================================================================
+
+banner "Subsequent runs"
+
+note "On subsequent runs, secrets are hidden by default."
+note "Pass --show-secrets to reveal them again."
+sleep "$DELAY"
+
+step "Re-running the same directory"
+run "SHOEBOX_LOG=off $SHOEBOX '$DEMO_ROOT/Photos'"
+
+step "With --show-secrets"
+run "SHOEBOX_LOG=off $SHOEBOX --show-secrets '$DEMO_ROOT/Photos'"
+
+# ============================================================================
+# Part 3 — Multiple buckets
 # ============================================================================
 
 banner "Multiple directories at once"
@@ -62,7 +79,7 @@ step "Serving three directories"
 run "SHOEBOX_LOG=off $SHOEBOX '$DEMO_ROOT/Photos' '$DEMO_ROOT/Videos' '$DEMO_ROOT/Documents'"
 
 # ============================================================================
-# Part 3 — Custom host and port
+# Part 4 — Custom host and port
 # ============================================================================
 
 step "Custom host and port"

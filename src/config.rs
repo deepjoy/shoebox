@@ -29,6 +29,10 @@ pub struct ServerConfig {
     /// Listen port.
     #[arg(long, default_value_t = 9000, env = "SHOEBOX_PORT")]
     pub port: u16,
+
+    /// Print secret access keys on startup.
+    #[arg(long, default_value_t = false)]
+    pub show_secrets: bool,
 }
 
 // ── Per-bucket config (.shoebox/config.toml) ──────────────────────────────
@@ -69,6 +73,8 @@ pub struct BucketState {
     pub root: PathBuf,
     /// Persisted config.
     pub config: BucketConfig,
+    /// True when the config was generated for the first time this run.
+    pub freshly_created: bool,
 }
 
 // ── Key generation ────────────────────────────────────────────────────────
@@ -161,8 +167,8 @@ pub fn derive_bucket_name(path: &Path) -> Result<String, BucketNameError> {
 /// Load a bucket config from `.shoebox/config.toml`, or generate a default one.
 ///
 /// If the file doesn't exist, creates it with a generated admin credential.
-/// Returns the loaded or generated config.
-pub async fn load_or_create_bucket_config(bucket_root: &Path) -> std::io::Result<BucketConfig> {
+/// Returns `(config, freshly_created)`.
+pub async fn load_or_create_bucket_config(bucket_root: &Path) -> std::io::Result<(BucketConfig, bool)> {
     let shoebox_dir = bucket_root.join(SHOEBOX_DIR);
     let config_path = shoebox_dir.join(CONFIG_FILE);
 
@@ -174,7 +180,7 @@ pub async fn load_or_create_bucket_config(bucket_root: &Path) -> std::io::Result
                 format!("Failed to parse {}: {e}", config_path.display()),
             )
         })?;
-        return Ok(config);
+        return Ok((config, false));
     }
 
     // Generate default config
@@ -208,13 +214,13 @@ pub async fn load_or_create_bucket_config(bucket_root: &Path) -> std::io::Result
         tokio::fs::set_permissions(&config_path, perms).await?;
     }
 
-    Ok(config)
+    Ok((config, true))
 }
 
 /// Resolve a directory path into a full `BucketState`.
 pub async fn resolve_bucket(path: &Path) -> Result<BucketState, Box<dyn std::error::Error>> {
     let root = tokio::fs::canonicalize(path).await?;
-    let config = load_or_create_bucket_config(&root).await?;
+    let (config, freshly_created) = load_or_create_bucket_config(&root).await?;
 
     let name = match &config.bucket_name {
         Some(n) => {
@@ -228,6 +234,7 @@ pub async fn resolve_bucket(path: &Path) -> Result<BucketState, Box<dyn std::err
         name,
         root,
         config,
+        freshly_created,
     })
 }
 
@@ -277,8 +284,9 @@ mod tests {
     #[tokio::test]
     async fn test_load_or_create_bucket_config_creates_new() {
         let tmp = TempDir::new().unwrap();
-        let config = load_or_create_bucket_config(tmp.path()).await.unwrap();
+        let (config, freshly_created) = load_or_create_bucket_config(tmp.path()).await.unwrap();
 
+        assert!(freshly_created);
         assert!(!config.versioning_enabled);
         assert_eq!(config.credentials.len(), 1);
         assert!(config.credentials[0].access_key_id.starts_with("AKIA"));
@@ -313,7 +321,8 @@ description = "Test credential"
 "#;
         std::fs::write(shoebox_dir.join(CONFIG_FILE), config_toml).unwrap();
 
-        let config = load_or_create_bucket_config(tmp.path()).await.unwrap();
+        let (config, freshly_created) = load_or_create_bucket_config(tmp.path()).await.unwrap();
+        assert!(!freshly_created);
         assert_eq!(config.bucket_name.as_deref(), Some("my-custom-bucket"));
         assert!(config.versioning_enabled);
         assert_eq!(config.credentials.len(), 1);

@@ -84,10 +84,26 @@ impl S3Error {
   <RequestId>{}</RequestId>
 </Error>"#,
             self.code(),
-            self.message(),
-            request_id
+            escape_xml(&self.message()),
+            escape_xml(request_id)
         )
     }
+}
+
+/// Escape XML special characters in a string.
+fn escape_xml(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 impl IntoResponse for S3Error {

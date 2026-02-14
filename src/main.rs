@@ -36,8 +36,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     for bucket in &buckets {
+        let show = config.show_secrets || bucket.freshly_created;
         println!("  {} → {}", bucket.name, bucket.root.display());
-        println!("    Credentials:");
+        if bucket.freshly_created {
+            println!("    (new) Credentials generated:");
+        } else {
+            println!("    Credentials:");
+        }
         for (i, cred) in bucket.config.credentials.iter().enumerate() {
             let desc = cred
                 .description
@@ -49,12 +54,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cred.access_key_id,
                 desc
             );
-            println!("          Secret: {}", cred.secret_access_key);
+            if show {
+                println!("          Secret: {}", cred.secret_access_key);
+            }
         }
         println!();
     }
 
     println!("Credentials saved to .shoebox/config.toml");
+    if !config.show_secrets {
+        println!("Use --show-secrets to display secret access keys");
+    }
 
     // TODO: Add the Axum router and server here
     tracing::info!("Server startup complete (no HTTP listener yet — Phase 2)");

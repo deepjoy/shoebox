@@ -22,3 +22,6 @@ target
 .claude
 .devcontainer
 .vscode
+
+# Per-bucket metadata directory (contains credentials)
+.shoebox/

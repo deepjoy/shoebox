@@ -1,6 +1,7 @@
 -- Object metadata
 CREATE TABLE IF NOT EXISTS objects (
     id TEXT PRIMARY KEY,
+    -- UNIQUE implies an implicit index; no explicit CREATE INDEX needed for key lookups.
     key TEXT NOT NULL UNIQUE,
     parent_directory TEXT NOT NULL,
     is_directory BOOLEAN NOT NULL DEFAULT FALSE,

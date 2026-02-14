@@ -47,7 +47,15 @@ impl FilesystemStorage {
 
     /// Resolve a key to an absolute path, ensuring it stays within the bucket
     /// and that no intermediate path component is a symlink.
-    pub fn resolve_path(&self, key: &str) -> Result<PathBuf, S3Error> {
+    ///
+    /// # Security: TOCTOU caveat
+    ///
+    /// The intermediate-symlink check is inherently racy: a directory could be
+    /// swapped for a symlink between this check and the subsequent file
+    /// operation. This is a fundamental limitation of path-based filesystem
+    /// security. For a race-free solution on Linux, consider `openat2` with
+    /// `RESOLVE_NO_SYMLINKS` in the future.
+    pub async fn resolve_path(&self, key: &str) -> Result<PathBuf, S3Error> {
         // Reject empty keys
         if key.is_empty() {
             return Err(S3Error::InvalidArgument);
@@ -81,7 +89,7 @@ impl FilesystemStorage {
             let mut check = self.root.clone();
             for component in parent.components() {
                 check.push(component);
-                if let Ok(meta) = std::fs::symlink_metadata(&check) {
+                if let Ok(meta) = tokio::fs::symlink_metadata(&check).await {
                     if meta.file_type().is_symlink() {
                         return Err(S3Error::AccessDenied);
                     }
@@ -94,7 +102,7 @@ impl FilesystemStorage {
 
     /// Check if a key exists on disk (symlink-aware — does not follow links).
     pub async fn exists(&self, key: &str) -> Result<bool, S3Error> {
-        let path = self.resolve_path(key)?;
+        let path = self.resolve_path(key).await?;
         Ok(tokio::fs::symlink_metadata(&path).await.is_ok())
     }
 
@@ -103,7 +111,7 @@ impl FilesystemStorage {
     /// Regular files return a file handle; symlinks return their target
     /// string as content (the link is never followed).
     pub async fn get(&self, key: &str) -> Result<FileContent, S3Error> {
-        let path = self.resolve_path(key)?;
+        let path = self.resolve_path(key).await?;
 
         let meta = tokio::fs::symlink_metadata(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -135,12 +143,16 @@ impl FilesystemStorage {
     ///
     /// If the target path is currently a symlink it is removed first — writes
     /// never follow symlinks.
+    ///
+    /// Parent directories are created automatically via `create_dir_all`.
+    /// These empty directories may appear as spurious common prefixes if the
+    /// bucket is subsequently listed before any objects are written into them.
     pub async fn put(
         &self,
         key: &str,
         mut stream: impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
     ) -> Result<WriteResult, S3Error> {
-        let path = self.resolve_path(key)?;
+        let path = self.resolve_path(key).await?;
 
         // Create parent directories
         if let Some(parent) = path.parent() {
@@ -165,7 +177,7 @@ impl FilesystemStorage {
             written += chunk.len() as u64;
         }
 
-        file.flush().await?;
+        file.sync_all().await?;
 
         let md5_hex = hex::encode(hasher.finalize());
 
@@ -178,7 +190,7 @@ impl FilesystemStorage {
     /// Delete a key from disk.  For symlinks this removes the link itself,
     /// not the target — no special handling required.
     pub async fn delete(&self, key: &str) -> Result<(), S3Error> {
-        let path = self.resolve_path(key)?;
+        let path = self.resolve_path(key).await?;
         tokio::fs::remove_file(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 S3Error::NoSuchKey
@@ -199,35 +211,35 @@ mod tests {
         FilesystemStorage::new(tmp.path().to_path_buf())
     }
 
-    #[test]
-    fn test_resolve_path_valid_key() {
+    #[tokio::test]
+    async fn test_resolve_path_valid_key() {
         let tmp = TempDir::new().unwrap();
         let storage = make_storage(&tmp);
-        let path = storage.resolve_path("photos/cat.jpg").unwrap();
+        let path = storage.resolve_path("photos/cat.jpg").await.unwrap();
         assert!(path.starts_with(tmp.path()));
         assert!(path.ends_with("photos/cat.jpg"));
     }
 
-    #[test]
-    fn test_resolve_path_traversal_blocked() {
+    #[tokio::test]
+    async fn test_resolve_path_traversal_blocked() {
         let tmp = TempDir::new().unwrap();
         let storage = make_storage(&tmp);
-        assert!(storage.resolve_path("../../etc/passwd").is_err());
+        assert!(storage.resolve_path("../../etc/passwd").await.is_err());
     }
 
-    #[test]
-    fn test_resolve_path_shoebox_dir_blocked() {
+    #[tokio::test]
+    async fn test_resolve_path_shoebox_dir_blocked() {
         let tmp = TempDir::new().unwrap();
         let storage = make_storage(&tmp);
-        assert!(storage.resolve_path(".shoebox/config.toml").is_err());
-        assert!(storage.resolve_path("foo/.shoebox/bar").is_err());
+        assert!(storage.resolve_path(".shoebox/config.toml").await.is_err());
+        assert!(storage.resolve_path("foo/.shoebox/bar").await.is_err());
     }
 
-    #[test]
-    fn test_resolve_path_empty_key_blocked() {
+    #[tokio::test]
+    async fn test_resolve_path_empty_key_blocked() {
         let tmp = TempDir::new().unwrap();
         let storage = make_storage(&tmp);
-        assert!(storage.resolve_path("").is_err());
+        assert!(storage.resolve_path("").await.is_err());
     }
 
     #[tokio::test]
@@ -331,7 +343,7 @@ mod tests {
         let link_path = tmp.path().join("link-to-etc");
         std::os::unix::fs::symlink("/etc", &link_path).unwrap();
 
-        match storage.resolve_path("link-to-etc/passwd") {
+        match storage.resolve_path("link-to-etc/passwd").await {
             Err(S3Error::AccessDenied) => {}
             other => panic!("Expected AccessDenied, got {:?}", other),
         }
