@@ -1,0 +1,16 @@
+[package]
+name = "shoebox"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Lightweight S3-compatible object storage backed by local filesystem"
+repository = "https://github.com/shoebox/shoebox"
+keywords = ["s3", "storage", "object-storage", "aws"]
+categories = ["filesystem", "web-programming::http-server", "api-bindings"]
+readme = "README.md"
+
+[lib]
+name = "shoebox"
+path = "src/lib.rs"
+
+[dependencies]
