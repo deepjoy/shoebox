@@ -14,3 +14,8 @@ name = "shoebox"
 path = "src/lib.rs"
 
 [dependencies]
+# Error handling
+thiserror = "2.0"
+
+# Web framework (StatusCode, IntoResponse)
+axum = { version = "0.8", features = ["macros"] }
