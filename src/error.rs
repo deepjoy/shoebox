@@ -123,3 +123,181 @@ impl From<sqlx::Error> for S3Error {
         Self::InternalError
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum BucketNameError {
+    #[error("Bucket name must be between 3 and 63 characters long, got {0}")]
+    InvalidLength(usize),
+
+    #[error("Bucket name can only contain lowercase letters, numbers, hyphens, and periods")]
+    InvalidCharacters,
+
+    #[error("Bucket name must start and end with a letter or number")]
+    InvalidStartEnd,
+
+    #[error("Bucket name must not contain consecutive hyphens or periods")]
+    ConsecutiveHyphensOrPeriods,
+
+    #[error("Bucket name must not be formatted as an IP address")]
+    LooksLikeIpAddress,
+}
+
+/// Validate a bucket name against S3 naming rules.
+pub fn validate_bucket_name(name: &str) -> Result<(), BucketNameError> {
+    if name.len() < 3 || name.len() > 63 {
+        return Err(BucketNameError::InvalidLength(name.len()));
+    }
+    // Check IP format before character validation (IPs contain dots
+    // which would otherwise be rejected as invalid characters).
+    if looks_like_ip_address(name) {
+        return Err(BucketNameError::LooksLikeIpAddress);
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+    {
+        return Err(BucketNameError::InvalidCharacters);
+    }
+    if name.starts_with(['-', '.']) || name.ends_with(['-', '.']) {
+        return Err(BucketNameError::InvalidStartEnd);
+    }
+    if name.contains("--") || name.contains("..") {
+        return Err(BucketNameError::ConsecutiveHyphensOrPeriods);
+    }
+    Ok(())
+}
+
+/// Check if a string looks like an IP address (e.g. "192.168.1.1").
+fn looks_like_ip_address(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    parts.iter().all(|p| p.parse::<u8>().is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_bucket_names() {
+        assert!(validate_bucket_name("my-bucket").is_ok());
+        assert!(validate_bucket_name("bucket123").is_ok());
+        assert!(validate_bucket_name("abc").is_ok());
+        assert!(validate_bucket_name("a-b-c").is_ok());
+    }
+
+    #[test]
+    fn test_invalid_bucket_name_length() {
+        assert!(matches!(
+            validate_bucket_name("ab"),
+            Err(BucketNameError::InvalidLength(2))
+        ));
+        let long_name = "a".repeat(64);
+        assert!(matches!(
+            validate_bucket_name(&long_name),
+            Err(BucketNameError::InvalidLength(64))
+        ));
+    }
+
+    #[test]
+    fn test_invalid_bucket_name_characters() {
+        assert!(matches!(
+            validate_bucket_name("My-Bucket"),
+            Err(BucketNameError::InvalidCharacters)
+        ));
+        assert!(matches!(
+            validate_bucket_name("my_bucket"),
+            Err(BucketNameError::InvalidCharacters)
+        ));
+        assert!(matches!(
+            validate_bucket_name("my bucket"),
+            Err(BucketNameError::InvalidCharacters)
+        ));
+    }
+
+    #[test]
+    fn test_invalid_bucket_name_start_end() {
+        assert!(matches!(
+            validate_bucket_name("-my-bucket"),
+            Err(BucketNameError::InvalidStartEnd)
+        ));
+        assert!(matches!(
+            validate_bucket_name("my-bucket-"),
+            Err(BucketNameError::InvalidStartEnd)
+        ));
+    }
+
+    #[test]
+    fn test_invalid_bucket_name_consecutive_hyphens() {
+        assert!(matches!(
+            validate_bucket_name("my--bucket"),
+            Err(BucketNameError::ConsecutiveHyphensOrPeriods)
+        ));
+    }
+
+    #[test]
+    fn test_invalid_bucket_name_consecutive_periods() {
+        assert!(matches!(
+            validate_bucket_name("my..bucket"),
+            Err(BucketNameError::ConsecutiveHyphensOrPeriods)
+        ));
+    }
+
+    #[test]
+    fn test_valid_bucket_name_with_dots() {
+        assert!(validate_bucket_name("my.bucket.name").is_ok());
+        assert!(validate_bucket_name("a.b.c").is_ok());
+    }
+
+    #[test]
+    fn test_invalid_bucket_name_dot_at_edges() {
+        assert!(matches!(
+            validate_bucket_name(".my-bucket"),
+            Err(BucketNameError::InvalidStartEnd)
+        ));
+        assert!(matches!(
+            validate_bucket_name("my-bucket."),
+            Err(BucketNameError::InvalidStartEnd)
+        ));
+    }
+
+    #[test]
+    fn test_invalid_bucket_name_ip_address() {
+        assert!(matches!(
+            validate_bucket_name("192.168.1.1"),
+            Err(BucketNameError::LooksLikeIpAddress)
+        ));
+    }
+
+    #[test]
+    fn test_not_ip_address() {
+        // This has hyphens, not dots - should be fine
+        assert!(validate_bucket_name("192-168-1-1").is_ok());
+    }
+
+    #[test]
+    fn test_s3_error_xml_format() {
+        let err = S3Error::NoSuchKey;
+        let xml = err.to_xml("test-request-id");
+        assert!(xml.contains("<Code>NoSuchKey</Code>"));
+        assert!(xml.contains("<Message>The specified key does not exist</Message>"));
+        assert!(xml.contains("<RequestId>test-request-id</RequestId>"));
+    }
+
+    #[test]
+    fn test_s3_error_status_codes() {
+        assert_eq!(S3Error::NoSuchBucket.status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(S3Error::NoSuchKey.status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(S3Error::AccessDenied.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            S3Error::InvalidArgument.status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            S3Error::InternalError.status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+}
