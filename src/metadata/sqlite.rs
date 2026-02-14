@@ -49,6 +49,7 @@ impl MetadataStore {
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
 
+        // TODO: Make max_connections configurable (per-bucket or global).
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)
@@ -66,6 +67,9 @@ impl MetadataStore {
 
         Ok(Self { pool })
     }
+
+    // TODO: Replace `SELECT *` with explicit column lists in get/list queries
+    // to avoid loading heavy columns (e.g. `metadata` JSON) when not needed.
 
     /// Retrieve an object record by key.
     pub async fn get_object(&self, key: &str) -> Result<Option<ObjectRecord>, S3Error> {

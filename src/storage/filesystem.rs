@@ -18,6 +18,7 @@ pub enum FileContent {
 }
 
 /// Result of a successful write: bytes written and hex-encoded MD5 digest.
+#[must_use]
 pub struct WriteResult {
     pub bytes_written: u64,
     pub md5_hex: String,
@@ -147,6 +148,9 @@ impl FilesystemStorage {
     /// Parent directories are created automatically via `create_dir_all`.
     /// These empty directories may appear as spurious common prefixes if the
     /// bucket is subsequently listed before any objects are written into them.
+    ///
+    /// TODO: Check available disk space before writing and reject with an
+    /// appropriate error if the object would not fit.
     pub async fn put(
         &self,
         key: &str,
@@ -271,7 +275,7 @@ mod tests {
 
         let data = Bytes::from_static(b"nested file");
         let stream = stream::iter(vec![Ok::<_, std::io::Error>(data)]);
-        storage.put("a/b/c/deep.txt", stream).await.unwrap();
+        let _ = storage.put("a/b/c/deep.txt", stream).await.unwrap();
 
         assert!(tmp.path().join("a/b/c/deep.txt").exists());
     }
@@ -284,7 +288,7 @@ mod tests {
         // Create file
         let stream =
             stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"delete me"))]);
-        storage.put("to-delete.txt", stream).await.unwrap();
+        let _ = storage.put("to-delete.txt", stream).await.unwrap();
         assert!(storage.exists("to-delete.txt").await.unwrap());
 
         // Delete it
@@ -362,7 +366,7 @@ mod tests {
         // Put should replace the symlink with a regular file
         let stream =
             stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"real content"))]);
-        storage.put("overwrite-me", stream).await.unwrap();
+        let _ = storage.put("overwrite-me", stream).await.unwrap();
 
         let meta = std::fs::symlink_metadata(tmp.path().join("overwrite-me")).unwrap();
         assert!(!meta.file_type().is_symlink());

@@ -123,6 +123,14 @@ pub fn derive_bucket_name(path: &Path) -> Result<String, BucketNameError> {
     // Trim leading/trailing hyphens and dots
     let name = name.trim_matches(['-', '.']).to_string();
 
+    if name != dir_name.to_ascii_lowercase() {
+        tracing::warn!(
+            original = dir_name,
+            derived = %name,
+            "Bucket name derived from directory name required sanitization"
+        );
+    }
+
     // Collapse consecutive hyphens and consecutive dots
     let mut result = String::with_capacity(name.len());
     let mut prev_hyphen = false;
@@ -204,14 +212,21 @@ pub async fn load_or_create_bucket_config(bucket_root: &Path) -> std::io::Result
         )
     })?;
 
-    tokio::fs::write(&config_path, &toml_str).await?;
-
-    // Set file permissions to 0600 (owner read/write only) since it contains secrets
+    // Write with restricted permissions from the start to avoid a window
+    // where the file containing secrets is world-readable.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        tokio::fs::set_permissions(&config_path, perms).await?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&config_path)?;
+        std::io::Write::write_all(&mut file, toml_str.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::write(&config_path, &toml_str).await?;
     }
 
     Ok((config, true))

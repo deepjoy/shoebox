@@ -116,7 +116,12 @@ impl IntoResponse for S3Error {
             .header("content-type", "application/xml")
             .header("x-amz-request-id", &request_id)
             .body(axum::body::Body::from(body))
-            .unwrap()
+            .unwrap_or_else(|_| {
+                axum::http::Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(axum::body::Body::empty())
+                    .expect("minimal 500 response must not fail")
+            })
     }
 }
 
