@@ -19,3 +19,12 @@ thiserror = "2.0"
 
 # Web framework (StatusCode, IntoResponse)
 axum = { version = "0.8", features = ["macros"] }
+
+# UUID generation (request IDs)
+uuid = { version = "1.11", features = ["v4"] }
+
+# Logging
+tracing = "0.1"
+
+# Database (From<sqlx::Error> conversion)
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }

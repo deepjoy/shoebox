@@ -1,4 +1,5 @@
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 
 #[derive(Debug, thiserror::Error)]
 pub enum S3Error {
@@ -71,5 +72,54 @@ impl S3Error {
             Self::BucketAlreadyExists | Self::BucketAlreadyOwnedByYou => StatusCode::CONFLICT,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+
+    /// Render to S3-compatible XML error response.
+    pub fn to_xml(&self, request_id: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>{}</Code>
+  <Message>{}</Message>
+  <RequestId>{}</RequestId>
+</Error>"#,
+            self.code(),
+            self.message(),
+            request_id
+        )
+    }
+}
+
+impl IntoResponse for S3Error {
+    fn into_response(self) -> Response {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let body = self.to_xml(&request_id);
+
+        axum::http::Response::builder()
+            .status(self.status_code())
+            .header("content-type", "application/xml")
+            .header("x-amz-request-id", &request_id)
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+}
+
+impl From<std::io::Error> for S3Error {
+    fn from(err: std::io::Error) -> Self {
+        match err.kind() {
+            std::io::ErrorKind::NotFound => Self::NoSuchKey,
+            std::io::ErrorKind::PermissionDenied => Self::AccessDenied,
+            _ => {
+                tracing::error!("IO error: {err}");
+                Self::InternalError
+            }
+        }
+    }
+}
+
+impl From<sqlx::Error> for S3Error {
+    fn from(err: sqlx::Error) -> Self {
+        tracing::error!("Database error: {err}");
+        Self::InternalError
     }
 }
