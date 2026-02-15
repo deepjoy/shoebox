@@ -60,10 +60,13 @@ impl MetadataStore {
             })?;
 
         // Run migrations from the compiled-in migrations directory
-        sqlx::migrate!("./migrations").run(&pool).await.map_err(|e| {
-            tracing::error!("Failed to run migrations: {e}");
-            S3Error::InternalError
-        })?;
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to run migrations: {e}");
+                S3Error::InternalError
+            })?;
 
         Ok(Self { pool })
     }
@@ -73,12 +76,10 @@ impl MetadataStore {
 
     /// Retrieve an object record by key.
     pub async fn get_object(&self, key: &str) -> Result<Option<ObjectRecord>, S3Error> {
-        let record = sqlx::query_as::<_, ObjectRecord>(
-            "SELECT * FROM objects WHERE key = ?",
-        )
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await?;
+        let record = sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(record)
     }
@@ -99,12 +100,12 @@ impl MetadataStore {
         .bind(obj.is_symlink)
         .bind(&obj.symlink_target)
         .bind(obj.size)
-        .bind(&obj.file_mtime)
+        .bind(obj.file_mtime)
         .bind(&obj.etag)
         .bind(&obj.content_hash)
         .bind(&obj.content_type)
-        .bind(&obj.last_modified)
-        .bind(&obj.created_at)
+        .bind(obj.last_modified)
+        .bind(obj.created_at)
         .bind(&obj.metadata)
         .bind(obj.scan_level)
         .execute(&self.pool)
@@ -146,12 +147,12 @@ impl MetadataStore {
         .bind(obj.is_symlink)
         .bind(&obj.symlink_target)
         .bind(obj.size)
-        .bind(&obj.file_mtime)
+        .bind(obj.file_mtime)
         .bind(&obj.etag)
         .bind(&obj.content_hash)
         .bind(&obj.content_type)
-        .bind(&obj.last_modified)
-        .bind(&obj.created_at)
+        .bind(obj.last_modified)
+        .bind(obj.created_at)
         .bind(&obj.metadata)
         .bind(obj.scan_level)
         .execute(&self.pool)
@@ -193,10 +194,7 @@ impl MetadataStore {
     }
 
     /// List objects within a specific parent directory.
-    pub async fn list_by_parent(
-        &self,
-        parent: &str,
-    ) -> Result<Vec<ObjectRecord>, S3Error> {
+    pub async fn list_by_parent(&self, parent: &str) -> Result<Vec<ObjectRecord>, S3Error> {
         let records = sqlx::query_as::<_, ObjectRecord>(
             "SELECT * FROM objects WHERE parent_directory = ? ORDER BY key",
         )
@@ -311,9 +309,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp).await;
 
-        store.insert_object(&make_record("photos/a.jpg")).await.unwrap();
-        store.insert_object(&make_record("photos/b.jpg")).await.unwrap();
-        store.insert_object(&make_record("docs/readme.md")).await.unwrap();
+        store
+            .insert_object(&make_record("photos/a.jpg"))
+            .await
+            .unwrap();
+        store
+            .insert_object(&make_record("photos/b.jpg"))
+            .await
+            .unwrap();
+        store
+            .insert_object(&make_record("docs/readme.md"))
+            .await
+            .unwrap();
 
         let photos = store.list_objects("photos/", 100).await.unwrap();
         assert_eq!(photos.len(), 2);
@@ -363,9 +370,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp).await;
 
-        store.insert_object(&make_record("photos/a.jpg")).await.unwrap();
-        store.insert_object(&make_record("photos/b.jpg")).await.unwrap();
-        store.insert_object(&make_record("photos/sub/c.jpg")).await.unwrap();
+        store
+            .insert_object(&make_record("photos/a.jpg"))
+            .await
+            .unwrap();
+        store
+            .insert_object(&make_record("photos/b.jpg"))
+            .await
+            .unwrap();
+        store
+            .insert_object(&make_record("photos/sub/c.jpg"))
+            .await
+            .unwrap();
 
         let photos = store.list_by_parent("photos").await.unwrap();
         assert_eq!(photos.len(), 2);
