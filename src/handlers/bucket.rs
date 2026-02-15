@@ -22,7 +22,7 @@ pub async fn list_buckets(
         .values()
         .map(|b| BucketInfo {
             name: b.name.clone(),
-            // TODO: persist and return actual bucket creation date
+            // TODO(#10): persist and return actual bucket creation date
             creation_date: "1970-01-01T00:00:00.000Z".to_string(),
         })
         .collect();
