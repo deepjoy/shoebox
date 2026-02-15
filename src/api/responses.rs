@@ -48,6 +48,14 @@ impl IntoResponse for ObjectResponse {
             }
         }
 
-        builder.body(self.body).unwrap().into_response()
+        builder
+            .body(self.body)
+            .unwrap_or_else(|_| {
+                axum::http::Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            })
+            .into_response()
     }
 }

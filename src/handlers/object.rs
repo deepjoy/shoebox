@@ -137,7 +137,12 @@ pub async fn head_object(
     for (k, v) in &headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
-    Ok(builder.body(axum::body::Body::empty()).unwrap())
+    Ok(builder.body(axum::body::Body::empty()).unwrap_or_else(|_| {
+        axum::http::Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }))
 }
 
 fn parse_metadata_json(raw: &Option<String>) -> HashMap<String, String> {
