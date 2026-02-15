@@ -10,6 +10,12 @@ use crate::error::S3Error;
 /// Timestamp fields use `time::OffsetDateTime`. The sqlx `time` feature
 /// serialises these as RFC 3339 TEXT in SQLite, giving direct comparisons
 /// without runtime parsing and human-readable storage.
+///
+/// ## ETag Convention
+/// The `etag` field stores values WITH surrounding double-quote characters,
+/// e.g. `"\"d41d8cd98f00b204e9800998ecf8427e\""`. This matches the S3 wire
+/// format where ETags are always quoted per RFC 7232. Code should store
+/// and return the value as-is without adding or stripping quotes.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ObjectRecord {
     pub id: String,
@@ -208,6 +214,99 @@ impl MetadataStore {
     /// Gracefully close the metadata store, flushing WAL to the main database.
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    /// ListObjectsV2-compatible query with prefix, delimiter, pagination.
+    ///
+    /// Returns `(objects, common_prefixes, is_truncated, next_continuation_token)`.
+    pub async fn list_objects_v2(
+        &self,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: i32,
+        start_after: Option<&str>,
+    ) -> Result<(Vec<ObjectRecord>, Vec<String>, bool, Option<String>), S3Error> {
+        // Fetch extra rows to handle delimiter grouping and truncation.
+        // With a delimiter we may collapse many rows into one common-prefix
+        // entry, so fetch more than max_keys to avoid under-filling pages.
+        let limit = if delimiter.is_some() {
+            (max_keys as i64 + 1) * 10
+        } else {
+            max_keys as i64 + 1
+        };
+        let escaped_prefix = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped_prefix}%");
+
+        let records = if let Some(after) = start_after {
+            sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' AND key > ? ORDER BY key LIMIT ?",
+            )
+            .bind(&pattern)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key LIMIT ?",
+            )
+            .bind(&pattern)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        // If no delimiter, return flat list with truncation detection.
+        let Some(delim) = delimiter else {
+            let is_truncated = records.len() > max_keys as usize;
+            let mut objects: Vec<ObjectRecord> = records;
+            if is_truncated {
+                objects.truncate(max_keys as usize);
+            }
+            let next_token = if is_truncated {
+                objects.last().map(|o| o.key.clone())
+            } else {
+                None
+            };
+            return Ok((objects, Vec::new(), is_truncated, next_token));
+        };
+
+        // With delimiter: separate objects from common prefixes.
+        let prefix_len = prefix.len();
+        let mut objects = Vec::new();
+        let mut common_prefixes = std::collections::BTreeSet::new();
+        let mut count = 0;
+        let mut last_key = None;
+        let mut is_truncated = false;
+
+        for record in records {
+            if count >= max_keys as usize {
+                is_truncated = true;
+                break;
+            }
+
+            let suffix = &record.key[prefix_len..];
+            if let Some(pos) = suffix.find(delim) {
+                // Key contains delimiter after prefix → common prefix.
+                let cp = format!("{}{}", prefix, &suffix[..pos + delim.len()]);
+                if common_prefixes.insert(cp) {
+                    count += 1;
+                    last_key = Some(record.key.clone());
+                }
+            } else {
+                last_key = Some(record.key.clone());
+                objects.push(record);
+                count += 1;
+            }
+        }
+
+        let next_token = if is_truncated { last_key } else { None };
+        let cp_vec: Vec<String> = common_prefixes.into_iter().collect();
+
+        Ok((objects, cp_vec, is_truncated, next_token))
     }
 
     /// Get the total count of objects in the store.
