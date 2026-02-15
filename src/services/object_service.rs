@@ -77,7 +77,11 @@ pub async fn put_object(
         content_type: Some(input.content_type),
         last_modified: now,
         created_at: now,
-        metadata: Some(serde_json::to_string(&input.user_metadata).unwrap()),
+        metadata: if input.user_metadata.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&input.user_metadata).unwrap())
+        },
         scan_level: 3,
     };
 
