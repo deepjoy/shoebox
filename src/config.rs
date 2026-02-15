@@ -230,9 +230,8 @@ pub async fn load_or_create_bucket_config(
         }],
     };
 
-    let toml_str = toml::to_string_pretty(&config).map_err(|e| {
-        std::io::Error::other(format!("Failed to serialize config: {e}"))
-    })?;
+    let toml_str = toml::to_string_pretty(&config)
+        .map_err(|e| std::io::Error::other(format!("Failed to serialize config: {e}")))?;
 
     // Write with restricted permissions from the start to avoid a window
     // where the file containing secrets is world-readable.
