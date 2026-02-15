@@ -34,16 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("    Credentials:");
         }
         for (i, cred) in bucket.config.credentials.iter().enumerate() {
-            let desc = cred
-                .description
-                .as_deref()
-                .unwrap_or("no description");
-            println!(
-                "      [{}] {} ({})",
-                i + 1,
-                cred.access_key_id,
-                desc
-            );
+            let desc = cred.description.as_deref().unwrap_or("no description");
+            println!("      [{}] {} ({})", i + 1, cred.access_key_id, desc);
             if show {
                 println!("          Secret: {}", cred.secret_access_key);
             }

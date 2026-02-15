@@ -19,18 +19,27 @@ pub const METADATA_DB: &str = "metadata.db";
 /// so it can be built from CLI args. Library consumers construct it directly.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "binary", derive(clap::Parser))]
-#[cfg_attr(feature = "binary", command(name = "shoebox", about = "Lightweight S3-compatible object storage"))]
+#[cfg_attr(
+    feature = "binary",
+    command(name = "shoebox", about = "Lightweight S3-compatible object storage")
+)]
 pub struct ServerConfig {
     /// Directories to serve as buckets.
     #[cfg_attr(feature = "binary", arg(required = true))]
     pub paths: Vec<std::path::PathBuf>,
 
     /// Listen address.
-    #[cfg_attr(feature = "binary", arg(long, default_value = "0.0.0.0", env = "SHOEBOX_HOST"))]
+    #[cfg_attr(
+        feature = "binary",
+        arg(long, default_value = "0.0.0.0", env = "SHOEBOX_HOST")
+    )]
     pub host: String,
 
     /// Listen port.
-    #[cfg_attr(feature = "binary", arg(long, default_value_t = 9000, env = "SHOEBOX_PORT"))]
+    #[cfg_attr(
+        feature = "binary",
+        arg(long, default_value_t = 9000, env = "SHOEBOX_PORT")
+    )]
     pub port: u16,
 
     /// Print secret access keys on startup.
@@ -95,7 +104,9 @@ pub fn generate_access_key_id() -> String {
     use rand::Rng;
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let mut rng = rand::rng();
-    let suffix: String = (0..16).map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char).collect();
+    let suffix: String = (0..16)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect();
     format!("AKIA{suffix}")
 }
 
@@ -104,7 +115,9 @@ pub fn generate_secret_access_key() -> String {
     use rand::Rng;
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut rng = rand::rng();
-    (0..40).map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char).collect()
+    (0..40)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect()
 }
 
 // ── Bucket name derivation ────────────────────────────────────────────────
@@ -187,7 +200,9 @@ pub fn derive_bucket_name(path: &Path) -> Result<String, BucketNameError> {
 ///
 /// If the file doesn't exist, creates it with a generated admin credential.
 /// Returns `(config, freshly_created)`.
-pub async fn load_or_create_bucket_config(shoebox_dir: &Path) -> std::io::Result<(BucketConfig, bool)> {
+pub async fn load_or_create_bucket_config(
+    shoebox_dir: &Path,
+) -> std::io::Result<(BucketConfig, bool)> {
     let config_path = shoebox_dir.join(CONFIG_FILE);
 
     if config_path.exists() {
@@ -216,10 +231,7 @@ pub async fn load_or_create_bucket_config(shoebox_dir: &Path) -> std::io::Result
     };
 
     let toml_str = toml::to_string_pretty(&config).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to serialize config: {e}"),
-        )
+        std::io::Error::other(format!("Failed to serialize config: {e}"))
     })?;
 
     // Write with restricted permissions from the start to avoid a window

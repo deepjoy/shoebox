@@ -75,10 +75,7 @@ impl FilesystemStorage {
         }
 
         // Exclude .shoebox directory
-        if path
-            .components()
-            .any(|c| c.as_os_str() == SHOEBOX_DIR)
-        {
+        if path.components().any(|c| c.as_os_str() == SHOEBOX_DIR) {
             return Err(S3Error::InvalidArgument);
         }
 
@@ -128,7 +125,10 @@ impl FilesystemStorage {
                 .map_err(|_| S3Error::InternalError)?;
             let target_str = target.to_string_lossy().to_string();
             let len = target_str.len() as u64;
-            Ok(FileContent::Symlink { target: target_str, len })
+            Ok(FileContent::Symlink {
+                target: target_str,
+                len,
+            })
         } else {
             let file = tokio::fs::File::open(&path)
                 .await
@@ -286,8 +286,9 @@ mod tests {
         let storage = make_storage(&tmp);
 
         // Create file
-        let stream =
-            stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"delete me"))]);
+        let stream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"delete me",
+        ))]);
         let _ = storage.put("to-delete.txt", stream).await.unwrap();
         assert!(storage.exists("to-delete.txt").await.unwrap());
 
@@ -364,8 +365,9 @@ mod tests {
         std::os::unix::fs::symlink("/some/target", &link_path).unwrap();
 
         // Put should replace the symlink with a regular file
-        let stream =
-            stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"real content"))]);
+        let stream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"real content",
+        ))]);
         let _ = storage.put("overwrite-me", stream).await.unwrap();
 
         let meta = std::fs::symlink_metadata(tmp.path().join("overwrite-me")).unwrap();
