@@ -14,6 +14,9 @@
 
 DELAY="${DEMO_DELAY:-1.5}"
 
+# Disable the AWS CLI pager so demos don't hang waiting for user input.
+export AWS_PAGER=""
+
 # --- Palette — Akaroa / Coral Reef / Mongoose / Avocado / Como -------------
 
 AKAROA='\033[38;2;216;198;176m'     # #d8c6b0 — headings
