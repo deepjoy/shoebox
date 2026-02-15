@@ -153,8 +153,9 @@ impl FilesystemStorage {
     /// These empty directories may appear as spurious common prefixes if the
     /// bucket is subsequently listed before any objects are written into them.
     ///
-    /// TODO: Check available disk space before writing and reject with an
+    /// TODO(#7): Check available disk space before writing and reject with an
     /// appropriate error if the object would not fit.
+    /// https://github.com/deepjoy/shoebox/issues/7
     pub async fn put(
         &self,
         key: &str,
