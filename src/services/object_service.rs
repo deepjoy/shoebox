@@ -73,7 +73,7 @@ pub async fn put_object(
         size: Some(result.bytes_written as i64),
         file_mtime: Some(now),
         etag: Some(etag.clone()),
-        content_hash: None,
+        content_hash: Some(result.md5_hex.clone()),
         content_type: Some(input.content_type),
         last_modified: now,
         created_at: now,
