@@ -119,6 +119,10 @@ impl FilesystemStorage {
             }
         })?;
 
+        if meta.is_dir() {
+            return Err(S3Error::NoSuchKey);
+        }
+
         if meta.file_type().is_symlink() {
             let target = tokio::fs::read_link(&path)
                 .await
@@ -295,6 +299,20 @@ mod tests {
         // Delete it
         storage.delete("to-delete.txt").await.unwrap();
         assert!(!storage.exists("to-delete.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_get_directory_returns_no_such_key() {
+        let tmp = TempDir::new().unwrap();
+        let storage = make_storage(&tmp);
+
+        // Create a directory (not a file)
+        std::fs::create_dir_all(tmp.path().join("somedir")).unwrap();
+
+        match storage.get("somedir").await {
+            Err(S3Error::NoSuchKey) => {}
+            other => panic!("Expected NoSuchKey, got {:?}", other),
+        }
     }
 
     #[tokio::test]

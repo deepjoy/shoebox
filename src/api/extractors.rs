@@ -8,14 +8,12 @@ pub fn extract_metadata_headers(headers: &HeaderMap) -> HashMap<String, String> 
         .iter()
         .filter_map(|(name, value)| {
             let name_str = name.as_str();
-            if let Some(meta_key) = name_str.strip_prefix("x-amz-meta-") {
-                Some((
+            name_str.strip_prefix("x-amz-meta-").map(|meta_key| {
+                (
                     meta_key.to_string(),
                     value.to_str().unwrap_or("").to_string(),
-                ))
-            } else {
-                None
-            }
+                )
+            })
         })
         .collect()
 }

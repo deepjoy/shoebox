@@ -19,10 +19,7 @@ pub struct ListBucketResult {
     pub is_truncated: bool,
     #[serde(rename = "StartAfter", skip_serializing_if = "Option::is_none")]
     pub start_after: Option<String>,
-    #[serde(
-        rename = "ContinuationToken",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "ContinuationToken", skip_serializing_if = "Option::is_none")]
     pub continuation_token: Option<String>,
     #[serde(rename = "Contents", default)]
     pub contents: Vec<ObjectInfo>,
