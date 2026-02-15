@@ -179,6 +179,25 @@ impl MetadataStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Bulk-delete object records by key in a single SQL statement.
+    pub async fn delete_objects(&self, keys: &[String]) -> Result<u64, S3Error> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        // Build `DELETE FROM objects WHERE key IN (?, ?, ...)`
+        let placeholders: Vec<&str> = keys.iter().map(|_| "?").collect();
+        let sql = format!(
+            "DELETE FROM objects WHERE key IN ({})",
+            placeholders.join(", ")
+        );
+        let mut query = sqlx::query(&sql);
+        for key in keys {
+            query = query.bind(key);
+        }
+        let result = query.execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
     /// List objects matching a prefix, up to `max_keys`.
     pub async fn list_objects(
         &self,
@@ -228,45 +247,21 @@ impl MetadataStore {
         max_keys: i32,
         start_after: Option<&str>,
     ) -> Result<(Vec<ObjectRecord>, Vec<String>, bool, Option<String>), S3Error> {
-        // Fetch extra rows to handle delimiter grouping and truncation.
-        // With a delimiter we may collapse many rows into one common-prefix
-        // entry, so fetch more than max_keys to avoid under-filling pages.
-        let limit = if delimiter.is_some() {
-            (max_keys as i64 + 1) * 10
-        } else {
-            max_keys as i64 + 1
-        };
         let escaped_prefix = prefix
             .replace('\\', "\\\\")
             .replace('%', "\\%")
             .replace('_', "\\_");
         let pattern = format!("{escaped_prefix}%");
+        let max = max_keys as usize;
 
-        let records = if let Some(after) = start_after {
-            sqlx::query_as::<_, ObjectRecord>(
-                "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' AND key > ? ORDER BY key LIMIT ?",
-            )
-            .bind(&pattern)
-            .bind(after)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, ObjectRecord>(
-                "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key LIMIT ?",
-            )
-            .bind(&pattern)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        // If no delimiter, return flat list with truncation detection.
+        // No delimiter: flat list with one extra row for truncation detection.
         let Some(delim) = delimiter else {
-            let is_truncated = records.len() > max_keys as usize;
-            let mut objects: Vec<ObjectRecord> = records;
+            let limit = max_keys as i64 + 1;
+            let records = self.fetch_page(&pattern, start_after, limit).await?;
+            let is_truncated = records.len() > max;
+            let mut objects = records;
             if is_truncated {
-                objects.truncate(max_keys as usize);
+                objects.truncate(max);
             }
             let next_token = if is_truncated {
                 objects.last().map(|o| o.key.clone())
@@ -276,39 +271,106 @@ impl MetadataStore {
             return Ok((objects, Vec::new(), is_truncated, next_token));
         };
 
-        // With delimiter: separate objects from common prefixes.
+        // With delimiter: requery loop to fill the page.
+        // We collapse keys into common prefixes which reduces the count,
+        // so a single fetch may not yield enough entries to fill max_keys.
         let prefix_len = prefix.len();
         let mut objects = Vec::new();
         let mut common_prefixes = std::collections::BTreeSet::new();
-        let mut count = 0;
-        let mut last_key = None;
-        let mut is_truncated = false;
+        let mut cursor = start_after.map(|s| s.to_string());
+        let batch_size = (max_keys as i64 + 1).max(100);
 
-        for record in records {
-            if count >= max_keys as usize {
-                is_truncated = true;
-                break;
+        loop {
+            let records = self
+                .fetch_page(&pattern, cursor.as_deref(), batch_size)
+                .await?;
+            let exhausted = (records.len() as i64) < batch_size;
+
+            for record in records {
+                let count = objects.len() + common_prefixes.len();
+                if count > max {
+                    // We have enough to detect truncation; stop.
+                    break;
+                }
+
+                cursor = Some(record.key.clone());
+                let suffix = &record.key[prefix_len..];
+                if let Some(pos) = suffix.find(delim) {
+                    let cp = format!("{}{}", prefix, &suffix[..pos + delim.len()]);
+                    common_prefixes.insert(cp);
+                } else {
+                    objects.push(record);
+                }
             }
 
-            let suffix = &record.key[prefix_len..];
-            if let Some(pos) = suffix.find(delim) {
-                // Key contains delimiter after prefix → common prefix.
-                let cp = format!("{}{}", prefix, &suffix[..pos + delim.len()]);
-                if common_prefixes.insert(cp) {
-                    count += 1;
-                    last_key = Some(record.key.clone());
-                }
-            } else {
-                last_key = Some(record.key.clone());
-                objects.push(record);
-                count += 1;
+            let count = objects.len() + common_prefixes.len();
+            if count > max || exhausted {
+                break;
             }
         }
 
-        let next_token = if is_truncated { last_key } else { None };
+        let count = objects.len() + common_prefixes.len();
+        let is_truncated = count > max;
+
+        // Trim to exactly max_keys entries. Remove excess objects first
+        // (common prefixes sort earlier and are typically fewer).
+        if is_truncated {
+            while objects.len() + common_prefixes.len() > max {
+                // Pop the lexicographically last item.
+                let last_obj = objects.last().map(|o| o.key.as_str());
+                let last_cp = common_prefixes.iter().next_back().map(|s| s.as_str());
+                match (last_obj, last_cp) {
+                    (Some(o), Some(c)) if o > c => {
+                        objects.pop();
+                    }
+                    (_, Some(_)) => {
+                        common_prefixes.pop_last();
+                    }
+                    (Some(_), None) => {
+                        objects.pop();
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        // The continuation token is the last key in sort order among the
+        // items we're returning. For common prefixes, the token must be
+        // the last *actual key* that falls under that prefix so that the
+        // next page starts after all keys in the group.
+        let next_token = if is_truncated { cursor } else { None };
         let cp_vec: Vec<String> = common_prefixes.into_iter().collect();
 
         Ok((objects, cp_vec, is_truncated, next_token))
+    }
+
+    /// Fetch a page of records matching a LIKE pattern, optionally after a cursor key.
+    async fn fetch_page(
+        &self,
+        pattern: &str,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ObjectRecord>, S3Error> {
+        if let Some(after) = after {
+            sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' AND key > ? ORDER BY key LIMIT ?",
+            )
+            .bind(pattern)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into)
+        } else {
+            sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key LIMIT ?",
+            )
+            .bind(pattern)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into)
+        }
     }
 
     /// Get the total count of objects in the store.

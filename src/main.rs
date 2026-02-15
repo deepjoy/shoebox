@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -21,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig::parse();
     let buckets = resolve_all_buckets(&config).await?;
 
-    let mut loaded_buckets = Vec::new();
+    let mut loaded_buckets = HashMap::new();
     for bucket in &buckets {
         // Open metadata database
         let db_path = bucket.shoebox_dir.join(METADATA_DB);
@@ -30,12 +31,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Create storage layer
         let storage = FilesystemStorage::new(bucket.root.clone());
 
-        loaded_buckets.push(LoadedBucket {
-            name: bucket.name.clone(),
-            config: bucket.config.clone(),
-            storage,
-            metadata,
-        });
+        loaded_buckets.insert(
+            bucket.name.clone(),
+            LoadedBucket {
+                name: bucket.name.clone(),
+                config: bucket.config.clone(),
+                storage,
+                metadata,
+            },
+        );
 
         // Print bucket info
         let show = config.show_secrets || bucket.freshly_created;

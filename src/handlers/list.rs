@@ -47,7 +47,7 @@ pub async fn list_objects_v2(
             key: o.key,
             last_modified: o.last_modified.format(&Rfc3339).unwrap(),
             etag: o.etag.unwrap_or_default(),
-            size: o.size.unwrap_or(0) as u64,
+            size: o.size.unwrap_or(0).max(0) as u64,
             storage_class: "STANDARD".to_string(),
         })
         .collect();

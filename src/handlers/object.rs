@@ -20,6 +20,13 @@ const HTTP_DATE: &[time::format_description::FormatItem<'static>] = time::macros
     "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
 );
 
+const EPOCH_HTTP_DATE: &str = "Thu, 01 Jan 1970 00:00:00 GMT";
+
+fn format_http_date(dt: &time::OffsetDateTime) -> String {
+    dt.format(HTTP_DATE)
+        .unwrap_or_else(|_| EPOCH_HTTP_DATE.to_string())
+}
+
 /// GET /{bucket}/{key} — download an object.
 pub async fn get_object(
     State(state): State<AppState>,
@@ -41,7 +48,7 @@ pub async fn get_object(
                     .content_type
                     .unwrap_or_else(|| "application/octet-stream".to_string()),
                 etag: metadata.etag.unwrap_or_default(),
-                last_modified: metadata.last_modified.format(HTTP_DATE).unwrap(),
+                last_modified: format_http_date(&metadata.last_modified),
                 metadata: parse_metadata_json(&metadata.metadata),
             })
         }
@@ -53,7 +60,7 @@ pub async fn get_object(
                 content_length: len,
                 content_type: "application/x-symlink".to_string(),
                 etag: metadata.etag.unwrap_or_default(),
-                last_modified: metadata.last_modified.format(HTTP_DATE).unwrap(),
+                last_modified: format_http_date(&metadata.last_modified),
                 metadata: parse_metadata_json(&metadata.metadata),
             })
         }
@@ -125,7 +132,7 @@ pub async fn head_object(
         (header::ETAG.to_string(), metadata.etag.unwrap_or_default()),
         (
             header::LAST_MODIFIED.to_string(),
-            metadata.last_modified.format(HTTP_DATE).unwrap(),
+            format_http_date(&metadata.last_modified),
         ),
     ];
 

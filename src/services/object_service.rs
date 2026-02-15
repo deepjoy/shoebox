@@ -100,6 +100,7 @@ pub async fn delete_object(
         Err(S3Error::NoSuchKey) => {}
         Err(e) => return Err(e),
     }
+    // _ discards the bool return value; the ? still propagates errors (clippy::let_underscore_must_use)
     let _ = metadata.delete_object(key).await?;
     Ok(())
 }

@@ -13,7 +13,8 @@ impl<T: Serialize> IntoResponse for XmlResponse<T> {
     fn into_response(self) -> Response {
         match quick_xml::se::to_string(&self.0) {
             Ok(xml) => {
-                let body = format!(r#"<?xml version="1.0" encoding="UTF-8"?>{}"#, xml);
+                // Inject the S3 xmlns attribute into the root element.
+                let body = inject_xmlns(&xml);
                 ([(header::CONTENT_TYPE, "application/xml")], body).into_response()
             }
             Err(e) => {
@@ -21,6 +22,25 @@ impl<T: Serialize> IntoResponse for XmlResponse<T> {
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         }
+    }
+}
+
+const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+
+/// Insert `xmlns` into the first XML element of the serialized output.
+fn inject_xmlns(xml: &str) -> String {
+    let header = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
+    // Find the first '>' of the root element and inject xmlns before it.
+    if let Some(pos) = xml.find('>') {
+        format!(
+            r#"{}{} xmlns="{}"{}"#,
+            header,
+            &xml[..pos],
+            S3_XMLNS,
+            &xml[pos..]
+        )
+    } else {
+        format!("{}{}", header, xml)
     }
 }
 

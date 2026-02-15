@@ -19,11 +19,11 @@ pub async fn list_buckets(
 ) -> Result<XmlResponse<ListAllMyBucketsResult>, S3Error> {
     let buckets: Vec<BucketInfo> = state
         .buckets
-        .iter()
+        .values()
         .map(|b| BucketInfo {
             name: b.name.clone(),
-            // We don't persist bucket creation date yet; use epoch.
-            creation_date: "2024-01-01T00:00:00.000Z".to_string(),
+            // TODO: persist and return actual bucket creation date
+            creation_date: "1970-01-01T00:00:00.000Z".to_string(),
         })
         .collect();
 
