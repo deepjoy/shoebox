@@ -1,5 +1,5 @@
 use clap::Parser;
-use shoebox::config::{resolve_bucket, ServerConfig};
+use shoebox::config::{resolve_all_buckets, ServerConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,17 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = ServerConfig::parse();
-
-    // Resolve each path into a bucket
-    let mut buckets = Vec::new();
-    for path in &config.paths {
-        if !path.is_dir() {
-            eprintln!("Error: {} is not a directory", path.display());
-            std::process::exit(1);
-        }
-        let bucket = resolve_bucket(path).await?;
-        buckets.push(bucket);
-    }
+    let buckets = resolve_all_buckets(&config).await?;
 
     // Print startup info
     println!(
@@ -61,7 +51,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
-    println!("Credentials saved to .shoebox/config.toml");
+    if let Some(ref data_dir) = config.data_dir {
+        println!("Credentials saved to {}/*/config.toml", data_dir.display());
+    } else {
+        println!("Credentials saved to .shoebox/config.toml");
+    }
     if !config.show_secrets {
         println!("Use --show-secrets to display secret access keys");
     }

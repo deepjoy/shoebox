@@ -11,28 +11,37 @@ pub const CONFIG_FILE: &str = "config.toml";
 /// SQLite database within the shoebox directory.
 pub const METADATA_DB: &str = "metadata.db";
 
-// ── Server config (CLI only) ──────────────────────────────────────────────
+// ── Server config ─────────────────────────────────────────────────────────
 
-/// Top-level server configuration, built from CLI args and environment.
-#[cfg(feature = "binary")]
-#[derive(Debug, Clone, clap::Parser)]
-#[command(name = "shoebox", about = "Lightweight S3-compatible object storage")]
+/// Top-level server configuration.
+///
+/// When the `binary` feature is enabled this also derives `clap::Parser`
+/// so it can be built from CLI args. Library consumers construct it directly.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "binary", derive(clap::Parser))]
+#[cfg_attr(feature = "binary", command(name = "shoebox", about = "Lightweight S3-compatible object storage"))]
 pub struct ServerConfig {
     /// Directories to serve as buckets.
-    #[arg(required = true)]
+    #[cfg_attr(feature = "binary", arg(required = true))]
     pub paths: Vec<std::path::PathBuf>,
 
     /// Listen address.
-    #[arg(long, default_value = "0.0.0.0", env = "SHOEBOX_HOST")]
+    #[cfg_attr(feature = "binary", arg(long, default_value = "0.0.0.0", env = "SHOEBOX_HOST"))]
     pub host: String,
 
     /// Listen port.
-    #[arg(long, default_value_t = 9000, env = "SHOEBOX_PORT")]
+    #[cfg_attr(feature = "binary", arg(long, default_value_t = 9000, env = "SHOEBOX_PORT"))]
     pub port: u16,
 
     /// Print secret access keys on startup.
-    #[arg(long, default_value_t = false)]
+    #[cfg_attr(feature = "binary", arg(long, default_value_t = false))]
     pub show_secrets: bool,
+
+    /// Directory for per-bucket state (config, metadata DB).
+    /// When set, state is stored in `<data-dir>/<bucket-name>/` instead of
+    /// `<bucket-root>/.shoebox/`.
+    #[cfg_attr(feature = "binary", arg(long, env = "SHOEBOX_DATA_DIR"))]
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 // ── Per-bucket config (.shoebox/config.toml) ──────────────────────────────
@@ -71,6 +80,8 @@ pub struct BucketState {
     pub name: String,
     /// Absolute path to the bucket root directory.
     pub root: PathBuf,
+    /// Directory where per-bucket state files live (config.toml, metadata.db).
+    pub shoebox_dir: PathBuf,
     /// Persisted config.
     pub config: BucketConfig,
     /// True when the config was generated for the first time this run.
@@ -172,12 +183,11 @@ pub fn derive_bucket_name(path: &Path) -> Result<String, BucketNameError> {
 
 // ── Config loading / generation ───────────────────────────────────────────
 
-/// Load a bucket config from `.shoebox/config.toml`, or generate a default one.
+/// Load a bucket config from `<shoebox_dir>/config.toml`, or generate a default one.
 ///
 /// If the file doesn't exist, creates it with a generated admin credential.
 /// Returns `(config, freshly_created)`.
-pub async fn load_or_create_bucket_config(bucket_root: &Path) -> std::io::Result<(BucketConfig, bool)> {
-    let shoebox_dir = bucket_root.join(SHOEBOX_DIR);
+pub async fn load_or_create_bucket_config(shoebox_dir: &Path) -> std::io::Result<(BucketConfig, bool)> {
     let config_path = shoebox_dir.join(CONFIG_FILE);
 
     if config_path.exists() {
@@ -233,24 +243,87 @@ pub async fn load_or_create_bucket_config(bucket_root: &Path) -> std::io::Result
 }
 
 /// Resolve a directory path into a full `BucketState`.
-pub async fn resolve_bucket(path: &Path) -> Result<BucketState, Box<dyn std::error::Error>> {
+///
+/// When `data_dir` is `Some`, per-bucket state is stored under
+/// `<data_dir>/<derived_bucket_name>/` instead of `<bucket_root>/.shoebox/`.
+pub async fn resolve_bucket(
+    path: &Path,
+    data_dir: Option<&Path>,
+) -> Result<BucketState, Box<dyn std::error::Error>> {
     let root = tokio::fs::canonicalize(path).await?;
-    let (config, freshly_created) = load_or_create_bucket_config(&root).await?;
+
+    let derived_name = derive_bucket_name(&root)?;
+    let shoebox_dir = match data_dir {
+        Some(d) => d.join(&derived_name),
+        None => root.join(SHOEBOX_DIR),
+    };
+
+    let (config, freshly_created) = load_or_create_bucket_config(&shoebox_dir).await?;
 
     let name = match &config.bucket_name {
         Some(n) => {
             validate_bucket_name(n)?;
             n.clone()
         }
-        None => derive_bucket_name(&root)?,
+        None => derived_name,
     };
 
     Ok(BucketState {
         name,
         root,
+        shoebox_dir,
         config,
         freshly_created,
     })
+}
+
+// ── Bulk resolution ───────────────────────────────────────────────────────
+
+/// Errors that can occur during startup / bucket resolution.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("{0} is not a directory")]
+    NotADirectory(PathBuf),
+
+    #[error("{0} is read-only; use --data-dir to store state elsewhere")]
+    ReadOnlyPath(PathBuf),
+
+    #[error("{0}")]
+    Other(#[from] Box<dyn std::error::Error>),
+}
+
+impl From<std::io::Error> for ConfigError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Other(err.into())
+    }
+}
+
+impl From<BucketNameError> for ConfigError {
+    fn from(err: BucketNameError) -> Self {
+        Self::Other(err.into())
+    }
+}
+
+/// Validate and resolve every path in the configuration into a [`BucketState`].
+///
+/// When `data_dir` is `None` and a path is read-only, returns
+/// [`ConfigError::ReadOnlyPath`].
+pub async fn resolve_all_buckets(config: &ServerConfig) -> Result<Vec<BucketState>, ConfigError> {
+    let mut buckets = Vec::with_capacity(config.paths.len());
+    for path in &config.paths {
+        if !path.is_dir() {
+            return Err(ConfigError::NotADirectory(path.clone()));
+        }
+        if config.data_dir.is_none() {
+            let meta = std::fs::metadata(path)?;
+            if meta.permissions().readonly() {
+                return Err(ConfigError::ReadOnlyPath(path.clone()));
+            }
+        }
+        let bucket = resolve_bucket(path, config.data_dir.as_deref()).await?;
+        buckets.push(bucket);
+    }
+    Ok(buckets)
 }
 
 #[cfg(test)]
@@ -299,7 +372,8 @@ mod tests {
     #[tokio::test]
     async fn test_load_or_create_bucket_config_creates_new() {
         let tmp = TempDir::new().unwrap();
-        let (config, freshly_created) = load_or_create_bucket_config(tmp.path()).await.unwrap();
+        let shoebox_dir = tmp.path().join("my-bucket");
+        let (config, freshly_created) = load_or_create_bucket_config(&shoebox_dir).await.unwrap();
 
         assert!(freshly_created);
         assert!(!config.versioning_enabled);
@@ -307,7 +381,7 @@ mod tests {
         assert!(config.credentials[0].access_key_id.starts_with("AKIA"));
 
         // File should exist now
-        let config_path = tmp.path().join(SHOEBOX_DIR).join(CONFIG_FILE);
+        let config_path = shoebox_dir.join(CONFIG_FILE);
         assert!(config_path.exists());
 
         // Verify 0600 permissions on unix
@@ -322,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_or_create_bucket_config_loads_existing() {
         let tmp = TempDir::new().unwrap();
-        let shoebox_dir = tmp.path().join(SHOEBOX_DIR);
+        let shoebox_dir = tmp.path().join("my-bucket");
         std::fs::create_dir_all(&shoebox_dir).unwrap();
 
         let config_toml = r#"
@@ -336,11 +410,41 @@ description = "Test credential"
 "#;
         std::fs::write(shoebox_dir.join(CONFIG_FILE), config_toml).unwrap();
 
-        let (config, freshly_created) = load_or_create_bucket_config(tmp.path()).await.unwrap();
+        let (config, freshly_created) = load_or_create_bucket_config(&shoebox_dir).await.unwrap();
         assert!(!freshly_created);
         assert_eq!(config.bucket_name.as_deref(), Some("my-custom-bucket"));
         assert!(config.versioning_enabled);
         assert_eq!(config.credentials.len(), 1);
         assert_eq!(config.credentials[0].access_key_id, "AKIATEST1234567890AB");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_bucket_default_shoebox_dir() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_root = tmp.path().join("photos");
+        std::fs::create_dir_all(&bucket_root).unwrap();
+
+        let state = resolve_bucket(&bucket_root, None).await.unwrap();
+        assert_eq!(state.name, "photos");
+        assert_eq!(state.shoebox_dir, state.root.join(SHOEBOX_DIR));
+        assert!(state.freshly_created);
+        assert!(state.shoebox_dir.join(CONFIG_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_bucket_with_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_root = tmp.path().join("photos");
+        let data_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&bucket_root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let state = resolve_bucket(&bucket_root, Some(&data_dir)).await.unwrap();
+        assert_eq!(state.name, "photos");
+        assert_eq!(state.shoebox_dir, data_dir.join("photos"));
+        assert!(state.freshly_created);
+        assert!(data_dir.join("photos").join(CONFIG_FILE).exists());
+        // .shoebox should NOT exist in the bucket root
+        assert!(!bucket_root.join(SHOEBOX_DIR).exists());
     }
 }
