@@ -52,7 +52,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Use --show-secrets to display secret access keys");
     }
 
-    // TODO: Add the Axum router and server here
+    // TODO(#6): Add the Axum router and server here
+    // https://github.com/deepjoy/shoebox/issues/6
     tracing::info!("Server startup complete (no HTTP listener yet — Phase 2)");
 
     Ok(())
