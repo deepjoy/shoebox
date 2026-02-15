@@ -100,7 +100,7 @@ pub async fn delete_object(
         Err(S3Error::NoSuchKey) => {}
         Err(e) => return Err(e),
     }
-    let _ = metadata.delete_object(key).await;
+    let _ = metadata.delete_object(key).await?;
     Ok(())
 }
 
