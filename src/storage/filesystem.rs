@@ -98,10 +98,14 @@ impl FilesystemStorage {
         Ok(path)
     }
 
-    /// Check if a key exists on disk (symlink-aware — does not follow links).
+    /// Check if a key exists as a file on disk (symlink-aware — does not follow links).
+    /// Returns `false` for directories.
     pub async fn exists(&self, key: &str) -> Result<bool, S3Error> {
         let path = self.resolve_path(key).await?;
-        Ok(tokio::fs::symlink_metadata(&path).await.is_ok())
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(meta) => Ok(!meta.is_dir()),
+            Err(_) => Ok(false),
+        }
     }
 
     /// Open a key for streaming read.
@@ -118,6 +122,10 @@ impl FilesystemStorage {
                 S3Error::InternalError
             }
         })?;
+
+        if meta.is_dir() {
+            return Err(S3Error::NoSuchKey);
+        }
 
         if meta.file_type().is_symlink() {
             let target = tokio::fs::read_link(&path)
@@ -296,6 +304,20 @@ mod tests {
         // Delete it
         storage.delete("to-delete.txt").await.unwrap();
         assert!(!storage.exists("to-delete.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_get_directory_returns_no_such_key() {
+        let tmp = TempDir::new().unwrap();
+        let storage = make_storage(&tmp);
+
+        // Create a directory (not a file)
+        std::fs::create_dir_all(tmp.path().join("somedir")).unwrap();
+
+        match storage.get("somedir").await {
+            Err(S3Error::NoSuchKey) => {}
+            other => panic!("Expected NoSuchKey, got {:?}", other),
+        }
     }
 
     #[tokio::test]

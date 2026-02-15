@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS objects (
     file_mtime TEXT,
 
     -- L3 metadata (NULL until content-hashed)
-    etag TEXT,
+    etag TEXT,                   -- stored WITH surrounding quotes, e.g. '"abc123"'
     content_hash TEXT,
 
     -- S3 metadata

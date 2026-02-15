@@ -12,7 +12,7 @@
 
 # --- Config -----------------------------------------------------------------
 
-DELAY="${DEMO_DELAY:-2.5}"
+DELAY="${DEMO_DELAY:-1.5}"
 
 # --- Palette — Akaroa / Coral Reef / Mongoose / Avocado / Como -------------
 
@@ -27,6 +27,7 @@ RESET='\033[0m'
 # --- Helpers ----------------------------------------------------------------
 
 banner() {
+  clear
   echo ""
   echo -e "${COMO}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
   echo -e "${BOLD}${AKAROA}  $1${RESET}"
@@ -42,7 +43,19 @@ step() {
 
 run() {
   echo -e "${MONGOOSE}\$ $1${RESET}"
-  eval "$1"
+  local start_ns end_ns elapsed_ms output line_count
+  start_ns=$(date +%s%N)
+  output=$(eval "$1" 2>&1)
+  end_ns=$(date +%s%N)
+  elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+  line_count=$(printf '%s\n' "$output" | wc -l)
+  if (( line_count > 80 )); then
+    echo -e "  ${CORAL}# … showing last 80 of $line_count lines${RESET}"
+    printf '%s\n' "$output" | tail -80
+  else
+    printf '%s\n' "$output"
+  fi
+  echo -e "  ${CORAL}(${elapsed_ms}ms)${RESET}"
   sleep "$DELAY"
 }
 
