@@ -1,5 +1,11 @@
+use std::sync::Arc;
+
 use clap::Parser;
-use shoebox::config::{resolve_all_buckets, ServerConfig};
+use shoebox::api::routes::create_router;
+use shoebox::config::{resolve_all_buckets, ServerConfig, METADATA_DB};
+use shoebox::metadata::MetadataStore;
+use shoebox::services::{AppState, LoadedBucket};
+use shoebox::storage::FilesystemStorage;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,17 +21,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig::parse();
     let buckets = resolve_all_buckets(&config).await?;
 
-    // Print startup info
-    println!(
-        "Serving {} bucket{} on http://{}:{}",
-        buckets.len(),
-        if buckets.len() == 1 { "" } else { "s" },
-        config.host,
-        config.port
-    );
-    println!();
-
+    let mut loaded_buckets = Vec::new();
     for bucket in &buckets {
+        // Open metadata database
+        let db_path = bucket.shoebox_dir.join(METADATA_DB);
+        let metadata = MetadataStore::new(&db_path).await?;
+
+        // Create storage layer
+        let storage = FilesystemStorage::new(bucket.root.clone());
+
+        loaded_buckets.push(LoadedBucket {
+            name: bucket.name.clone(),
+            config: bucket.config.clone(),
+            storage,
+            metadata,
+        });
+
+        // Print bucket info
         let show = config.show_secrets || bucket.freshly_created;
         println!("  {} → {}", bucket.name, bucket.root.display());
         if bucket.freshly_created {
@@ -43,6 +55,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
+    let listen_addr = format!("{}:{}", config.host, config.port);
+    println!(
+        "Serving {} bucket{} on http://{}",
+        loaded_buckets.len(),
+        if loaded_buckets.len() == 1 { "" } else { "s" },
+        listen_addr,
+    );
     if let Some(ref data_dir) = config.data_dir {
         println!("Credentials saved to {}/*/config.toml", data_dir.display());
     } else {
@@ -51,9 +70,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !config.show_secrets {
         println!("Use --show-secrets to display secret access keys");
     }
+    println!();
 
-    // TODO: Add the Axum router and server here
-    tracing::info!("Server startup complete (no HTTP listener yet — Phase 2)");
+    let state = AppState {
+        buckets: Arc::new(loaded_buckets),
+    };
+
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    tracing::info!("Listening on {}", listen_addr);
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
