@@ -22,7 +22,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../util/lib.sh"
 # --- Setup -------------------------------------------------------------------
 
 DEMO_ROOT="$(mktemp -d)"
-trap 'kill "$SERVER_PID" 2>/dev/null; rm -rf "$DEMO_ROOT"' EXIT
+trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; rm -rf "$DEMO_ROOT"' EXIT
 
 BUCKET_DIR="$DEMO_ROOT/photos"
 mkdir -p "$BUCKET_DIR"
@@ -197,3 +197,4 @@ echo ""
 ok "All Current S3 operations verified with the standard AWS CLI."
 ok "shoebox is a drop-in local replacement for S3."
 echo ""
+sleep "$END_DELAY"
