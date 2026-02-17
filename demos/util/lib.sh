@@ -7,12 +7,14 @@
 #   source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 #
 # Environment variables:
-#   DEMO_DELAY  — pause between steps (default 1.5s, set 0 for CI)
+#   DEMO_DELAY      — pause between steps (default 1.5s, set 0 for CI)
+#   DEMO_END_DELAY  — hold on final frame before exit (default 3s, set 0 for CI)
 # ============================================================================
 
 # --- Config -----------------------------------------------------------------
 
 DELAY="${DEMO_DELAY:-1.5}"
+END_DELAY="${DEMO_END_DELAY:-4}"
 
 # Disable the AWS CLI pager so demos don't hang waiting for user input.
 export AWS_PAGER=""
