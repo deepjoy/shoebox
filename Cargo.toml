@@ -50,6 +50,8 @@ bytes = "1.9"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
 url = "2"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "limit", "request-id"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.9"

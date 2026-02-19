@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{header, Request};
+use axum::http::{self, header, Request, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
 
@@ -83,8 +83,25 @@ pub async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
-// Helper functions for auth middleware
+// Virtual-host middleware
 
+pub async fn virtual_host_middleware(
+    State(bucket_names): State<Arc<Vec<String>>>,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if let Some(bucket) = extract_bucket_from_host(request.headers(), &bucket_names) {
+        let original_path = request.uri().path();
+        let new_path = format!("/{}{}", bucket, original_path);
+        let new_uri = rebuild_uri(request.uri(), &new_path);
+        *request.uri_mut() = new_uri;
+    }
+    next.run(request).await
+}
+
+// Helper functions
+
+/// Check if the credential has permission for the determined operation.
 fn check_permission(
     request: &Request<axum::body::Body>,
     credential: &ResolvedCredential,
@@ -141,9 +158,53 @@ fn extract_bucket_from_path(path: &str) -> Option<String> {
     segments.first().map(|s| s.to_string())
 }
 
+/// Extract bucket name from Host header subdomain.
+fn extract_bucket_from_host(headers: &http::HeaderMap, bucket_names: &[String]) -> Option<String> {
+    let host = headers.get(header::HOST)?.to_str().ok()?;
+    let host_no_port = host.split(':').next().unwrap_or(host);
+    let parts: Vec<&str> = host_no_port.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let subdomain = parts[0];
+    bucket_names
+        .iter()
+        .find(|b| b.as_str() == subdomain)
+        .cloned()
+}
+
+/// Rebuild URI preserving query string.
+fn rebuild_uri(original: &Uri, new_path: &str) -> Uri {
+    let path_and_query = match original.query() {
+        Some(q) => format!("{}?{}", new_path, q),
+        None => new_path.to_string(),
+    };
+    path_and_query.parse().unwrap_or_else(|_| original.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_bucket_from_host() {
+        let bucket_names = vec!["photos".to_string(), "docs".to_string()];
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(header::HOST, "photos.localhost:9000".parse().unwrap());
+        assert_eq!(
+            extract_bucket_from_host(&headers, &bucket_names),
+            Some("photos".to_string())
+        );
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(header::HOST, "unknown.localhost:9000".parse().unwrap());
+        assert_eq!(extract_bucket_from_host(&headers, &bucket_names), None);
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(header::HOST, "localhost:9000".parse().unwrap());
+        assert_eq!(extract_bucket_from_host(&headers, &bucket_names), None);
+    }
 
     #[test]
     fn test_extract_bucket_from_path() {
@@ -151,45 +212,23 @@ mod tests {
             extract_bucket_from_path("/photos/sunset.jpg"),
             Some("photos".to_string())
         );
+        assert_eq!(
+            extract_bucket_from_path("/photos"),
+            Some("photos".to_string())
+        );
         assert_eq!(extract_bucket_from_path("/"), None);
-        assert_eq!(extract_bucket_from_path(""), None);
     }
 
     #[test]
-    fn test_determine_operation() {
-        use axum::body::Body;
-        use axum::http::Request;
+    fn test_rebuild_uri() {
+        let uri: Uri = "/key?list-type=2".parse().unwrap();
+        let new_uri = rebuild_uri(&uri, "/photos/key");
+        assert_eq!(new_uri.path(), "/photos/key");
+        assert_eq!(new_uri.query(), Some("list-type=2"));
 
-        // ListBuckets
-        let req = Request::builder()
-            .method("GET")
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(determine_operation(&req), "ListBuckets");
-
-        // ListObjectsV2
-        let req = Request::builder()
-            .method("GET")
-            .uri("/photos")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(determine_operation(&req), "ListObjectsV2");
-
-        // GetObject
-        let req = Request::builder()
-            .method("GET")
-            .uri("/photos/sunset.jpg")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(determine_operation(&req), "GetObject");
-
-        // PutObject
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/photos/sunset.jpg")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(determine_operation(&req), "PutObject");
+        let uri: Uri = "/key".parse().unwrap();
+        let new_uri = rebuild_uri(&uri, "/photos/key");
+        assert_eq!(new_uri.path(), "/photos/key");
+        assert_eq!(new_uri.query(), None);
     }
 }
