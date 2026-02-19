@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::auth::provider::CredentialProvider;
 use crate::config::BucketConfig;
 use crate::error::S3Error;
 use crate::metadata::MetadataStore;
@@ -18,6 +19,8 @@ pub struct LoadedBucket {
 #[derive(Clone)]
 pub struct AppState {
     pub buckets: Arc<HashMap<String, LoadedBucket>>,
+    pub credential_provider: Arc<tokio::sync::RwLock<CredentialProvider>>,
+    pub bucket_names: Arc<Vec<String>>,
 }
 
 impl AppState {

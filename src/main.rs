@@ -76,8 +76,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
+    // Temporary: Create empty credential provider (will be populated in Commit 15)
+    use shoebox::auth::provider::CredentialProvider;
+    let credential_provider = Arc::new(tokio::sync::RwLock::new(CredentialProvider::from_buckets(
+        &[],
+    )));
+    let bucket_names = Arc::new(loaded_buckets.keys().cloned().collect::<Vec<String>>());
+
     let state = AppState {
         buckets: Arc::new(loaded_buckets),
+        credential_provider,
+        bucket_names,
     };
 
     let app = create_router(state);

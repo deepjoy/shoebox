@@ -1,12 +1,20 @@
 use axum::{
+    middleware,
     routing::{delete, get, head, post, put},
     Router,
 };
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
+use tower_http::trace::TraceLayer;
 
+use crate::auth;
 use crate::handlers;
 use crate::services::AppState;
 
 pub fn create_router(state: AppState) -> Router {
+    let credential_provider = state.credential_provider.clone();
+    let bucket_names = state.bucket_names.clone();
+
     Router::new()
         // Service-level: GET / → ListBuckets
         .route("/", get(handlers::bucket::list_buckets))
@@ -20,4 +28,16 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{bucket}/{*key}", delete(handlers::object::delete_object))
         .route("/{bucket}/{*key}", head(handlers::object::head_object))
         .with_state(state)
+        // Innermost → outermost:
+        .layer(TraceLayer::new_for_http())
+        .layer(RequestBodyLimitLayer::new(5 * 1024 * 1024 * 1024)) // 5GB S3 PUT limit
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        .layer(middleware::from_fn_with_state(
+            credential_provider,
+            auth::auth_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            bucket_names,
+            auth::virtual_host_middleware,
+        ))
 }
