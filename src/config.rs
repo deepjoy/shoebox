@@ -521,4 +521,133 @@ description = "Test credential"
         // .shoebox should NOT exist in the bucket root
         assert!(!bucket_root.join(SHOEBOX_DIR).exists());
     }
+
+    #[tokio::test]
+    async fn test_save_bucket_config_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let shoebox_dir = tmp.path().join("roundtrip-bucket");
+
+        let config = BucketConfig {
+            bucket_name: Some("my-bucket".to_string()),
+            versioning_enabled: true,
+            credentials: vec![Credential {
+                access_key_id: "AKIATEST1234567890AB".to_string(),
+                secret_access_key: "secretkey1234567890123456789012345678".to_string(),
+                description: Some("Test cred".to_string()),
+                permissions: Some(vec!["read".to_string(), "write".to_string()]),
+            }],
+        };
+
+        save_bucket_config(&shoebox_dir, &config).await.unwrap();
+
+        // Load it back
+        let (loaded, freshly_created) = load_or_create_bucket_config(&shoebox_dir).await.unwrap();
+        assert!(!freshly_created);
+        assert_eq!(loaded.bucket_name.as_deref(), Some("my-bucket"));
+        assert!(loaded.versioning_enabled);
+        assert_eq!(loaded.credentials.len(), 1);
+        assert_eq!(loaded.credentials[0].access_key_id, "AKIATEST1234567890AB");
+        assert_eq!(
+            loaded.credentials[0].permissions.as_ref().unwrap(),
+            &vec!["read".to_string(), "write".to_string()]
+        );
+
+        // Verify 0600 permissions on unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let config_path = shoebox_dir.join(CONFIG_FILE);
+            let meta = std::fs::metadata(&config_path).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_save_bucket_config_overwrites_existing() {
+        let tmp = TempDir::new().unwrap();
+        let shoebox_dir = tmp.path().join("overwrite-test");
+
+        let config_v1 = BucketConfig {
+            bucket_name: Some("v1".to_string()),
+            versioning_enabled: false,
+            credentials: vec![],
+        };
+        save_bucket_config(&shoebox_dir, &config_v1).await.unwrap();
+
+        let config_v2 = BucketConfig {
+            bucket_name: Some("v2".to_string()),
+            versioning_enabled: true,
+            credentials: vec![Credential {
+                access_key_id: "AKIANEW".to_string(),
+                secret_access_key: "newsecret".to_string(),
+                description: None,
+                permissions: None,
+            }],
+        };
+        save_bucket_config(&shoebox_dir, &config_v2).await.unwrap();
+
+        let (loaded, _) = load_or_create_bucket_config(&shoebox_dir).await.unwrap();
+        assert_eq!(loaded.bucket_name.as_deref(), Some("v2"));
+        assert!(loaded.versioning_enabled);
+        assert_eq!(loaded.credentials.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_load_global_config() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("shoebox.toml");
+
+        let config_content = r#"
+host = "127.0.0.1"
+port = 8080
+buckets = ["/tmp/photos", "/tmp/docs"]
+
+[[credentials]]
+access_key_id = "AKIAGLOBAL1234567890"
+secret_access_key = "globalsecret1234567890123456789012345678"
+description = "Global admin"
+"#;
+        std::fs::write(&config_path, config_content).unwrap();
+
+        let config = load_global_config(&config_path).await.unwrap();
+        assert_eq!(config.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(config.port, Some(8080));
+        assert_eq!(config.credentials.len(), 1);
+        assert_eq!(config.credentials[0].access_key_id, "AKIAGLOBAL1234567890");
+        assert_eq!(config.buckets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_load_global_config_minimal() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("minimal.toml");
+
+        // Only buckets, no credentials or server overrides
+        std::fs::write(&config_path, "buckets = [\"/tmp/data\"]\n").unwrap();
+
+        let config = load_global_config(&config_path).await.unwrap();
+        assert!(config.host.is_none());
+        assert!(config.port.is_none());
+        assert!(config.credentials.is_empty());
+        assert_eq!(config.buckets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_load_global_config_malformed_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("bad.toml");
+        std::fs::write(&config_path, "this is not valid toml [[[").unwrap();
+
+        let result = load_global_config(&config_path).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_load_global_config_missing_file_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("nonexistent.toml");
+
+        let result = load_global_config(&config_path).await;
+        assert!(result.is_err());
+    }
 }
