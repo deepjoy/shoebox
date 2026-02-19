@@ -39,6 +39,8 @@ toml = "0.8"
 md-5 = "0.10"
 hex = "0.4"
 base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
 
 # Utilities
 uuid = { version = "1.11", features = ["v4"] }
@@ -47,6 +49,9 @@ thiserror = "2.0"
 bytes = "1.9"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
+url = "2"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "limit", "request-id"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.9"

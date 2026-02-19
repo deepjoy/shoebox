@@ -33,6 +33,21 @@ pub enum S3Error {
     #[error("Your previous request to create the named bucket succeeded and you already own it")]
     BucketAlreadyOwnedByYou,
 
+    #[error("The AWS Access Key Id you provided does not exist in our records")]
+    InvalidAccessKeyId,
+
+    #[error("The provided token has expired")]
+    ExpiredToken,
+
+    #[error("The authorization header is malformed")]
+    AuthorizationHeaderMalformed,
+
+    #[error("Your request was missing a required header")]
+    MissingSecurityHeader,
+
+    #[error("The specified credential does not exist")]
+    NoSuchCredential,
+
     #[error("We encountered an internal error, please try again")]
     InternalError,
 }
@@ -51,6 +66,11 @@ impl S3Error {
             Self::MethodNotAllowed => "MethodNotAllowed",
             Self::BucketAlreadyExists => "BucketAlreadyExists",
             Self::BucketAlreadyOwnedByYou => "BucketAlreadyOwnedByYou",
+            Self::InvalidAccessKeyId => "InvalidAccessKeyId",
+            Self::ExpiredToken => "ExpiredToken",
+            Self::AuthorizationHeaderMalformed => "AuthorizationHeaderMalformed",
+            Self::MissingSecurityHeader => "MissingSecurityHeader",
+            Self::NoSuchCredential => "NoSuchCredential",
             Self::InternalError => "InternalError",
         }
     }
@@ -64,10 +84,16 @@ impl S3Error {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::NoSuchBucket | Self::NoSuchKey => StatusCode::NOT_FOUND,
-            Self::AccessDenied | Self::SignatureDoesNotMatch => StatusCode::FORBIDDEN,
-            Self::InvalidBucketName | Self::InvalidArgument | Self::BadDigest => {
-                StatusCode::BAD_REQUEST
+            Self::AccessDenied | Self::SignatureDoesNotMatch | Self::InvalidAccessKeyId => {
+                StatusCode::FORBIDDEN
             }
+            Self::InvalidBucketName
+            | Self::InvalidArgument
+            | Self::BadDigest
+            | Self::ExpiredToken
+            | Self::AuthorizationHeaderMalformed
+            | Self::MissingSecurityHeader => StatusCode::BAD_REQUEST,
+            Self::NoSuchCredential => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::BucketAlreadyExists | Self::BucketAlreadyOwnedByYou => StatusCode::CONFLICT,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,

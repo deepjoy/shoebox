@@ -31,6 +31,7 @@ pub struct WriteResult {
 /// - `.shoebox/` directory is excluded from access
 /// - Intermediate symlinks are blocked (only leaf symlinks allowed)
 /// - Symlinks are never followed; their target is returned as content
+#[derive(Clone)]
 pub struct FilesystemStorage {
     root: PathBuf,
 }
