@@ -33,6 +33,12 @@ pub enum S3Error {
     #[error("Your previous request to create the named bucket succeeded and you already own it")]
     BucketAlreadyOwnedByYou,
 
+    #[error("The authorization header is malformed")]
+    AuthorizationHeaderMalformed,
+
+    #[error("Your request was missing a required header")]
+    MissingSecurityHeader,
+
     #[error("We encountered an internal error, please try again")]
     InternalError,
 }
@@ -51,6 +57,8 @@ impl S3Error {
             Self::MethodNotAllowed => "MethodNotAllowed",
             Self::BucketAlreadyExists => "BucketAlreadyExists",
             Self::BucketAlreadyOwnedByYou => "BucketAlreadyOwnedByYou",
+            Self::AuthorizationHeaderMalformed => "AuthorizationHeaderMalformed",
+            Self::MissingSecurityHeader => "MissingSecurityHeader",
             Self::InternalError => "InternalError",
         }
     }
@@ -65,9 +73,11 @@ impl S3Error {
         match self {
             Self::NoSuchBucket | Self::NoSuchKey => StatusCode::NOT_FOUND,
             Self::AccessDenied | Self::SignatureDoesNotMatch => StatusCode::FORBIDDEN,
-            Self::InvalidBucketName | Self::InvalidArgument | Self::BadDigest => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::InvalidBucketName
+            | Self::InvalidArgument
+            | Self::BadDigest
+            | Self::AuthorizationHeaderMalformed
+            | Self::MissingSecurityHeader => StatusCode::BAD_REQUEST,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::BucketAlreadyExists | Self::BucketAlreadyOwnedByYou => StatusCode::CONFLICT,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
