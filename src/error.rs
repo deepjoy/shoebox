@@ -33,6 +33,9 @@ pub enum S3Error {
     #[error("Your previous request to create the named bucket succeeded and you already own it")]
     BucketAlreadyOwnedByYou,
 
+    #[error("The provided token has expired")]
+    ExpiredToken,
+
     #[error("The authorization header is malformed")]
     AuthorizationHeaderMalformed,
 
@@ -57,6 +60,7 @@ impl S3Error {
             Self::MethodNotAllowed => "MethodNotAllowed",
             Self::BucketAlreadyExists => "BucketAlreadyExists",
             Self::BucketAlreadyOwnedByYou => "BucketAlreadyOwnedByYou",
+            Self::ExpiredToken => "ExpiredToken",
             Self::AuthorizationHeaderMalformed => "AuthorizationHeaderMalformed",
             Self::MissingSecurityHeader => "MissingSecurityHeader",
             Self::InternalError => "InternalError",
@@ -76,6 +80,7 @@ impl S3Error {
             Self::InvalidBucketName
             | Self::InvalidArgument
             | Self::BadDigest
+            | Self::ExpiredToken
             | Self::AuthorizationHeaderMalformed
             | Self::MissingSecurityHeader => StatusCode::BAD_REQUEST,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,

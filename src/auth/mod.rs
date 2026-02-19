@@ -1,3 +1,4 @@
+pub mod presigned;
 pub mod provider;
 pub mod sigv4;
 
