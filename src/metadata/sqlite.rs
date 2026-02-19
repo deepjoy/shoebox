@@ -43,6 +43,7 @@ pub struct ObjectRecord {
 }
 
 /// SQLite-backed metadata store for a single bucket.
+#[derive(Clone)]
 pub struct MetadataStore {
     pool: SqlitePool,
 }
