@@ -18,6 +18,20 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         // Service-level: GET / → ListBuckets
         .route("/", get(handlers::bucket::list_buckets))
+        // Admin endpoints
+        .route(
+            "/_shoebox/credentials",
+            post(crate::api::credentials::create_credential)
+                .get(crate::api::credentials::list_credentials),
+        )
+        .route(
+            "/_shoebox/credentials/{access_key_id}",
+            delete(crate::api::credentials::delete_credential),
+        )
+        .route(
+            "/_shoebox/reload",
+            post(crate::api::credentials::reload_config),
+        )
         // Bucket-level
         .route("/{bucket}", head(handlers::bucket::head_bucket))
         .route("/{bucket}", get(handlers::bucket::bucket_or_list))

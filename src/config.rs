@@ -4,6 +4,42 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{validate_bucket_name, BucketNameError};
 
+// ── Global config (--config / SHOEBOX_CONFIG) ─────────────────────────────
+
+/// Global configuration file loaded via `--config` or `SHOEBOX_CONFIG`.
+///
+/// Supports cross-bucket credentials and shared settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GlobalConfig {
+    /// Global credentials that apply to all buckets.
+    #[serde(default)]
+    pub credentials: Vec<Credential>,
+
+    /// Listen address override.
+    #[serde(default)]
+    pub host: Option<String>,
+
+    /// Listen port override.
+    #[serde(default)]
+    pub port: Option<u16>,
+
+    /// Bucket paths (alternative to CLI positional args).
+    #[serde(default)]
+    pub buckets: Vec<PathBuf>,
+}
+
+/// Load a global configuration file.
+pub async fn load_global_config(path: &Path) -> std::io::Result<GlobalConfig> {
+    let contents = tokio::fs::read_to_string(path).await?;
+    let config: GlobalConfig = toml::from_str(&contents).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to parse global config {}: {e}", path.display()),
+        )
+    })?;
+    Ok(config)
+}
+
 /// Directory name for per-bucket metadata/config.
 pub const SHOEBOX_DIR: &str = ".shoebox";
 /// Config file within the shoebox directory.
@@ -251,6 +287,33 @@ pub async fn load_or_create_bucket_config(
     }
 
     Ok((config, true))
+}
+
+/// Save a bucket config to `<shoebox_dir>/config.toml`.
+pub async fn save_bucket_config(shoebox_dir: &Path, config: &BucketConfig) -> std::io::Result<()> {
+    let config_path = shoebox_dir.join(CONFIG_FILE);
+    let toml_str = toml::to_string_pretty(config)
+        .map_err(|e| std::io::Error::other(format!("Failed to serialize config: {e}")))?;
+
+    tokio::fs::create_dir_all(shoebox_dir).await?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&config_path)?;
+        std::io::Write::write_all(&mut file, toml_str.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::write(&config_path, &toml_str).await?;
+    }
+
+    Ok(())
 }
 
 /// Resolve a directory path into a full `BucketState`.
