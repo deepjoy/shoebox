@@ -191,11 +191,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut loaded_buckets = HashMap::new();
     for bucket in &buckets {
-        // Open metadata database
         let db_path = bucket.shoebox_dir.join(METADATA_DB);
         let metadata = MetadataStore::new(&db_path).await?;
-
-        // Create storage layer
         let storage = FilesystemStorage::new(bucket.root.clone());
 
         loaded_buckets.insert(
@@ -210,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Print bucket info
         let show = config.show_secrets || bucket.freshly_created;
-        println!("  {} → {}", bucket.name, bucket.root.display());
+        println!("  {} -> {}", bucket.name, bucket.root.display());
         if bucket.freshly_created {
             println!("    (new) Credentials generated:");
         } else {
@@ -225,6 +222,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!();
     }
+
+    // Build credential provider from all bucket configs + global config
+    let all_bucket_creds: Vec<(String, BucketConfigRef)> = buckets
+        .iter()
+        .map(|b| (b.name.clone(), BucketConfigRef(&b.config)))
+        .collect();
+
+    let mut provider = CredentialProvider::from_buckets(
+        &all_bucket_creds
+            .iter()
+            .map(|(n, c)| (n.clone(), c.0))
+            .collect::<Vec<_>>(),
+    );
+
+    // Add global credentials (bucket_name = None, applies to all buckets)
+    if let Some(ref gc) = global_config {
+        for cred in &gc.credentials {
+            let permissions = cred
+                .permissions
+                .as_ref()
+                .map(|perms| {
+                    perms
+                        .iter()
+                        .filter_map(|s| shoebox::auth::provider::Permission::parse(s))
+                        .collect()
+                })
+                .unwrap_or_default();
+            provider.insert(shoebox::auth::provider::ResolvedCredential {
+                access_key_id: cred.access_key_id.clone(),
+                secret_access_key: cred.secret_access_key.clone(),
+                permissions,
+                bucket_name: None,
+                description: cred.description.clone(),
+            });
+        }
+    }
+
+    let _bucket_names: Vec<String> = loaded_buckets.keys().cloned().collect();
 
     let listen_addr = format!("{}:{}", config.host, config.port);
     println!(
