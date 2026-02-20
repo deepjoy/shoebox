@@ -259,7 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let bucket_names: Vec<String> = loaded_buckets.keys().cloned().collect();
+    let _bucket_names: Vec<String> = loaded_buckets.keys().cloned().collect();
 
     let listen_addr = format!("{}:{}", config.host, config.port);
     println!(
