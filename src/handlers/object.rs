@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use futures::StreamExt;
 
@@ -31,7 +31,7 @@ fn format_http_date(dt: &time::OffsetDateTime) -> String {
 pub async fn get_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
-) -> Result<ObjectResponse, S3Error> {
+) -> Result<Response, S3Error> {
     let bucket = state.get_bucket(&bucket)?;
     let result = object_service::get_object(&bucket.storage, &bucket.metadata, &key).await?;
 
@@ -50,7 +50,8 @@ pub async fn get_object(
                 etag: metadata.etag.unwrap_or_default(),
                 last_modified: format_http_date(&metadata.last_modified),
                 metadata: parse_metadata_json(&metadata.metadata),
-            })
+            }
+            .into_response())
         }
         FileContent::Symlink { target, len } => {
             let body = axum::body::Body::from(target.into_bytes());
@@ -62,7 +63,8 @@ pub async fn get_object(
                 etag: metadata.etag.unwrap_or_default(),
                 last_modified: format_http_date(&metadata.last_modified),
                 metadata: parse_metadata_json(&metadata.metadata),
-            })
+            }
+            .into_response())
         }
     }
 }
@@ -73,7 +75,7 @@ pub async fn put_object(
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
     body: axum::body::Body,
-) -> Result<impl IntoResponse, S3Error> {
+) -> Result<Response, S3Error> {
     let bucket = state.get_bucket(&bucket)?;
 
     let stream = body
@@ -96,24 +98,24 @@ pub async fn put_object(
     let result =
         object_service::put_object(&bucket.storage, &bucket.metadata, &key, stream, input).await?;
 
-    Ok(([(header::ETAG, result.etag)], StatusCode::OK))
+    Ok(([(header::ETAG, result.etag)], StatusCode::OK).into_response())
 }
 
 /// DELETE /{bucket}/{key} — delete an object.
 pub async fn delete_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
-) -> Result<StatusCode, S3Error> {
+) -> Result<Response, S3Error> {
     let bucket = state.get_bucket(&bucket)?;
     object_service::delete_object(&bucket.storage, &bucket.metadata, &key).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// HEAD /{bucket}/{key} — get object metadata without body.
 pub async fn head_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
-) -> Result<impl IntoResponse, S3Error> {
+) -> Result<Response, S3Error> {
     let bucket = state.get_bucket(&bucket)?;
     let metadata = object_service::head_object(&bucket.storage, &bucket.metadata, &key).await?;
 
