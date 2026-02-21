@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use crate::api::extractors::extract_metadata_headers;
 use crate::api::responses::ObjectResponse;
 use crate::error::S3Error;
+use crate::handlers::tagging;
 use crate::metadata::sqlite::ObjectRecord;
 use crate::services::copy_service::{self, CopyConditions};
 use crate::services::object_service::{self, PutObjectInput};
@@ -88,11 +89,22 @@ fn check_conditional(
 }
 
 /// GET /{bucket}/{key} — download an object with range and conditional support.
+/// Also dispatches to GetObjectTagging if `?tagging` is present.
 pub async fn get_object(
-    State(state): State<AppState>,
-    Path((bucket_name, key)): Path<(String, String)>,
+    state: State<AppState>,
+    path: Path<(String, String)>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, S3Error> {
+    // Dispatch to tagging handler if ?tagging is present
+    if has_query_param(query.as_deref(), "tagging") {
+        return tagging::get_object_tagging(state, path)
+            .await
+            .map(IntoResponse::into_response);
+    }
+
+    let State(state) = state;
+    let Path((bucket_name, key)) = path;
     let bucket = state.get_bucket(&bucket_name)?;
     let record = bucket
         .metadata
@@ -187,13 +199,25 @@ pub async fn get_object(
     }
 }
 
-/// PUT /{bucket}/{key} — upload, copy, or rename an object.
+/// PUT /{bucket}/{key} — upload, copy, rename, or set tags.
+/// Dispatches to PutObjectTagging if `?tagging` is present.
 pub async fn put_object(
-    State(state): State<AppState>,
-    Path((bucket_name, key)): Path<(String, String)>,
+    state: State<AppState>,
+    path: Path<(String, String)>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, S3Error> {
+    // Dispatch to tagging handler if ?tagging is present
+    if has_query_param(query.as_deref(), "tagging") {
+        return tagging::put_object_tagging(state, path, body)
+            .await
+            .map(IntoResponse::into_response);
+    }
+
+    let State(state) = state;
+    let Path((bucket_name, key)) = path;
+
     // Check for copy-source header
     if let Some(copy_source) = headers.get("x-amz-copy-source") {
         let is_rename = headers
@@ -275,11 +299,22 @@ pub async fn put_object(
     Ok(([(header::ETAG, result.etag)], StatusCode::OK).into_response())
 }
 
-/// DELETE /{bucket}/{key} — delete an object.
+/// DELETE /{bucket}/{key} — delete an object or its tags.
+/// Dispatches to DeleteObjectTagging if `?tagging` is present.
 pub async fn delete_object(
-    State(state): State<AppState>,
-    Path((bucket, key)): Path<(String, String)>,
+    state: State<AppState>,
+    path: Path<(String, String)>,
+    RawQuery(query): RawQuery,
 ) -> Result<Response, S3Error> {
+    // Dispatch to tagging handler if ?tagging is present
+    if has_query_param(query.as_deref(), "tagging") {
+        return tagging::delete_object_tagging(state, path)
+            .await
+            .map(IntoResponse::into_response);
+    }
+
+    let State(state) = state;
+    let Path((bucket, key)) = path;
     let bucket = state.get_bucket(&bucket)?;
     object_service::delete_object(&bucket.storage, &bucket.metadata, &key).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -405,6 +440,18 @@ fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64), S3Error> {
         let start: u64 = start_str.parse().map_err(|_| S3Error::InvalidRange)?;
         let end: u64 = end_str.parse().map_err(|_| S3Error::InvalidRange)?;
         Ok((start, end))
+    }
+}
+
+fn has_query_param(query: Option<&str>, param: &str) -> bool {
+    match query {
+        Some(q) => {
+            q == param
+                || q.starts_with(&format!("{}&", param))
+                || q.contains(&format!("&{}", param))
+                || q.starts_with(&format!("{}=", param))
+        }
+        None => false,
     }
 }
 

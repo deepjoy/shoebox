@@ -251,6 +251,49 @@ if echo "$RESULT" | grep -qi "PreconditionFailed\|Precondition\|412"; then
 fi
 sleep "$DELAY"
 
+# ── 8. Object tagging — Put / Get / Delete ────────────────────────────────
+
+banner "Object Tagging — Put / Get / Delete"
+
+step "Set tags on fox.txt via AWS CLI"
+run "aws s3api put-object-tagging --bucket photos --key animals/fox.txt --tagging 'TagSet=[{Key=environment,Value=production},{Key=category,Value=animals}]'"
+
+step "Get tags via AWS CLI"
+run "aws s3api get-object-tagging --bucket photos --key animals/fox.txt"
+ok "Put/Get object tags work via AWS CLI"
+
+step "Delete tags"
+run "aws s3api delete-object-tagging --bucket photos --key animals/fox.txt"
+
+step "Verify tags deleted (empty TagSet)"
+run "aws s3api get-object-tagging --bucket photos --key animals/fox.txt"
+ok "Delete object tags works"
+sleep "$DELAY"
+
+# ── 9. Tag limits ─────────────────────────────────────────────────────────
+
+banner "Object Tagging — Limit Enforcement"
+
+step "Try setting 11 tags (limit is 10, should fail)"
+TAGS=""
+for i in $(seq 1 11); do
+  TAGS+="{Key=tag$i,Value=val$i},"
+done
+TAGS="[${TAGS%,}]"
+HTTP_CODE=$(aws s3api put-object-tagging --bucket photos --key animals/fox.txt --tagging "TagSet=$TAGS" 2>&1 || true)
+note "$HTTP_CODE"
+ok "Tag limit (max 10) enforced"
+
+step "Set exactly 10 tags (should succeed)"
+TAGS=""
+for i in $(seq 1 10); do
+  TAGS+="{Key=tag$i,Value=val$i},"
+done
+TAGS="[${TAGS%,}]"
+run "aws s3api put-object-tagging --bucket photos --key animals/fox.txt --tagging 'TagSet=$TAGS'"
+ok "10 tags accepted"
+sleep "$DELAY"
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 
 banner "Phase 4 Demo Complete"
@@ -267,5 +310,7 @@ note "  - If-Match success and failure"
 note "  - If-None-Match returns 304"
 note "  - If-Modified-Since works"
 note "  - If-Unmodified-Since works"
+note "  - Object tagging put/get/delete"
+note "  - Tag limit enforcement (max 10)"
 
 sleep "${END_DELAY}"

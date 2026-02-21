@@ -404,6 +404,64 @@ impl MetadataStore {
 
         Ok(row.0)
     }
+
+    /// Get all tags for an object (looked up by key).
+    pub async fn get_object_tags(&self, key: &str) -> Result<Vec<Tag>, S3Error> {
+        let tags = sqlx::query_as::<_, Tag>(
+            "SELECT t.key, t.value FROM object_tags t \
+             INNER JOIN objects o ON t.object_id = o.id \
+             WHERE o.key = ? ORDER BY t.key",
+        )
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(tags)
+    }
+
+    /// Insert a single tag for an object (looked up by key).
+    pub async fn insert_object_tag(&self, key: &str, tag: &Tag) -> Result<(), S3Error> {
+        let object_id: Option<(String,)> = sqlx::query_as("SELECT id FROM objects WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        let (object_id,) = object_id.ok_or(S3Error::NoSuchKey)?;
+        let tag_id = uuid::Uuid::new_v4().to_string();
+
+        sqlx::query(
+            "INSERT INTO object_tags (id, object_id, key, value) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(object_id, key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(&tag_id)
+        .bind(&object_id)
+        .bind(&tag.key)
+        .bind(&tag.value)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete all tags for an object (looked up by key).
+    pub async fn delete_object_tags(&self, key: &str) -> Result<(), S3Error> {
+        sqlx::query(
+            "DELETE FROM object_tags WHERE object_id IN \
+             (SELECT id FROM objects WHERE key = ?)",
+        )
+        .bind(key)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+}
+
+/// Object tag key-value pair.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct Tag {
+    pub key: String,
+    pub value: String,
 }
 
 #[cfg(test)]

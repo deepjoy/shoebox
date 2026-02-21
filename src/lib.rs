@@ -20,11 +20,11 @@ use crate::auth::presigned;
 use crate::auth::provider::CredentialProvider;
 use crate::config::{resolve_bucket, BucketConfig, METADATA_DB};
 use crate::error::S3Error;
-use crate::metadata::sqlite::ObjectRecord;
+use crate::metadata::sqlite::{ObjectRecord, Tag};
 use crate::metadata::MetadataStore;
 use crate::services::copy_service::{self, CopyConditions, CopyResult};
 use crate::services::object_service::{self, GetObjectResult, PutObjectInput, PutObjectResult};
-use crate::services::{AppState, LoadedBucket};
+use crate::services::{tagging_service, AppState, LoadedBucket};
 use crate::storage::filesystem::FilesystemStorage;
 
 /// Per-bucket runtime state owned by Shoebox.
@@ -121,6 +121,21 @@ impl Shoebox {
             conditions,
         )
         .await
+    }
+
+    pub async fn get_tags(&self, bucket: &str, key: &str) -> Result<Vec<Tag>, S3Error> {
+        let b = self.get_bucket(bucket)?;
+        tagging_service::get_tags(&b.metadata, key).await
+    }
+
+    pub async fn put_tags(&self, bucket: &str, key: &str, tags: Vec<Tag>) -> Result<(), S3Error> {
+        let b = self.get_bucket(bucket)?;
+        tagging_service::put_tags(&b.metadata, key, tags).await
+    }
+
+    pub async fn delete_tags(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
+        let b = self.get_bucket(bucket)?;
+        tagging_service::delete_tags(&b.metadata, key).await
     }
 
     pub fn presign_get(
