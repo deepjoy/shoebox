@@ -200,7 +200,8 @@ pub async fn get_object(
 }
 
 /// PUT /{bucket}/{key} — upload, copy, rename, or set tags.
-/// Dispatches to PutObjectTagging if `?tagging` is present.
+/// Dispatches to PutObjectTagging if `?tagging` is present,
+/// and UploadPart if `?partNumber` and `?uploadId` are present.
 pub async fn put_object(
     state: State<AppState>,
     path: Path<(String, String)>,
@@ -208,6 +209,25 @@ pub async fn put_object(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, S3Error> {
+    // Dispatch to UploadPart if ?partNumber and ?uploadId are present
+    if has_query_param(query.as_deref(), "partNumber")
+        && has_query_param(query.as_deref(), "uploadId")
+    {
+        use crate::handlers::multipart::UploadPartQuery;
+        let params = parse_query_params(query.as_deref());
+        let upload_part_query = UploadPartQuery {
+            part_number: params.get("partNumber").and_then(|s| s.parse().ok()),
+            upload_id: params.get("uploadId").cloned(),
+        };
+        return crate::handlers::multipart::upload_part(
+            state,
+            path,
+            axum::extract::Query(upload_part_query),
+            body,
+        )
+        .await;
+    }
+
     // Dispatch to tagging handler if ?tagging is present
     if has_query_param(query.as_deref(), "tagging") {
         return tagging::put_object_tagging(state, path, body)
@@ -473,12 +493,17 @@ fn parse_metadata_json(raw: &Option<String>) -> HashMap<String, String> {
 /// Dispatches to InitiateMultipartUpload if `?uploads` is present,
 /// and CompleteMultipartUpload if `?uploadId` is present.
 pub async fn post_object(
-    _state: State<AppState>,
-    _path: Path<(String, String)>,
-    RawQuery(_query): RawQuery,
-    _headers: HeaderMap,
+    state: State<AppState>,
+    path: Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
     _body: axum::body::Body,
 ) -> Result<Response, S3Error> {
+    // Dispatch to InitiateMultipartUpload if ?uploads is present
+    if has_query_param(query.as_deref(), "uploads") {
+        return crate::handlers::multipart::initiate_multipart_upload(state, path, headers).await;
+    }
+
     Err(S3Error::MethodNotAllowed)
 }
 
@@ -496,7 +521,6 @@ fn has_query_param(query: Option<&str>, param: &str) -> bool {
 }
 
 /// Parse query string into a HashMap.
-#[allow(dead_code)] // Used in upcoming multipart dispatch commits
 fn parse_query_params(query: Option<&str>) -> HashMap<String, String> {
     query
         .map(|q| {

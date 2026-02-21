@@ -82,9 +82,49 @@ export AWS_ENDPOINT_URL="$ENDPOINT"
 ok "Server started on $ENDPOINT with bucket: uploads"
 sleep "$DELAY"
 
+# ── 2. Initiate + Upload Parts ────────────────────────────────────────────
+
+banner "Initiate + Upload Parts"
+
+step "Create test file (split into 3 parts)"
+echo "Part 1: The quick brown fox" > "$DEMO_ROOT/part1.txt"
+echo "Part 2: jumps over the lazy" > "$DEMO_ROOT/part2.txt"
+echo "Part 3: dog." > "$DEMO_ROOT/part3.txt"
+
+step "Initiate multipart upload"
+INITIATE_RESPONSE=$(signed_curl POST "/uploads/test-file.txt?uploads" -H "content-type: text/plain")
+UPLOAD_ID=$(echo "$INITIATE_RESPONSE" | grep -o '<UploadId>[^<]*</UploadId>' | sed 's/<[^>]*>//g')
+echo "  Upload ID: $UPLOAD_ID"
+ok "Multipart upload initiated"
+
+step "Upload Part 1"
+ETAG1=$(signed_curl PUT "/uploads/test-file.txt?partNumber=1&uploadId=$UPLOAD_ID" \
+  -d @"$DEMO_ROOT/part1.txt" -D- | grep -i '^etag:' | cut -d' ' -f2 | tr -d '\r')
+echo "  ETag: $ETAG1"
+ok "Part 1 uploaded"
+
+step "Upload Part 2"
+ETAG2=$(signed_curl PUT "/uploads/test-file.txt?partNumber=2&uploadId=$UPLOAD_ID" \
+  -d @"$DEMO_ROOT/part2.txt" -D- | grep -i '^etag:' | cut -d' ' -f2 | tr -d '\r')
+echo "  ETag: $ETAG2"
+ok "Part 2 uploaded"
+
+step "Upload Part 3"
+ETAG3=$(signed_curl PUT "/uploads/test-file.txt?partNumber=3&uploadId=$UPLOAD_ID" \
+  -d @"$DEMO_ROOT/part3.txt" -D- | grep -i '^etag:' | cut -d' ' -f2 | tr -d '\r')
+echo "  ETag: $ETAG3"
+ok "Part 3 uploaded"
+
+# Clean up — abort the upload since Complete isn't wired yet
+signed_curl DELETE "/uploads/test-file.txt?uploadId=$UPLOAD_ID" > /dev/null 2>&1 || true
+
+sleep "$DELAY"
+
 # ── Done ───────────────────────────────────────────────────────────────────
 
 banner "Phase 5 Demo Complete"
-note "Phase 5 scaffold in place"
+note "All Phase 5 features demonstrated so far:"
+note "  - InitiateMultipartUpload creates upload ID"
+note "  - UploadPart uploads individual parts with ETags"
 
 sleep "${END_DELAY}"

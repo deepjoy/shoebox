@@ -9,6 +9,12 @@ pub enum S3Error {
     #[error("The specified key does not exist")]
     NoSuchKey,
 
+    #[error("The specified upload does not exist")]
+    NoSuchUpload,
+
+    #[error("One or more of the specified parts could not be found or the specified entity tag might not have matched the part's entity tag")]
+    InvalidPart,
+
     #[error("Access Denied")]
     AccessDenied,
 
@@ -76,6 +82,8 @@ impl S3Error {
         match self {
             Self::NoSuchBucket => "NoSuchBucket",
             Self::NoSuchKey => "NoSuchKey",
+            Self::NoSuchUpload => "NoSuchUpload",
+            Self::InvalidPart => "InvalidPart",
             Self::AccessDenied => "AccessDenied",
             Self::SignatureDoesNotMatch => "SignatureDoesNotMatch",
             Self::InvalidBucketName => "InvalidBucketName",
@@ -107,12 +115,13 @@ impl S3Error {
     /// HTTP status code for this error.
     pub fn status_code(&self) -> StatusCode {
         match self {
-            Self::NoSuchBucket | Self::NoSuchKey => StatusCode::NOT_FOUND,
+            Self::NoSuchBucket | Self::NoSuchKey | Self::NoSuchUpload => StatusCode::NOT_FOUND,
             Self::AccessDenied | Self::SignatureDoesNotMatch | Self::InvalidAccessKeyId => {
                 StatusCode::FORBIDDEN
             }
             Self::InvalidBucketName
             | Self::InvalidArgument
+            | Self::InvalidPart
             | Self::BadDigest
             | Self::ExpiredToken
             | Self::AuthorizationHeaderMalformed
