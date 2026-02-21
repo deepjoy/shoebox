@@ -28,7 +28,7 @@ impl<T: Serialize> IntoResponse for XmlResponse<T> {
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// Insert `xmlns` into the first XML element of the serialized output.
-fn inject_xmlns(xml: &str) -> String {
+pub fn inject_xmlns(xml: &str) -> String {
     let header = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
     // Find the first '>' of the root element and inject xmlns before it.
     if let Some(pos) = xml.find('>') {

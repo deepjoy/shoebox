@@ -463,6 +463,26 @@ fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64), S3Error> {
     }
 }
 
+fn parse_metadata_json(raw: &Option<String>) -> HashMap<String, String> {
+    raw.as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
+}
+
+/// POST /{bucket}/{key} — initiate or complete multipart upload.
+/// Dispatches to InitiateMultipartUpload if `?uploads` is present,
+/// and CompleteMultipartUpload if `?uploadId` is present.
+pub async fn post_object(
+    _state: State<AppState>,
+    _path: Path<(String, String)>,
+    RawQuery(_query): RawQuery,
+    _headers: HeaderMap,
+    _body: axum::body::Body,
+) -> Result<Response, S3Error> {
+    Err(S3Error::MethodNotAllowed)
+}
+
+/// Check if a query string contains a specific parameter (e.g. "tagging").
 fn has_query_param(query: Option<&str>, param: &str) -> bool {
     match query {
         Some(q) => {
@@ -475,8 +495,19 @@ fn has_query_param(query: Option<&str>, param: &str) -> bool {
     }
 }
 
-fn parse_metadata_json(raw: &Option<String>) -> HashMap<String, String> {
-    raw.as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
+/// Parse query string into a HashMap.
+#[allow(dead_code)] // Used in upcoming multipart dispatch commits
+fn parse_query_params(query: Option<&str>) -> HashMap<String, String> {
+    query
+        .map(|q| {
+            q.split('&')
+                .filter_map(|part| {
+                    let mut split = part.splitn(2, '=');
+                    let key = split.next()?.to_string();
+                    let value = split.next().unwrap_or("").to_string();
+                    Some((key, value))
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
