@@ -60,6 +60,9 @@ pub enum S3Error {
     #[error("The requested range is not satisfiable")]
     RangeNotSatisfiable,
 
+    #[error("{0}")]
+    Conflict(String),
+
     #[error("Bad Request: {0}")]
     BadRequest(String),
 
@@ -90,6 +93,7 @@ impl S3Error {
             Self::NotModified => "NotModified",
             Self::InvalidRange => "InvalidRange",
             Self::RangeNotSatisfiable => "InvalidRange",
+            Self::Conflict(_) => "Conflict",
             Self::BadRequest(_) => "BadRequest",
             Self::InternalError => "InternalError",
         }
@@ -117,7 +121,9 @@ impl S3Error {
             | Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NoSuchCredential => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
-            Self::BucketAlreadyExists | Self::BucketAlreadyOwnedByYou => StatusCode::CONFLICT,
+            Self::BucketAlreadyExists | Self::BucketAlreadyOwnedByYou | Self::Conflict(_) => {
+                StatusCode::CONFLICT
+            }
             Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             Self::NotModified => StatusCode::NOT_MODIFIED,
             Self::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,

@@ -406,6 +406,28 @@ impl MetadataStore {
     }
 
     /// Get all tags for an object (looked up by key).
+    pub async fn rename_object(&self, src_key: &str, dst_key: &str) -> Result<(), S3Error> {
+        let parent = dst_key
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        let now = time::OffsetDateTime::now_utc();
+        let result = sqlx::query(
+            "UPDATE objects SET key = ?, parent_directory = ?, last_modified = ? WHERE key = ?",
+        )
+        .bind(dst_key)
+        .bind(&parent)
+        .bind(now)
+        .bind(src_key)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(S3Error::NoSuchKey);
+        }
+        Ok(())
+    }
+
     pub async fn get_object_tags(&self, key: &str) -> Result<Vec<Tag>, S3Error> {
         let tags = sqlx::query_as::<_, Tag>(
             "SELECT t.key, t.value FROM object_tags t \

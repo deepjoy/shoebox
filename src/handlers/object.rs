@@ -230,8 +230,28 @@ pub async fn put_object(
         let (src_bucket_name, src_key) = parse_copy_source(copy_source_str)?;
 
         if is_rename {
-            // Rename not yet implemented — will be added in a later commit
-            return Err(S3Error::InvalidArgument);
+            // Atomic rename (same bucket only)
+            if src_bucket_name != bucket_name {
+                return Err(S3Error::InvalidArgument);
+            }
+
+            let bucket = state.get_bucket(&bucket_name)?;
+            let overwrite = headers
+                .get("x-shoebox-overwrite")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v == "true")
+                .unwrap_or(false);
+
+            copy_service::rename_object(
+                &bucket.storage,
+                &bucket.metadata,
+                &src_key,
+                &key,
+                overwrite,
+            )
+            .await?;
+
+            return Ok(StatusCode::OK.into_response());
         }
 
         // Regular copy — resolve both buckets

@@ -92,6 +92,20 @@ enum Commands {
         port: u16,
     },
 
+    /// Rename (move) an object within a bucket.
+    #[command(alias = "mv")]
+    Rename {
+        /// Path to the bucket directory.
+        bucket_path: PathBuf,
+        /// Source object key.
+        source_key: String,
+        /// Destination object key.
+        dest_key: String,
+        /// Overwrite if destination exists.
+        #[arg(long)]
+        overwrite: bool,
+    },
+
     /// Generate a pre-signed URL.
     Presign {
         #[command(subcommand)]
@@ -437,6 +451,30 @@ async fn handle_command(command: Commands) -> Result<(), Box<dyn std::error::Err
 
             save_bucket_config(&shoebox_dir, &config).await?;
             println!("Credential {} removed", access_key_id);
+        }
+
+        Commands::Rename {
+            bucket_path,
+            source_key,
+            dest_key,
+            overwrite,
+        } => {
+            let shoebox = shoebox::Shoebox::builder()
+                .bucket(&bucket_path)
+                .build()
+                .await?;
+
+            let bucket_name = bucket_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("Invalid bucket path")?;
+
+            shoebox
+                .rename_object(bucket_name, &source_key, &dest_key, overwrite)
+                .await
+                .map_err(|e| format!("Rename failed: {}", e))?;
+
+            println!("Renamed {} -> {}", source_key, dest_key);
         }
 
         Commands::Presign { action } => match action {

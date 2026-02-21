@@ -80,6 +80,42 @@ pub async fn copy_object(
     })
 }
 
+/// Rename (move) an object within the same bucket.
+/// Uses an atomic filesystem rename (O(1) on the same filesystem).
+pub async fn rename_object(
+    storage: &FilesystemStorage,
+    metadata: &MetadataStore,
+    src_key: &str,
+    dst_key: &str,
+    overwrite: bool,
+) -> Result<(), S3Error> {
+    let src_path = storage.resolve_path(src_key).await?;
+    let dst_path = storage.resolve_path(dst_key).await?;
+
+    // Check source exists
+    if !tokio::fs::try_exists(&src_path).await.unwrap_or(false) {
+        return Err(S3Error::NoSuchKey);
+    }
+
+    // Check destination
+    if tokio::fs::try_exists(&dst_path).await.unwrap_or(false) && !overwrite {
+        return Err(S3Error::Conflict("Destination already exists".to_string()));
+    }
+
+    // Create parent directories
+    if let Some(parent) = dst_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    // Atomic rename (O(1) operation on same filesystem)
+    tokio::fs::rename(&src_path, &dst_path).await?;
+
+    // Update database
+    metadata.rename_object(src_key, dst_key).await?;
+
+    Ok(())
+}
+
 fn check_copy_conditions(
     src_record: &ObjectRecord,
     conditions: &CopyConditions,

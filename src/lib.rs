@@ -123,6 +123,17 @@ impl Shoebox {
         .await
     }
 
+    pub async fn rename_object(
+        &self,
+        bucket: &str,
+        src_key: &str,
+        dst_key: &str,
+        overwrite: bool,
+    ) -> Result<(), S3Error> {
+        let b = self.get_bucket(bucket)?;
+        copy_service::rename_object(&b.storage, &b.metadata, src_key, dst_key, overwrite).await
+    }
+
     pub async fn get_tags(&self, bucket: &str, key: &str) -> Result<Vec<Tag>, S3Error> {
         let b = self.get_bucket(bucket)?;
         tagging_service::get_tags(&b.metadata, key).await

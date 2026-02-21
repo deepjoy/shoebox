@@ -294,13 +294,46 @@ run "aws s3api put-object-tagging --bucket photos --key animals/fox.txt --taggin
 ok "10 tags accepted"
 sleep "$DELAY"
 
+# ── 10. Rename (Shoebox extension) ────────────────────────────────────────
+
+banner "Rename — Atomic File Move"
+
+step "Rename animals/fox.txt to renamed-fox.txt"
+note "Using curl with x-shoebox-rename header (Shoebox extension, no AWS CLI equivalent)"
+HTTP_CODE=$(signed_curl PUT "/photos/renamed-fox.txt" \
+  -o /dev/null -w '%{http_code}' \
+  -H "x-amz-copy-source: /photos/animals/fox.txt" \
+  -H "x-shoebox-rename: true" \
+  2>/dev/null || true)
+note "HTTP $HTTP_CODE"
+if [[ "$HTTP_CODE" == "200" ]]; then
+  ok "Atomic rename succeeded"
+fi
+
+step "Verify: fox.txt gone, renamed-fox.txt exists"
+run "aws s3 ls s3://photos/ --recursive"
+
+step "Try rename to existing destination without overwrite (should fail 409)"
+echo "destination" | aws s3 cp - s3://photos/dest.txt 2>/dev/null
+HTTP_CODE=$(signed_curl PUT "/photos/dest.txt" \
+  -o /dev/null -w '%{http_code}' \
+  -H "x-amz-copy-source: /photos/renamed-fox.txt" \
+  -H "x-shoebox-rename: true" \
+  2>/dev/null || true)
+note "HTTP $HTTP_CODE"
+if [[ "$HTTP_CODE" == "409" ]]; then
+  ok "Rename to existing destination correctly returns 409 Conflict"
+fi
+sleep "$DELAY"
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 
 banner "Phase 4 Demo Complete"
-note "All Phase 4 features demonstrated so far:"
+note "All Phase 4 features demonstrated successfully:"
 note "  - CopyObject within same bucket"
 note "  - CopyObject across buckets"
 note "  - CopyObject conditional headers (if-match)"
+note "  - RenameObject atomic rename"
 note "  - Range: bytes=0-N (first N bytes)"
 note "  - Range: bytes=-N (last N bytes)"
 note "  - Range: bytes=N- (offset to end)"
@@ -310,7 +343,8 @@ note "  - If-Match success and failure"
 note "  - If-None-Match returns 304"
 note "  - If-Modified-Since works"
 note "  - If-Unmodified-Since works"
-note "  - Object tagging put/get/delete"
-note "  - Tag limit enforcement (max 10)"
+note "  - Put/Get/Delete object tags"
+note "  - Tag limits enforced (10 tags max)"
+note "  - AWS CLI tagging commands work"
 
 sleep "${END_DELAY}"
