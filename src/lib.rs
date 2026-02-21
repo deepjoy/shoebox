@@ -20,10 +20,11 @@ use crate::auth::presigned;
 use crate::auth::provider::CredentialProvider;
 use crate::config::{resolve_bucket, BucketConfig, METADATA_DB};
 use crate::error::S3Error;
-use crate::metadata::sqlite::ObjectRecord;
+use crate::metadata::sqlite::{ObjectRecord, Tag};
 use crate::metadata::MetadataStore;
+use crate::services::copy_service::{self, CopyConditions, CopyResult};
 use crate::services::object_service::{self, GetObjectResult, PutObjectInput, PutObjectResult};
-use crate::services::{AppState, LoadedBucket};
+use crate::services::{tagging_service, AppState, LoadedBucket};
 use crate::storage::filesystem::FilesystemStorage;
 
 /// Per-bucket runtime state owned by Shoebox.
@@ -98,6 +99,54 @@ impl Shoebox {
         b.metadata
             .list_objects_v2(prefix, delimiter, max_keys, start_after)
             .await
+    }
+
+    pub async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+        conditions: &CopyConditions,
+    ) -> Result<CopyResult, S3Error> {
+        let src = self.get_bucket(src_bucket)?;
+        let dst = self.get_bucket(dst_bucket)?;
+        copy_service::copy_object(
+            &src.storage,
+            &src.metadata,
+            src_key,
+            &dst.storage,
+            &dst.metadata,
+            dst_key,
+            conditions,
+        )
+        .await
+    }
+
+    pub async fn rename_object(
+        &self,
+        bucket: &str,
+        src_key: &str,
+        dst_key: &str,
+        overwrite: bool,
+    ) -> Result<(), S3Error> {
+        let b = self.get_bucket(bucket)?;
+        copy_service::rename_object(&b.storage, &b.metadata, src_key, dst_key, overwrite).await
+    }
+
+    pub async fn get_tags(&self, bucket: &str, key: &str) -> Result<Vec<Tag>, S3Error> {
+        let b = self.get_bucket(bucket)?;
+        tagging_service::get_tags(&b.metadata, key).await
+    }
+
+    pub async fn put_tags(&self, bucket: &str, key: &str, tags: Vec<Tag>) -> Result<(), S3Error> {
+        let b = self.get_bucket(bucket)?;
+        tagging_service::put_tags(&b.metadata, key, tags).await
+    }
+
+    pub async fn delete_tags(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
+        let b = self.get_bucket(bucket)?;
+        tagging_service::delete_tags(&b.metadata, key).await
     }
 
     pub fn presign_get(

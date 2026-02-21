@@ -42,6 +42,28 @@ pub struct ObjectRecord {
     pub scan_level: i32,
 }
 
+impl Default for ObjectRecord {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            key: String::new(),
+            parent_directory: String::new(),
+            is_directory: false,
+            is_symlink: false,
+            symlink_target: None,
+            size: None,
+            file_mtime: None,
+            etag: None,
+            content_hash: None,
+            content_type: None,
+            last_modified: time::OffsetDateTime::UNIX_EPOCH,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            metadata: None,
+            scan_level: 0,
+        }
+    }
+}
+
 /// SQLite-backed metadata store for a single bucket.
 #[derive(Clone)]
 pub struct MetadataStore {
@@ -382,6 +404,86 @@ impl MetadataStore {
 
         Ok(row.0)
     }
+
+    /// Get all tags for an object (looked up by key).
+    pub async fn rename_object(&self, src_key: &str, dst_key: &str) -> Result<(), S3Error> {
+        let parent = dst_key
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        let now = time::OffsetDateTime::now_utc();
+        let result = sqlx::query(
+            "UPDATE objects SET key = ?, parent_directory = ?, last_modified = ? WHERE key = ?",
+        )
+        .bind(dst_key)
+        .bind(&parent)
+        .bind(now)
+        .bind(src_key)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(S3Error::NoSuchKey);
+        }
+        Ok(())
+    }
+
+    pub async fn get_object_tags(&self, key: &str) -> Result<Vec<Tag>, S3Error> {
+        let tags = sqlx::query_as::<_, Tag>(
+            "SELECT t.key, t.value FROM object_tags t \
+             INNER JOIN objects o ON t.object_id = o.id \
+             WHERE o.key = ? ORDER BY t.key",
+        )
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(tags)
+    }
+
+    /// Insert a single tag for an object (looked up by key).
+    pub async fn insert_object_tag(&self, key: &str, tag: &Tag) -> Result<(), S3Error> {
+        let object_id: Option<(String,)> = sqlx::query_as("SELECT id FROM objects WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        let (object_id,) = object_id.ok_or(S3Error::NoSuchKey)?;
+        let tag_id = uuid::Uuid::new_v4().to_string();
+
+        sqlx::query(
+            "INSERT INTO object_tags (id, object_id, key, value) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(object_id, key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(&tag_id)
+        .bind(&object_id)
+        .bind(&tag.key)
+        .bind(&tag.value)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete all tags for an object (looked up by key).
+    pub async fn delete_object_tags(&self, key: &str) -> Result<(), S3Error> {
+        sqlx::query(
+            "DELETE FROM object_tags WHERE object_id IN \
+             (SELECT id FROM objects WHERE key = ?)",
+        )
+        .bind(key)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+}
+
+/// Object tag key-value pair.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct Tag {
+    pub key: String,
+    pub value: String,
 }
 
 #[cfg(test)]

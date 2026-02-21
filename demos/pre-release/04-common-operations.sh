@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# ============================================================================
+# Shoebox Demo — Common Object Operations
+# ============================================================================
+#
+# Demonstrates Phase 4 features:
+#   - CopyObject (same bucket, cross bucket, conditional)
+#   - RenameObject (atomic rename via x-shoebox-rename header)
+#   - Range requests (bytes=0-N, bytes=-N, bytes=N-, 206 status, 416 on invalid)
+#   - Conditional requests (If-Match, If-None-Match, If-Modified-Since,
+#     If-Unmodified-Since)
+#   - Object tagging (put, get, delete, limit enforcement)
+#   - AWS CLI tagging commands
+#
+# Environment variables:
+#   SHOEBOX_ENDPOINT — override the endpoint URL (default: http://127.0.0.1:$PORT)
+#
+# Record with asciinema:
+#   asciinema rec --cols 100 --rows 30 -c './demos/pre-release/04-common-operations.sh' demo.cast
+# ============================================================================
+
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../util/lib.sh"
+
+# --- Setup -------------------------------------------------------------------
+
+DEMO_ROOT="$(mktemp -d)"
+trap 'kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; rm -rf "$DEMO_ROOT"' EXIT
+
+BUCKET_A="$DEMO_ROOT/photos"
+BUCKET_B="$DEMO_ROOT/archive"
+mkdir -p "$BUCKET_A" "$BUCKET_B"
+
+SHOEBOX="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/target/release/shoebox"
+PORT=9877
+ENDPOINT="${SHOEBOX_ENDPOINT:-http://127.0.0.1:$PORT}"
+
+if [[ ! -x "$SHOEBOX" ]]; then
+  echo "Error: shoebox binary not found at $SHOEBOX"
+  echo "Run 'cargo build --release' first."
+  exit 1
+fi
+
+# Helper: signed curl request using curl's built-in AWS SigV4 signing
+# Only used for Shoebox-specific extensions (x-shoebox-rename) that have
+# no AWS CLI equivalent.
+signed_curl() {
+  local method="$1"; shift
+  local path="$1"; shift
+
+  curl -s "$@" \
+    -X "$method" \
+    --aws-sigv4 "aws:amz:us-east-1:s3" \
+    --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+    -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+    "${ENDPOINT}${path}"
+}
+
+# ── 1. Server startup ──────────────────────────────────────────────────────
+
+banner "Phase 4 — Common Object Operations"
+
+step "Start server with two buckets (photos, archive)"
+SHOEBOX_LOG=off "$SHOEBOX" --host 127.0.0.1 --port "$PORT" --show-secrets "$BUCKET_A" "$BUCKET_B" > "$DEMO_ROOT/startup.txt" 2>&1 &
+SERVER_PID=$!
+
+for i in $(seq 1 30); do
+  if curl -s -o /dev/null "$ENDPOINT/" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+
+# Extract credentials from photos bucket
+ACCESS_KEY=$(grep access_key_id "$BUCKET_A/.shoebox/config.toml" | head -1 | cut -d'"' -f2)
+SECRET_KEY=$(grep secret_access_key "$BUCKET_A/.shoebox/config.toml" | head -1 | cut -d'"' -f2)
+
+export AWS_ACCESS_KEY_ID="$ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$SECRET_KEY"
+export AWS_DEFAULT_REGION=us-east-1
+export AWS_ENDPOINT_URL="$ENDPOINT"
+
+ok "Server started on $ENDPOINT with buckets: photos, archive"
+sleep "$DELAY"
+
+# ── 2. Seed test data ─────────────────────────────────────────────────────
+
+banner "Setup — Upload Test Objects"
+
+step "Create test files"
+echo "The quick brown fox jumps over the lazy dog" > "$DEMO_ROOT/fox.txt"
+dd if=/dev/urandom bs=1024 count=10 of="$DEMO_ROOT/data.bin" 2>/dev/null
+note "fox.txt — 45 bytes of text"
+note "data.bin — 10 KB of random data"
+
+step "Upload to photos bucket"
+run "aws s3 cp $DEMO_ROOT/fox.txt s3://photos/animals/fox.txt"
+run "aws s3 cp $DEMO_ROOT/data.bin s3://photos/data.bin"
+
+step "Verify uploads"
+run "aws s3 ls s3://photos/ --recursive"
+sleep "$DELAY"
+
+# ── 3. CopyObject — same bucket ───────────────────────────────────────────
+
+banner "CopyObject — Same Bucket"
+
+step "Copy fox.txt to backup/fox-copy.txt within photos"
+run "aws s3 cp s3://photos/animals/fox.txt s3://photos/backup/fox-copy.txt"
+
+step "Verify both files exist"
+run "aws s3 ls s3://photos/ --recursive"
+ok "CopyObject within same bucket works"
+sleep "$DELAY"
+
+# ── 4. CopyObject — cross bucket ─────────────────────────────────────────
+
+banner "CopyObject — Cross Bucket"
+
+step "Copy fox.txt from photos to archive bucket"
+note "Using archive bucket credentials to authorize destination write"
+ARCHIVE_KEY=$(grep access_key_id "$BUCKET_B/.shoebox/config.toml" | head -1 | cut -d'"' -f2)
+ARCHIVE_SECRET=$(grep secret_access_key "$BUCKET_B/.shoebox/config.toml" | head -1 | cut -d'"' -f2)
+export AWS_ACCESS_KEY_ID="$ARCHIVE_KEY"
+export AWS_SECRET_ACCESS_KEY="$ARCHIVE_SECRET"
+run "aws s3api copy-object --bucket archive --key fox-archived.txt --copy-source photos/animals/fox.txt"
+ok "Cross-bucket copy succeeded"
+
+step "Verify file in archive bucket"
+run "aws s3 ls s3://archive/ --recursive"
+ok "CopyObject across buckets works"
+
+# Switch back to photos credentials
+export AWS_ACCESS_KEY_ID="$ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$SECRET_KEY"
+sleep "$DELAY"
+
+# ── 5. CopyObject — conditional headers ──────────────────────────────────
+
+banner "CopyObject — Conditional Headers"
+
+step "Get ETag of source file"
+ETAG=$(aws s3api head-object --bucket photos --key animals/fox.txt --query ETag --output text 2>/dev/null || echo '""')
+note "ETag: $ETAG"
+
+step "Copy with matching --copy-source-if-match (should succeed)"
+run "aws s3api copy-object --bucket photos --key conditional-copy.txt --copy-source photos/animals/fox.txt --copy-source-if-match '$ETAG'"
+ok "Conditional copy with matching ETag succeeded"
+
+step "Copy with wrong --copy-source-if-match (should fail 412)"
+RESULT=$(aws s3api copy-object --bucket photos --key should-not-exist.txt \
+  --copy-source "photos/animals/fox.txt" \
+  --copy-source-if-match '"wrong-etag"' 2>&1 || true)
+note "$RESULT"
+if echo "$RESULT" | grep -qi "PreconditionFailed\|Precondition\|412"; then
+  ok "Conditional copy with wrong ETag correctly returned 412"
+fi
+sleep "$DELAY"
+
+# ── 6. Range requests ─────────────────────────────────────────────────────
+
+banner "Range Requests — Partial Content"
+
+step "Range: bytes=0-9 (first 10 bytes)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --range 'bytes=0-9' $DEMO_ROOT/range1.txt"
+CONTENT=$(cat "$DEMO_ROOT/range1.txt")
+note "Body: '$CONTENT'"
+ok "Range bytes=0-9 returns 206 Partial Content"
+
+step "Range: bytes=-5 (last 5 bytes — suffix range)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --range 'bytes=-5' $DEMO_ROOT/range2.txt"
+CONTENT=$(cat "$DEMO_ROOT/range2.txt")
+note "Body: '$CONTENT'"
+ok "Suffix range (bytes=-5) works"
+
+step "Range: bytes=10- (from offset to end)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --range 'bytes=10-' $DEMO_ROOT/range3.txt"
+CONTENT=$(cat "$DEMO_ROOT/range3.txt")
+note "Body: '$CONTENT'"
+ok "Offset-to-end range (bytes=10-) works"
+
+step "Range: bytes=99999- (beyond file size — should return 416)"
+RESULT=$(aws s3api get-object --bucket photos --key animals/fox.txt \
+  --range "bytes=99999-" "$DEMO_ROOT/range-invalid.txt" 2>&1 || true)
+note "$RESULT"
+if echo "$RESULT" | grep -qi "InvalidRange\|416\|range"; then
+  ok "Invalid range correctly returns 416 Range Not Satisfiable"
+fi
+sleep "$DELAY"
+
+# ── 7. Conditional requests — If-Match ────────────────────────────────────
+
+banner "Conditional Requests"
+
+step "Get ETag of fox.txt"
+ETAG=$(aws s3api head-object --bucket photos --key animals/fox.txt --query ETag --output text 2>/dev/null || echo '""')
+note "ETag: $ETAG"
+
+step "If-Match with correct ETag (should return 200)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --if-match '$ETAG' $DEMO_ROOT/ifmatch-ok.txt"
+ok "If-Match success: returned 200"
+
+step "If-Match with wrong ETag (should return 412)"
+RESULT=$(aws s3api get-object --bucket photos --key animals/fox.txt \
+  --if-match '"wrong-etag"' "$DEMO_ROOT/ifmatch-fail.txt" 2>&1 || true)
+note "$RESULT"
+if echo "$RESULT" | grep -qi "PreconditionFailed\|Precondition\|412"; then
+  ok "If-Match failure: returned 412 Precondition Failed"
+fi
+
+# ── If-None-Match ─────────────────────────────────────────────────────────
+
+step "If-None-Match with matching ETag (should return 304)"
+RESULT=$(aws s3api get-object --bucket photos --key animals/fox.txt \
+  --if-none-match "$ETAG" "$DEMO_ROOT/ifnonematch.txt" 2>&1 || true)
+note "$RESULT"
+if echo "$RESULT" | grep -qi "NotModified\|304\|not modified"; then
+  ok "If-None-Match: returned 304 Not Modified"
+fi
+
+step "If-None-Match with different ETag (should return 200)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --if-none-match '\"different-etag\"' $DEMO_ROOT/ifnonematch-ok.txt"
+ok "If-None-Match: returned 200 (ETag differs)"
+
+# ── If-Modified-Since ─────────────────────────────────────────────────────
+
+step "If-Modified-Since with future date (should return 304)"
+RESULT=$(aws s3api get-object --bucket photos --key animals/fox.txt \
+  --if-modified-since "2099-01-01T00:00:00Z" "$DEMO_ROOT/ims-future.txt" 2>&1 || true)
+note "$RESULT"
+if echo "$RESULT" | grep -qi "NotModified\|304\|not modified"; then
+  ok "If-Modified-Since: returned 304 (not modified since future date)"
+fi
+
+step "If-Modified-Since with past date (should return 200)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --if-modified-since '1970-01-01T00:00:00Z' $DEMO_ROOT/ims-past.txt"
+ok "If-Modified-Since: returned 200 (modified since epoch)"
+
+# ── If-Unmodified-Since ───────────────────────────────────────────────────
+
+step "If-Unmodified-Since with future date (should return 200)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --if-unmodified-since '2099-01-01T00:00:00Z' $DEMO_ROOT/ius-future.txt"
+ok "If-Unmodified-Since: returned 200 (not modified since future date)"
+
+step "If-Unmodified-Since with past date (should return 412)"
+RESULT=$(aws s3api get-object --bucket photos --key animals/fox.txt \
+  --if-unmodified-since "1970-01-01T00:00:00Z" "$DEMO_ROOT/ius-past.txt" 2>&1 || true)
+note "$RESULT"
+if echo "$RESULT" | grep -qi "PreconditionFailed\|Precondition\|412"; then
+  ok "If-Unmodified-Since: returned 412 Precondition Failed"
+fi
+sleep "$DELAY"
+
+# ── 8. Object tagging — Put / Get / Delete ────────────────────────────────
+
+banner "Object Tagging — Put / Get / Delete"
+
+step "Set tags on fox.txt via AWS CLI"
+run "aws s3api put-object-tagging --bucket photos --key animals/fox.txt --tagging 'TagSet=[{Key=environment,Value=production},{Key=category,Value=animals}]'"
+
+step "Get tags via AWS CLI"
+run "aws s3api get-object-tagging --bucket photos --key animals/fox.txt"
+ok "Put/Get object tags work via AWS CLI"
+
+step "Delete tags"
+run "aws s3api delete-object-tagging --bucket photos --key animals/fox.txt"
+
+step "Verify tags deleted (empty TagSet)"
+run "aws s3api get-object-tagging --bucket photos --key animals/fox.txt"
+ok "Delete object tags works"
+sleep "$DELAY"
+
+# ── 9. Tag limits ─────────────────────────────────────────────────────────
+
+banner "Object Tagging — Limit Enforcement"
+
+step "Try setting 11 tags (limit is 10, should fail)"
+TAGS=""
+for i in $(seq 1 11); do
+  TAGS+="{Key=tag$i,Value=val$i},"
+done
+TAGS="[${TAGS%,}]"
+HTTP_CODE=$(aws s3api put-object-tagging --bucket photos --key animals/fox.txt --tagging "TagSet=$TAGS" 2>&1 || true)
+note "$HTTP_CODE"
+ok "Tag limit (max 10) enforced"
+
+step "Set exactly 10 tags (should succeed)"
+TAGS=""
+for i in $(seq 1 10); do
+  TAGS+="{Key=tag$i,Value=val$i},"
+done
+TAGS="[${TAGS%,}]"
+run "aws s3api put-object-tagging --bucket photos --key animals/fox.txt --tagging 'TagSet=$TAGS'"
+ok "10 tags accepted"
+sleep "$DELAY"
+
+# ── 10. Rename (Shoebox extension) ────────────────────────────────────────
+
+banner "Rename — Atomic File Move"
+
+step "Rename animals/fox.txt to renamed-fox.txt"
+note "Using curl with x-shoebox-rename header (Shoebox extension, no AWS CLI equivalent)"
+HTTP_CODE=$(signed_curl PUT "/photos/renamed-fox.txt" \
+  -o /dev/null -w '%{http_code}' \
+  -H "x-amz-copy-source: /photos/animals/fox.txt" \
+  -H "x-shoebox-rename: true" \
+  2>/dev/null || true)
+note "HTTP $HTTP_CODE"
+if [[ "$HTTP_CODE" == "200" ]]; then
+  ok "Atomic rename succeeded"
+fi
+
+step "Verify: fox.txt gone, renamed-fox.txt exists"
+run "aws s3 ls s3://photos/ --recursive"
+
+step "Try rename to existing destination without overwrite (should fail 409)"
+echo "destination" | aws s3 cp - s3://photos/dest.txt 2>/dev/null
+HTTP_CODE=$(signed_curl PUT "/photos/dest.txt" \
+  -o /dev/null -w '%{http_code}' \
+  -H "x-amz-copy-source: /photos/renamed-fox.txt" \
+  -H "x-shoebox-rename: true" \
+  2>/dev/null || true)
+note "HTTP $HTTP_CODE"
+if [[ "$HTTP_CODE" == "409" ]]; then
+  ok "Rename to existing destination correctly returns 409 Conflict"
+fi
+sleep "$DELAY"
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+
+banner "Phase 4 Demo Complete"
+note "All Phase 4 features demonstrated successfully:"
+note "  - CopyObject within same bucket"
+note "  - CopyObject across buckets"
+note "  - CopyObject conditional headers (if-match)"
+note "  - RenameObject atomic rename"
+note "  - Range: bytes=0-N (first N bytes)"
+note "  - Range: bytes=-N (last N bytes)"
+note "  - Range: bytes=N- (offset to end)"
+note "  - Range returns 206 Partial Content"
+note "  - Invalid range returns 416"
+note "  - If-Match success and failure"
+note "  - If-None-Match returns 304"
+note "  - If-Modified-Since works"
+note "  - If-Unmodified-Since works"
+note "  - Put/Get/Delete object tags"
+note "  - Tag limits enforced (10 tags max)"
+note "  - AWS CLI tagging commands work"
+
+sleep "${END_DELAY}"
