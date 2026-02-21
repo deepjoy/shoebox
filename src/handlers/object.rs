@@ -89,13 +89,33 @@ fn check_conditional(
 }
 
 /// GET /{bucket}/{key} — download an object with range and conditional support.
-/// Also dispatches to GetObjectTagging if `?tagging` is present.
+/// Also dispatches to GetObjectTagging if `?tagging` is present,
+/// and ListParts if `?uploadId` is present.
 pub async fn get_object(
     state: State<AppState>,
     path: Path<(String, String)>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, S3Error> {
+    // Dispatch to ListParts if ?uploadId is present
+    if has_query_param(query.as_deref(), "uploadId") {
+        use crate::handlers::multipart::ListPartsQuery;
+        let params = parse_query_params(query.as_deref());
+        let list_parts_query = ListPartsQuery {
+            upload_id: params.get("uploadId").cloned(),
+            max_parts: params.get("max-parts").and_then(|s| s.parse().ok()),
+            part_number_marker: params
+                .get("part-number-marker")
+                .and_then(|s| s.parse().ok()),
+        };
+        return crate::handlers::multipart::list_parts(
+            state,
+            path,
+            axum::extract::Query(list_parts_query),
+        )
+        .await;
+    }
+
     // Dispatch to tagging handler if ?tagging is present
     if has_query_param(query.as_deref(), "tagging") {
         return tagging::get_object_tagging(state, path)
@@ -200,7 +220,8 @@ pub async fn get_object(
 }
 
 /// PUT /{bucket}/{key} — upload, copy, rename, or set tags.
-/// Dispatches to PutObjectTagging if `?tagging` is present.
+/// Dispatches to PutObjectTagging if `?tagging` is present,
+/// and UploadPart if `?partNumber` and `?uploadId` are present.
 pub async fn put_object(
     state: State<AppState>,
     path: Path<(String, String)>,
@@ -208,6 +229,25 @@ pub async fn put_object(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, S3Error> {
+    // Dispatch to UploadPart if ?partNumber and ?uploadId are present
+    if has_query_param(query.as_deref(), "partNumber")
+        && has_query_param(query.as_deref(), "uploadId")
+    {
+        use crate::handlers::multipart::UploadPartQuery;
+        let params = parse_query_params(query.as_deref());
+        let upload_part_query = UploadPartQuery {
+            part_number: params.get("partNumber").and_then(|s| s.parse().ok()),
+            upload_id: params.get("uploadId").cloned(),
+        };
+        return crate::handlers::multipart::upload_part(
+            state,
+            path,
+            axum::extract::Query(upload_part_query),
+            body,
+        )
+        .await;
+    }
+
     // Dispatch to tagging handler if ?tagging is present
     if has_query_param(query.as_deref(), "tagging") {
         return tagging::put_object_tagging(state, path, body)
@@ -320,12 +360,28 @@ pub async fn put_object(
 }
 
 /// DELETE /{bucket}/{key} — delete an object or its tags.
-/// Dispatches to DeleteObjectTagging if `?tagging` is present.
+/// Dispatches to DeleteObjectTagging if `?tagging` is present,
+/// and AbortMultipartUpload if `?uploadId` is present.
 pub async fn delete_object(
     state: State<AppState>,
     path: Path<(String, String)>,
     RawQuery(query): RawQuery,
 ) -> Result<Response, S3Error> {
+    // Dispatch to AbortMultipartUpload if ?uploadId is present
+    if has_query_param(query.as_deref(), "uploadId") {
+        use crate::handlers::multipart::AbortMultipartQuery;
+        let params = parse_query_params(query.as_deref());
+        let abort_query = AbortMultipartQuery {
+            upload_id: params.get("uploadId").cloned(),
+        };
+        return crate::handlers::multipart::abort_multipart_upload(
+            state,
+            path,
+            axum::extract::Query(abort_query),
+        )
+        .await;
+    }
+
     // Dispatch to tagging handler if ?tagging is present
     if has_query_param(query.as_deref(), "tagging") {
         return tagging::delete_object_tagging(state, path)
@@ -463,6 +519,54 @@ fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64), S3Error> {
     }
 }
 
+fn parse_metadata_json(raw: &Option<String>) -> HashMap<String, String> {
+    raw.as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
+}
+
+/// POST /{bucket}/{key} — initiate or complete multipart upload.
+/// Dispatches to InitiateMultipartUpload if `?uploads` is present,
+/// and CompleteMultipartUpload if `?uploadId` is present.
+pub async fn post_object(
+    state: State<AppState>,
+    path: Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Result<Response, S3Error> {
+    // Dispatch to InitiateMultipartUpload if ?uploads is present
+    if has_query_param(query.as_deref(), "uploads") {
+        return crate::handlers::multipart::initiate_multipart_upload(state, path, headers).await;
+    }
+
+    // Dispatch to CompleteMultipartUpload if ?uploadId is present
+    if has_query_param(query.as_deref(), "uploadId") {
+        // Convert body to string for XML parsing
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .map_err(|_| S3Error::InternalError)?;
+        let body_str = String::from_utf8(bytes.to_vec())
+            .map_err(|_| S3Error::BadRequest("Invalid UTF-8 in request body".to_string()))?;
+
+        use crate::handlers::multipart::CompleteMultipartQuery;
+        let params = parse_query_params(query.as_deref());
+        let complete_query = CompleteMultipartQuery {
+            upload_id: params.get("uploadId").cloned(),
+        };
+        return crate::handlers::multipart::complete_multipart_upload(
+            state,
+            path,
+            axum::extract::Query(complete_query),
+            body_str,
+        )
+        .await;
+    }
+
+    Err(S3Error::MethodNotAllowed)
+}
+
+/// Check if a query string contains a specific parameter (e.g. "tagging").
 fn has_query_param(query: Option<&str>, param: &str) -> bool {
     match query {
         Some(q) => {
@@ -475,8 +579,18 @@ fn has_query_param(query: Option<&str>, param: &str) -> bool {
     }
 }
 
-fn parse_metadata_json(raw: &Option<String>) -> HashMap<String, String> {
-    raw.as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
+/// Parse query string into a HashMap.
+fn parse_query_params(query: Option<&str>) -> HashMap<String, String> {
+    query
+        .map(|q| {
+            q.split('&')
+                .filter_map(|part| {
+                    let mut split = part.splitn(2, '=');
+                    let key = split.next()?.to_string();
+                    let value = split.next().unwrap_or("").to_string();
+                    Some((key, value))
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }

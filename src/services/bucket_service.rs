@@ -13,6 +13,7 @@ pub struct LoadedBucket {
     pub config: BucketConfig,
     pub storage: FilesystemStorage,
     pub metadata: MetadataStore,
+    pub parts_dir: std::path::PathBuf,
 }
 
 /// Shared application state passed to all handlers.

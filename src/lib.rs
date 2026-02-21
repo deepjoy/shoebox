@@ -33,6 +33,7 @@ struct BucketRuntime {
     config: BucketConfig,
     storage: FilesystemStorage,
     metadata: MetadataStore,
+    parts_dir: std::path::PathBuf,
 }
 
 /// Main Shoebox builder and runtime.
@@ -149,6 +150,77 @@ impl Shoebox {
         tagging_service::delete_tags(&b.metadata, key).await
     }
 
+    // -- Multipart upload methods --
+
+    pub async fn initiate_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+        metadata: Option<HashMap<String, String>>,
+    ) -> Result<String, S3Error> {
+        let b = self.get_bucket(bucket)?;
+        crate::services::multipart_service::initiate(
+            &b.metadata,
+            &b.parts_dir,
+            key,
+            content_type,
+            metadata,
+        )
+        .await
+    }
+
+    pub async fn upload_part<S>(
+        &self,
+        bucket: &str,
+        _key: &str,
+        upload_id: &str,
+        part_number: i32,
+        stream: S,
+    ) -> Result<String, S3Error>
+    where
+        S: futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
+    {
+        let b = self.get_bucket(bucket)?;
+        crate::services::multipart_service::upload_part(
+            &b.metadata,
+            &b.parts_dir,
+            upload_id,
+            part_number,
+            stream,
+        )
+        .await
+    }
+
+    pub async fn complete_multipart(
+        &self,
+        bucket: &str,
+        _key: &str,
+        upload_id: &str,
+        parts: Vec<(i32, String)>,
+    ) -> Result<crate::types::multipart::CompleteResult, S3Error> {
+        let b = self.get_bucket(bucket)?;
+        crate::services::multipart_service::complete(
+            &b.storage,
+            &b.metadata,
+            &b.parts_dir,
+            bucket,
+            upload_id,
+            parts,
+        )
+        .await
+    }
+
+    pub async fn abort_multipart(
+        &self,
+        bucket: &str,
+        _key: &str,
+        upload_id: &str,
+    ) -> Result<(), S3Error> {
+        let b = self.get_bucket(bucket)?;
+        crate::services::multipart_service::abort(&b.metadata, &b.parts_dir, upload_id).await
+    }
+
     pub fn presign_get(
         &self,
         bucket: &str,
@@ -204,6 +276,7 @@ impl Shoebox {
                                 config: b.config.clone(),
                                 storage: b.storage.clone(),
                                 metadata: b.metadata.clone(),
+                                parts_dir: b.parts_dir.clone(),
                             },
                         )
                     })
@@ -310,6 +383,8 @@ impl ShoeboxBuilder {
             let db_path = state.shoebox_dir.join(METADATA_DB);
             let metadata = MetadataStore::new(&db_path).await?;
             let storage = FilesystemStorage::new(state.root.clone());
+            let parts_dir = state.shoebox_dir.join("parts");
+            tokio::fs::create_dir_all(&parts_dir).await?;
             buckets.insert(
                 state.name.clone(),
                 BucketRuntime {
@@ -317,6 +392,7 @@ impl ShoeboxBuilder {
                     config: state.config,
                     storage,
                     metadata,
+                    parts_dir,
                 },
             );
         }

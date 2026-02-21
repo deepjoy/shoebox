@@ -107,6 +107,17 @@ fn check_permission(
     credential: &ResolvedCredential,
 ) -> Result<(), S3Error> {
     let operation = determine_operation(request);
+
+    // Admin endpoints (/_shoebox/*) are not bucket-scoped in the URL,
+    // so use the credential's own bucket for the scope check.
+    if operation == "Admin" {
+        let bucket = credential.bucket_name.as_deref().unwrap_or("");
+        if !credential.has_permission(&operation, bucket) {
+            return Err(S3Error::AccessDenied);
+        }
+        return Ok(());
+    }
+
     let bucket = extract_bucket_from_path(request.uri().path());
 
     if let Some(bucket_name) = bucket {
@@ -140,13 +151,19 @@ fn determine_operation(request: &Request<axum::body::Body>) -> String {
         ("GET", false) if path == "/" => "ListBuckets",
         ("GET", false) if query.contains("location") => "GetBucketLocation",
         ("GET", false) if query.contains("versioning") => "GetBucketVersioning",
+        ("GET", false) if query.contains("uploads") => "ListMultipartUploads",
         ("GET", false) => "ListObjectsV2",
+        ("GET", true) if query.contains("uploadId") => "ListParts",
         ("GET", true) => "GetObject",
         ("HEAD", false) => "HeadBucket",
         ("HEAD", true) => "HeadObject",
+        ("PUT", true) if query.contains("partNumber") => "UploadPart",
         ("PUT", true) => "PutObject",
+        ("DELETE", true) if query.contains("uploadId") => "AbortMultipartUpload",
         ("DELETE", true) => "DeleteObject",
         ("POST", false) if query.contains("delete") => "DeleteObjects",
+        ("POST", true) if query.contains("uploads") => "InitiateMultipartUpload",
+        ("POST", true) if query.contains("uploadId") => "CompleteMultipartUpload",
         _ => "Unknown",
     }
     .to_string()
@@ -230,5 +247,100 @@ mod tests {
         let new_uri = rebuild_uri(&uri, "/photos/key");
         assert_eq!(new_uri.path(), "/photos/key");
         assert_eq!(new_uri.query(), None);
+    }
+
+    /// Build a minimal request for testing determine_operation.
+    fn make_request(method: &str, uri: &str) -> Request<axum::body::Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn test_determine_operation_basic() {
+        assert_eq!(
+            determine_operation(&make_request("GET", "/")),
+            "ListBuckets"
+        );
+        assert_eq!(
+            determine_operation(&make_request("GET", "/photos")),
+            "ListObjectsV2"
+        );
+        assert_eq!(
+            determine_operation(&make_request("GET", "/photos/key.jpg")),
+            "GetObject"
+        );
+        assert_eq!(
+            determine_operation(&make_request("HEAD", "/photos")),
+            "HeadBucket"
+        );
+        assert_eq!(
+            determine_operation(&make_request("HEAD", "/photos/key.jpg")),
+            "HeadObject"
+        );
+        assert_eq!(
+            determine_operation(&make_request("PUT", "/photos/key.jpg")),
+            "PutObject"
+        );
+        assert_eq!(
+            determine_operation(&make_request("DELETE", "/photos/key.jpg")),
+            "DeleteObject"
+        );
+        assert_eq!(
+            determine_operation(&make_request("POST", "/photos?delete")),
+            "DeleteObjects"
+        );
+    }
+
+    #[test]
+    fn test_determine_operation_multipart() {
+        // InitiateMultipartUpload: POST /{bucket}/{key}?uploads
+        assert_eq!(
+            determine_operation(&make_request("POST", "/photos/big.zip?uploads")),
+            "InitiateMultipartUpload"
+        );
+
+        // UploadPart: PUT /{bucket}/{key}?partNumber=1&uploadId=abc
+        assert_eq!(
+            determine_operation(&make_request(
+                "PUT",
+                "/photos/big.zip?partNumber=1&uploadId=abc"
+            )),
+            "UploadPart"
+        );
+
+        // CompleteMultipartUpload: POST /{bucket}/{key}?uploadId=abc
+        assert_eq!(
+            determine_operation(&make_request("POST", "/photos/big.zip?uploadId=abc")),
+            "CompleteMultipartUpload"
+        );
+
+        // AbortMultipartUpload: DELETE /{bucket}/{key}?uploadId=abc
+        assert_eq!(
+            determine_operation(&make_request("DELETE", "/photos/big.zip?uploadId=abc")),
+            "AbortMultipartUpload"
+        );
+
+        // ListParts: GET /{bucket}/{key}?uploadId=abc
+        assert_eq!(
+            determine_operation(&make_request("GET", "/photos/big.zip?uploadId=abc")),
+            "ListParts"
+        );
+
+        // ListMultipartUploads: GET /{bucket}?uploads
+        assert_eq!(
+            determine_operation(&make_request("GET", "/photos?uploads")),
+            "ListMultipartUploads"
+        );
+    }
+
+    #[test]
+    fn test_determine_operation_admin() {
+        assert_eq!(
+            determine_operation(&make_request("GET", "/_shoebox/credentials")),
+            "Admin"
+        );
     }
 }

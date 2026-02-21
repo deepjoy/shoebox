@@ -39,6 +39,7 @@ pub fn create_router(state: AppState) -> Router {
         // Object-level
         .route("/{bucket}/{*key}", get(handlers::object::get_object))
         .route("/{bucket}/{*key}", put(handlers::object::put_object))
+        .route("/{bucket}/{*key}", post(handlers::object::post_object))
         .route("/{bucket}/{*key}", delete(handlers::object::delete_object))
         .route("/{bucket}/{*key}", head(handlers::object::head_object))
         .with_state(state)
