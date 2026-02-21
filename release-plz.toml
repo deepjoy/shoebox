@@ -1,0 +1,16 @@
+[workspace]
+# Only release when merging the release PR, not on every push
+release_always = false
+
+# Enable changelog generation from conventional commits
+changelog_update = true
+
+# Create GitHub releases with tag
+git_release_enable = true
+git_tag_enable = true
+
+# Check semver compatibility
+semver_check = true
+
+# Label release PRs for easy identification
+pr_labels = ["release"]
