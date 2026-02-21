@@ -10,6 +10,7 @@ use futures::StreamExt;
 use crate::api::extractors::extract_metadata_headers;
 use crate::api::responses::ObjectResponse;
 use crate::error::S3Error;
+use crate::services::copy_service::{self, CopyConditions};
 use crate::services::object_service::{self, PutObjectInput};
 use crate::services::AppState;
 use crate::storage::filesystem::FileContent;
@@ -25,6 +26,14 @@ const EPOCH_HTTP_DATE: &str = "Thu, 01 Jan 1970 00:00:00 GMT";
 fn format_http_date(dt: &time::OffsetDateTime) -> String {
     dt.format(HTTP_DATE)
         .unwrap_or_else(|_| EPOCH_HTTP_DATE.to_string())
+}
+
+fn parse_http_date(s: &str) -> Result<time::OffsetDateTime, S3Error> {
+    // Parse as PrimitiveDateTime because the format uses literal "GMT" rather
+    // than an offset specifier, then assume UTC.
+    time::PrimitiveDateTime::parse(s, HTTP_DATE)
+        .map(|dt| dt.assume_utc())
+        .map_err(|_| S3Error::InvalidArgument)
 }
 
 /// GET /{bucket}/{key} — download an object.
@@ -69,14 +78,70 @@ pub async fn get_object(
     }
 }
 
-/// PUT /{bucket}/{key} — upload an object.
+/// PUT /{bucket}/{key} — upload, copy, or rename an object.
 pub async fn put_object(
     State(state): State<AppState>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((bucket_name, key)): Path<(String, String)>,
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, S3Error> {
-    let bucket = state.get_bucket(&bucket)?;
+    // Check for copy-source header
+    if let Some(copy_source) = headers.get("x-amz-copy-source") {
+        let is_rename = headers
+            .get("x-shoebox-rename")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        let copy_source_str = copy_source.to_str().map_err(|_| S3Error::InvalidArgument)?;
+        let (src_bucket_name, src_key) = parse_copy_source(copy_source_str)?;
+
+        if is_rename {
+            // Rename not yet implemented — will be added in a later commit
+            return Err(S3Error::InvalidArgument);
+        }
+
+        // Regular copy — resolve both buckets
+        let src_bucket = state.get_bucket(&src_bucket_name)?;
+        let dst_bucket = state.get_bucket(&bucket_name)?;
+
+        let conditions = extract_copy_conditions(&headers);
+
+        let result = copy_service::copy_object(
+            &src_bucket.storage,
+            &src_bucket.metadata,
+            &src_key,
+            &dst_bucket.storage,
+            &dst_bucket.metadata,
+            &key,
+            &conditions,
+        )
+        .await?;
+
+        // Return CopyObjectResult XML
+        let last_modified = result
+            .last_modified
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <ETag>{}</ETag>
+  <LastModified>{}</LastModified>
+</CopyObjectResult>"#,
+            result.etag, last_modified
+        );
+
+        return Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/xml")],
+            xml,
+        )
+            .into_response());
+    }
+
+    // Regular PUT
+    let bucket = state.get_bucket(&bucket_name)?;
 
     let stream = body
         .into_data_stream()
@@ -120,7 +185,7 @@ pub async fn head_object(
     let metadata = object_service::head_object(&bucket.storage, &bucket.metadata, &key).await?;
 
     let user_meta = parse_metadata_json(&metadata.metadata);
-    let mut headers = vec![
+    let mut resp_headers = vec![
         (
             header::CONTENT_TYPE.to_string(),
             metadata
@@ -139,11 +204,11 @@ pub async fn head_object(
     ];
 
     for (key, value) in &user_meta {
-        headers.push((format!("x-amz-meta-{}", key), value.clone()));
+        resp_headers.push((format!("x-amz-meta-{}", key), value.clone()));
     }
 
     let mut builder = axum::http::Response::builder().status(StatusCode::OK);
-    for (k, v) in &headers {
+    for (k, v) in &resp_headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
     Ok(builder.body(axum::body::Body::empty()).unwrap_or_else(|_| {
@@ -152,6 +217,59 @@ pub async fn head_object(
             .body(axum::body::Body::empty())
             .unwrap()
     }))
+}
+
+/// Parse the `x-amz-copy-source` header value into (bucket, key).
+/// Format: `/bucket/key` or `bucket/key`
+fn parse_copy_source(source: &str) -> Result<(String, String), S3Error> {
+    let source = source.strip_prefix('/').unwrap_or(source);
+
+    // URL-decode the source path
+    let decoded = url::form_urlencoded::parse(source.as_bytes())
+        .map(|(k, v)| {
+            if v.is_empty() {
+                k.to_string()
+            } else {
+                format!("{}={}", k, v)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let source = if decoded.is_empty() {
+        source.to_string()
+    } else {
+        decoded
+    };
+
+    let (bucket, key) = source.split_once('/').ok_or(S3Error::InvalidArgument)?;
+
+    if bucket.is_empty() || key.is_empty() {
+        return Err(S3Error::InvalidArgument);
+    }
+
+    Ok((bucket.to_string(), key.to_string()))
+}
+
+/// Extract copy conditions from x-amz-copy-source-* headers.
+fn extract_copy_conditions(headers: &HeaderMap) -> CopyConditions {
+    CopyConditions {
+        if_match: headers
+            .get("x-amz-copy-source-if-match")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        if_none_match: headers
+            .get("x-amz-copy-source-if-none-match")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        if_modified_since: headers
+            .get("x-amz-copy-source-if-modified-since")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| parse_http_date(s).ok()),
+        if_unmodified_since: headers
+            .get("x-amz-copy-source-if-unmodified-since")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| parse_http_date(s).ok()),
+    }
 }
 
 fn parse_metadata_json(raw: &Option<String>) -> HashMap<String, String> {

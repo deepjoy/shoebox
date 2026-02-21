@@ -42,6 +42,28 @@ pub struct ObjectRecord {
     pub scan_level: i32,
 }
 
+impl Default for ObjectRecord {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            key: String::new(),
+            parent_directory: String::new(),
+            is_directory: false,
+            is_symlink: false,
+            symlink_target: None,
+            size: None,
+            file_mtime: None,
+            etag: None,
+            content_hash: None,
+            content_type: None,
+            last_modified: time::OffsetDateTime::UNIX_EPOCH,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            metadata: None,
+            scan_level: 0,
+        }
+    }
+}
+
 /// SQLite-backed metadata store for a single bucket.
 #[derive(Clone)]
 pub struct MetadataStore {

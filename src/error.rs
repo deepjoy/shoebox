@@ -48,6 +48,9 @@ pub enum S3Error {
     #[error("The specified credential does not exist")]
     NoSuchCredential,
 
+    #[error("At least one of the pre-conditions you specified did not hold")]
+    PreconditionFailed,
+
     #[error("We encountered an internal error, please try again")]
     InternalError,
 }
@@ -71,6 +74,7 @@ impl S3Error {
             Self::AuthorizationHeaderMalformed => "AuthorizationHeaderMalformed",
             Self::MissingSecurityHeader => "MissingSecurityHeader",
             Self::NoSuchCredential => "NoSuchCredential",
+            Self::PreconditionFailed => "PreconditionFailed",
             Self::InternalError => "InternalError",
         }
     }
@@ -96,6 +100,7 @@ impl S3Error {
             Self::NoSuchCredential => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::BucketAlreadyExists | Self::BucketAlreadyOwnedByYou => StatusCode::CONFLICT,
+            Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

@@ -22,6 +22,7 @@ use crate::config::{resolve_bucket, BucketConfig, METADATA_DB};
 use crate::error::S3Error;
 use crate::metadata::sqlite::ObjectRecord;
 use crate::metadata::MetadataStore;
+use crate::services::copy_service::{self, CopyConditions, CopyResult};
 use crate::services::object_service::{self, GetObjectResult, PutObjectInput, PutObjectResult};
 use crate::services::{AppState, LoadedBucket};
 use crate::storage::filesystem::FilesystemStorage;
@@ -98,6 +99,28 @@ impl Shoebox {
         b.metadata
             .list_objects_v2(prefix, delimiter, max_keys, start_after)
             .await
+    }
+
+    pub async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+        conditions: &CopyConditions,
+    ) -> Result<CopyResult, S3Error> {
+        let src = self.get_bucket(src_bucket)?;
+        let dst = self.get_bucket(dst_bucket)?;
+        copy_service::copy_object(
+            &src.storage,
+            &src.metadata,
+            src_key,
+            &dst.storage,
+            &dst.metadata,
+            dst_key,
+            conditions,
+        )
+        .await
     }
 
     pub fn presign_get(

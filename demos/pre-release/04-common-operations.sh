@@ -101,9 +101,68 @@ step "Verify uploads"
 run "aws s3 ls s3://photos/ --recursive"
 sleep "$DELAY"
 
+# ── 3. CopyObject — same bucket ───────────────────────────────────────────
+
+banner "CopyObject — Same Bucket"
+
+step "Copy fox.txt to backup/fox-copy.txt within photos"
+run "aws s3 cp s3://photos/animals/fox.txt s3://photos/backup/fox-copy.txt"
+
+step "Verify both files exist"
+run "aws s3 ls s3://photos/ --recursive"
+ok "CopyObject within same bucket works"
+sleep "$DELAY"
+
+# ── 4. CopyObject — cross bucket ─────────────────────────────────────────
+
+banner "CopyObject — Cross Bucket"
+
+step "Copy fox.txt from photos to archive bucket"
+note "Using archive bucket credentials to authorize destination write"
+ARCHIVE_KEY=$(grep access_key_id "$BUCKET_B/.shoebox/config.toml" | head -1 | cut -d'"' -f2)
+ARCHIVE_SECRET=$(grep secret_access_key "$BUCKET_B/.shoebox/config.toml" | head -1 | cut -d'"' -f2)
+export AWS_ACCESS_KEY_ID="$ARCHIVE_KEY"
+export AWS_SECRET_ACCESS_KEY="$ARCHIVE_SECRET"
+run "aws s3api copy-object --bucket archive --key fox-archived.txt --copy-source photos/animals/fox.txt"
+ok "Cross-bucket copy succeeded"
+
+step "Verify file in archive bucket"
+run "aws s3 ls s3://archive/ --recursive"
+ok "CopyObject across buckets works"
+
+# Switch back to photos credentials
+export AWS_ACCESS_KEY_ID="$ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$SECRET_KEY"
+sleep "$DELAY"
+
+# ── 5. CopyObject — conditional headers ──────────────────────────────────
+
+banner "CopyObject — Conditional Headers"
+
+step "Get ETag of source file"
+ETAG=$(aws s3api head-object --bucket photos --key animals/fox.txt --query ETag --output text 2>/dev/null || echo '""')
+note "ETag: $ETAG"
+
+step "Copy with matching --copy-source-if-match (should succeed)"
+run "aws s3api copy-object --bucket photos --key conditional-copy.txt --copy-source photos/animals/fox.txt --copy-source-if-match '$ETAG'"
+ok "Conditional copy with matching ETag succeeded"
+
+step "Copy with wrong --copy-source-if-match (should fail 412)"
+RESULT=$(aws s3api copy-object --bucket photos --key should-not-exist.txt \
+  --copy-source "photos/animals/fox.txt" \
+  --copy-source-if-match '"wrong-etag"' 2>&1 || true)
+note "$RESULT"
+if echo "$RESULT" | grep -qi "PreconditionFailed\|Precondition\|412"; then
+  ok "Conditional copy with wrong ETag correctly returned 412"
+fi
+sleep "$DELAY"
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 
 banner "Phase 4 Demo Complete"
-note "Phase 4 features will be demonstrated as they are implemented."
+note "All Phase 4 features demonstrated so far:"
+note "  - CopyObject within same bucket"
+note "  - CopyObject across buckets"
+note "  - CopyObject conditional headers (if-match)"
 
 sleep "${END_DELAY}"
