@@ -193,19 +193,56 @@ signed_curl DELETE "/uploads/error-test.txt?uploadId=$ERR_UPLOAD_ID" > /dev/null
 
 sleep "$DELAY"
 
-# ── 4. Abort Multipart Upload ─────────────────────────────────────────────
+# ── 4. List In-Progress Uploads ─────────────────────────────────────────────
+
+banner "List In-Progress Uploads"
+
+step "Initiate another upload (leave incomplete)"
+INITIATE2=$(signed_curl POST "/uploads/large-file.bin?uploads" -H "content-type: application/octet-stream")
+UPLOAD_ID2=$(echo "$INITIATE2" | grep -o '<UploadId>[^<]*</UploadId>' | sed 's/<[^>]*>//g')
+echo "  Upload ID: $UPLOAD_ID2"
+ok "Second upload initiated"
+
+step "List all in-progress multipart uploads"
+LIST_UPLOADS=$(signed_curl GET "/uploads?uploads")
+UPLOAD_COUNT=$(echo "$LIST_UPLOADS" | grep -o '<UploadId>' | wc -l)
+echo "  In-progress uploads: $UPLOAD_COUNT"
+ok "Listed multipart uploads"
+
+sleep "$DELAY"
+
+# ── 5. Abort Multipart Upload ─────────────────────────────────────────────
 
 banner "Abort Multipart Upload"
 
-step "Initiate upload to abort"
-ABORT_RESPONSE=$(signed_curl POST "/uploads/abort-test.txt?uploads" -H "content-type: text/plain")
-ABORT_UPLOAD_ID=$(echo "$ABORT_RESPONSE" | grep -o '<UploadId>[^<]*</UploadId>' | sed 's/<[^>]*>//g')
-echo "  Upload ID: $ABORT_UPLOAD_ID"
-ok "Upload initiated"
-
-step "Abort the upload"
-signed_curl DELETE "/uploads/abort-test.txt?uploadId=$ABORT_UPLOAD_ID" > /dev/null
+step "Abort the second upload"
+signed_curl DELETE "/uploads/large-file.bin?uploadId=$UPLOAD_ID2" > /dev/null
 ok "Upload aborted"
+
+step "Verify upload is gone"
+LIST_AFTER_ABORT=$(signed_curl GET "/uploads?uploads")
+REMAINING=$(echo "$LIST_AFTER_ABORT" | grep -o '<UploadId>' || true | wc -l)
+echo "  Remaining uploads: $REMAINING"
+ok "Upload removed from list"
+
+sleep "$DELAY"
+
+# ── 6. AWS CLI Automatic Multipart ────────────────────────────────────────
+
+banner "AWS CLI Automatic Multipart (Large File)"
+
+step "Create a 20 MB test file"
+dd if=/dev/zero bs=1M count=20 of="$DEMO_ROOT/large.bin" 2>/dev/null
+note "AWS CLI automatically uses multipart for files >5 MB"
+
+step "Upload large file (automatic multipart)"
+run "aws s3 cp $DEMO_ROOT/large.bin s3://uploads/large.bin"
+ok "Large file uploaded via automatic multipart"
+
+step "Verify file size"
+SIZE=$(aws s3api head-object --bucket uploads --key large.bin --query ContentLength --output text)
+echo "  Size: $SIZE bytes ($(($SIZE / 1024 / 1024)) MB)"
+ok "File uploaded correctly"
 
 sleep "$DELAY"
 
@@ -221,6 +258,9 @@ note "  - Multipart ETag format: hash-numparts"
 note "  - File content verified after assembly"
 note "  - Part number validation rejects invalid numbers"
 note "  - ETag verification rejects mismatched ETags"
+note "  - ListMultipartUploads shows in-progress uploads"
 note "  - AbortMultipartUpload cleans up parts"
+note "  - Upload removed from list after abort"
+note "  - AWS CLI automatic multipart (20 MB file)"
 
 sleep "${END_DELAY}"

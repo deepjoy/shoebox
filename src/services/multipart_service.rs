@@ -6,6 +6,8 @@ use md5::{Digest, Md5};
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncWriteExt;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::error::S3Error;
 use crate::metadata::sqlite::ObjectRecord;
 use crate::metadata::MetadataStore;
@@ -256,5 +258,120 @@ pub async fn list_parts(
             .collect(),
         is_truncated,
         next_part_number_marker: next_marker,
+    })
+}
+
+/// List all in-progress multipart uploads.
+pub async fn list_multipart_uploads(
+    metadata: &MetadataStore,
+    bucket_name: &str,
+    prefix: Option<&str>,
+    max_uploads: i32,
+    key_marker: Option<&str>,
+    upload_id_marker: Option<&str>,
+) -> Result<ListMultipartUploadsResult, S3Error> {
+    let uploads = metadata
+        .list_multipart_uploads(prefix, max_uploads, key_marker, upload_id_marker)
+        .await?;
+
+    let is_truncated = uploads.len() as i32 == max_uploads;
+    let (next_key_marker, next_upload_id_marker) = if is_truncated {
+        uploads
+            .last()
+            .map(|u| (Some(u.key.clone()), Some(u.id.clone())))
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+
+    Ok(ListMultipartUploadsResult {
+        bucket: bucket_name.to_string(),
+        uploads: uploads
+            .into_iter()
+            .map(|u| UploadInfo {
+                key: u.key,
+                upload_id: u.id,
+                initiated: u.initiated_at,
+            })
+            .collect(),
+        is_truncated,
+        next_key_marker,
+        next_upload_id_marker,
+    })
+}
+
+/// Clean up uploads older than max_age.
+pub async fn cleanup_abandoned(
+    metadata: &MetadataStore,
+    parts_dir: &Path,
+    max_age: std::time::Duration,
+) -> Result<CleanupReport, S3Error> {
+    let cutoff = time::OffsetDateTime::now_utc() - max_age;
+    let cutoff_str = cutoff.format(&Rfc3339).unwrap();
+
+    let abandoned = metadata.find_abandoned_uploads(&cutoff_str).await?;
+
+    let mut cleaned = 0;
+    let mut bytes_freed = 0u64;
+
+    for upload in abandoned {
+        // Calculate size of parts
+        let upload_parts_dir = parts_dir.join(&upload.id);
+        if upload_parts_dir.exists() {
+            bytes_freed += dir_size(&upload_parts_dir).await?;
+            tokio::fs::remove_dir_all(&upload_parts_dir).await?;
+        }
+
+        metadata.delete_multipart_upload(&upload.id).await?;
+        cleaned += 1;
+    }
+
+    Ok(CleanupReport {
+        cleaned,
+        bytes_freed,
+    })
+}
+
+/// Background task: run cleanup on an interval until shutdown.
+pub async fn cleanup_loop(
+    metadata: MetadataStore,
+    parts_dir: std::path::PathBuf,
+    max_age: std::time::Duration,
+    interval: std::time::Duration,
+    token: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                tracing::info!("Abandoned upload cleanup shutting down");
+                break;
+            }
+            _ = tokio::time::sleep(interval) => {
+                if let Err(e) = cleanup_abandoned(&metadata, &parts_dir, max_age).await {
+                    tracing::warn!("Abandoned upload cleanup failed: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Calculate total size of a directory recursively.
+fn dir_size(
+    path: &Path,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, S3Error>> + '_>> {
+    Box::pin(async move {
+        let mut total = 0u64;
+        let mut read_dir = tokio::fs::read_dir(path).await?;
+
+        while let Some(entry) = read_dir.next_entry().await? {
+            let metadata = entry.metadata().await?;
+            if metadata.is_file() {
+                total += metadata.len();
+            } else if metadata.is_dir() {
+                total += dir_size(&entry.path()).await?;
+            }
+        }
+
+        Ok(total)
     })
 }

@@ -54,6 +54,23 @@ pub async fn bucket_or_list(
     Path(bucket): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, S3Error> {
+    if params.contains_key("uploads") {
+        use crate::handlers::multipart::ListMultipartUploadsQuery;
+        let list_uploads_query = ListMultipartUploadsQuery {
+            uploads: params.get("uploads").cloned(),
+            prefix: params.get("prefix").cloned(),
+            delimiter: params.get("delimiter").cloned(),
+            max_uploads: params.get("max-uploads").and_then(|s| s.parse().ok()),
+            key_marker: params.get("key-marker").cloned(),
+            upload_id_marker: params.get("upload-id-marker").cloned(),
+        };
+        return crate::handlers::multipart::list_multipart_uploads(
+            State(state),
+            axum::extract::Path(bucket),
+            axum::extract::Query(list_uploads_query),
+        )
+        .await;
+    }
     if params.contains_key("location") {
         return get_bucket_location(State(state), Path(bucket))
             .await

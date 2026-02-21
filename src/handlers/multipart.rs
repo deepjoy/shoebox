@@ -41,6 +41,18 @@ pub struct ListPartsQuery {
     pub part_number_marker: Option<i32>,
 }
 
+/// Query parameters for ListMultipartUploads
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ListMultipartUploadsQuery {
+    pub uploads: Option<String>,
+    pub prefix: Option<String>,
+    pub delimiter: Option<String>,
+    pub max_uploads: Option<i32>,
+    pub key_marker: Option<String>,
+    pub upload_id_marker: Option<String>,
+}
+
 /// POST /{bucket}/{key}?uploads — Initiate a multipart upload.
 pub async fn initiate_multipart_upload(
     State(state): State<AppState>,
@@ -277,6 +289,75 @@ pub async fn list_parts(
             .collect(),
         is_truncated: result.is_truncated,
         next_part_number_marker: result.next_part_number_marker,
+    };
+
+    let xml = to_string(&response).unwrap();
+    let xml = inject_xmlns(&xml);
+
+    Ok((StatusCode::OK, ([("content-type", "application/xml")], xml)).into_response())
+}
+
+/// GET /{bucket}?uploads — List in-progress multipart uploads.
+pub async fn list_multipart_uploads(
+    State(state): State<AppState>,
+    AxumPath(bucket_name): AxumPath<String>,
+    Query(query): Query<ListMultipartUploadsQuery>,
+) -> Result<Response, S3Error> {
+    let bucket = state.get_bucket(&bucket_name)?;
+
+    let max_uploads = query.max_uploads.unwrap_or(1000).min(1000);
+
+    let result = multipart_service::list_multipart_uploads(
+        &bucket.metadata,
+        &bucket_name,
+        query.prefix.as_deref(),
+        max_uploads,
+        query.key_marker.as_deref(),
+        query.upload_id_marker.as_deref(),
+    )
+    .await?;
+
+    #[derive(serde::Serialize)]
+    struct ListMultipartUploadsResponse {
+        #[serde(rename = "Bucket")]
+        bucket: String,
+        #[serde(rename = "Upload")]
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        uploads: Vec<UploadEntry>,
+        #[serde(rename = "IsTruncated")]
+        is_truncated: bool,
+        #[serde(rename = "NextKeyMarker")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_key_marker: Option<String>,
+        #[serde(rename = "NextUploadIdMarker")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_upload_id_marker: Option<String>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct UploadEntry {
+        #[serde(rename = "Key")]
+        key: String,
+        #[serde(rename = "UploadId")]
+        upload_id: String,
+        #[serde(rename = "Initiated")]
+        initiated: String,
+    }
+
+    let response = ListMultipartUploadsResponse {
+        bucket: result.bucket,
+        uploads: result
+            .uploads
+            .into_iter()
+            .map(|u| UploadEntry {
+                key: u.key,
+                upload_id: u.upload_id,
+                initiated: u.initiated,
+            })
+            .collect(),
+        is_truncated: result.is_truncated,
+        next_key_marker: result.next_key_marker,
+        next_upload_id_marker: result.next_upload_id_marker,
     };
 
     let xml = to_string(&response).unwrap();
