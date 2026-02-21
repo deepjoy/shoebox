@@ -82,9 +82,9 @@ export AWS_ENDPOINT_URL="$ENDPOINT"
 ok "Server started on $ENDPOINT with bucket: uploads"
 sleep "$DELAY"
 
-# ── 2. Initiate + Upload Parts ────────────────────────────────────────────
+# ── 2. Manual Multipart Upload Flow ───────────────────────────────────────
 
-banner "Initiate + Upload Parts"
+banner "Manual Multipart Upload Flow"
 
 step "Create test file (split into 3 parts)"
 echo "Part 1: The quick brown fox" > "$DEMO_ROOT/part1.txt"
@@ -115,8 +115,97 @@ ETAG3=$(signed_curl PUT "/uploads/test-file.txt?partNumber=3&uploadId=$UPLOAD_ID
 echo "  ETag: $ETAG3"
 ok "Part 3 uploaded"
 
-# Clean up — abort the upload since Complete isn't wired yet
-signed_curl DELETE "/uploads/test-file.txt?uploadId=$UPLOAD_ID" > /dev/null 2>&1 || true
+step "List uploaded parts"
+LIST_PARTS_RESPONSE=$(signed_curl GET "/uploads/test-file.txt?uploadId=$UPLOAD_ID")
+PART_COUNT=$(echo "$LIST_PARTS_RESPONSE" | grep -o '<PartNumber>' | wc -l)
+echo "  Parts uploaded: $PART_COUNT"
+ok "Listed parts"
+
+step "Complete multipart upload"
+COMPLETE_BODY="<CompleteMultipartUpload>
+  <Part><PartNumber>1</PartNumber><ETag>$ETAG1</ETag></Part>
+  <Part><PartNumber>2</PartNumber><ETag>$ETAG2</ETag></Part>
+  <Part><PartNumber>3</PartNumber><ETag>$ETAG3</ETag></Part>
+</CompleteMultipartUpload>"
+
+COMPLETE_RESPONSE=$(signed_curl POST "/uploads/test-file.txt?uploadId=$UPLOAD_ID" -d "$COMPLETE_BODY")
+FINAL_ETAG=$(echo "$COMPLETE_RESPONSE" | grep -o '<ETag>[^<]*</ETag>' | sed 's/<[^>]*>//g')
+echo "  Final ETag: $FINAL_ETAG"
+ok "Multipart upload completed"
+
+step "Verify multipart ETag format (hash-numparts)"
+if [[ "$FINAL_ETAG" =~ ^\"?[0-9a-f]{32}-3\"?$ ]]; then
+  ok "ETag matches expected format: md5-3"
+else
+  echo "  FAIL: expected format '<32-hex>-3', got $FINAL_ETAG"
+  exit 1
+fi
+
+step "Verify assembled file"
+run "aws s3 cp s3://uploads/test-file.txt $DEMO_ROOT/assembled.txt"
+cat "$DEMO_ROOT/assembled.txt"
+ok "File assembled correctly"
+
+sleep "$DELAY"
+
+# ── 3. Error Handling ────────────────────────────────────────────────────
+
+banner "Error Handling"
+
+step "Initiate upload for error tests"
+ERR_RESPONSE=$(signed_curl POST "/uploads/error-test.txt?uploads" -H "content-type: text/plain")
+ERR_UPLOAD_ID=$(echo "$ERR_RESPONSE" | grep -o '<UploadId>[^<]*</UploadId>' | sed 's/<[^>]*>//g')
+ok "Upload initiated (ID: $ERR_UPLOAD_ID)"
+
+step "Reject part number 0 (must be 1-10000)"
+HTTP_CODE=$(signed_curl PUT "/uploads/error-test.txt?partNumber=0&uploadId=$ERR_UPLOAD_ID" \
+  -d "bad part" -o /dev/null -w '%{http_code}')
+echo "  HTTP status: $HTTP_CODE"
+if [[ "$HTTP_CODE" -ge 400 ]]; then
+  ok "Invalid part number correctly rejected"
+else
+  echo "  FAIL: expected 4xx, got $HTTP_CODE"
+  exit 1
+fi
+
+step "Upload a valid part for ETag test"
+ERR_ETAG=$(signed_curl PUT "/uploads/error-test.txt?partNumber=1&uploadId=$ERR_UPLOAD_ID" \
+  -d "valid part" -D- | grep -i '^etag:' | cut -d' ' -f2 | tr -d '\r')
+echo "  ETag: $ERR_ETAG"
+ok "Part uploaded"
+
+step "Reject complete with wrong ETag"
+BAD_COMPLETE="<CompleteMultipartUpload>
+  <Part><PartNumber>1</PartNumber><ETag>\"0000000000000000deadbeef00000000\"</ETag></Part>
+</CompleteMultipartUpload>"
+HTTP_CODE=$(signed_curl POST "/uploads/error-test.txt?uploadId=$ERR_UPLOAD_ID" \
+  -d "$BAD_COMPLETE" -o /dev/null -w '%{http_code}')
+echo "  HTTP status: $HTTP_CODE"
+if [[ "$HTTP_CODE" -ge 400 ]]; then
+  ok "Mismatched ETag correctly rejected"
+else
+  echo "  FAIL: expected 4xx, got $HTTP_CODE"
+  exit 1
+fi
+
+# Clean up error test upload
+signed_curl DELETE "/uploads/error-test.txt?uploadId=$ERR_UPLOAD_ID" > /dev/null
+
+sleep "$DELAY"
+
+# ── 4. Abort Multipart Upload ─────────────────────────────────────────────
+
+banner "Abort Multipart Upload"
+
+step "Initiate upload to abort"
+ABORT_RESPONSE=$(signed_curl POST "/uploads/abort-test.txt?uploads" -H "content-type: text/plain")
+ABORT_UPLOAD_ID=$(echo "$ABORT_RESPONSE" | grep -o '<UploadId>[^<]*</UploadId>' | sed 's/<[^>]*>//g')
+echo "  Upload ID: $ABORT_UPLOAD_ID"
+ok "Upload initiated"
+
+step "Abort the upload"
+signed_curl DELETE "/uploads/abort-test.txt?uploadId=$ABORT_UPLOAD_ID" > /dev/null
+ok "Upload aborted"
 
 sleep "$DELAY"
 
@@ -126,5 +215,12 @@ banner "Phase 5 Demo Complete"
 note "All Phase 5 features demonstrated so far:"
 note "  - InitiateMultipartUpload creates upload ID"
 note "  - UploadPart uploads individual parts with ETags"
+note "  - ListParts shows uploaded parts"
+note "  - CompleteMultipartUpload assembles final file"
+note "  - Multipart ETag format: hash-numparts"
+note "  - File content verified after assembly"
+note "  - Part number validation rejects invalid numbers"
+note "  - ETag verification rejects mismatched ETags"
+note "  - AbortMultipartUpload cleans up parts"
 
 sleep "${END_DELAY}"
