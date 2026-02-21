@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use crate::api::extractors::extract_metadata_headers;
 use crate::api::responses::ObjectResponse;
 use crate::error::S3Error;
+use crate::metadata::sqlite::ObjectRecord;
 use crate::services::copy_service::{self, CopyConditions};
 use crate::services::object_service::{self, PutObjectInput};
 use crate::services::AppState;
@@ -37,7 +38,56 @@ fn parse_http_date(s: &str) -> Result<time::OffsetDateTime, S3Error> {
         .map_err(|_| S3Error::InvalidArgument)
 }
 
-/// GET /{bucket}/{key} — download an object with range support.
+/// Check conditional headers against an object record.
+/// Returns `Some(Response)` for 304 Not Modified, or `Err` for precondition failures.
+fn check_conditional(
+    record: &ObjectRecord,
+    headers: &HeaderMap,
+) -> Result<Option<Response>, S3Error> {
+    // If-Match: Return only if ETag matches
+    if let Some(if_match) = headers.get(header::IF_MATCH) {
+        let etag = if_match.to_str().map_err(|_| S3Error::InvalidArgument)?;
+        if record.etag.as_deref() != Some(etag) {
+            return Err(S3Error::PreconditionFailed);
+        }
+    }
+
+    // If-None-Match: Return only if ETag differs (for caching)
+    if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH) {
+        let etag = if_none_match
+            .to_str()
+            .map_err(|_| S3Error::InvalidArgument)?;
+        if record.etag.as_deref() == Some(etag) {
+            return Ok(Some(
+                (
+                    StatusCode::NOT_MODIFIED,
+                    [(header::ETAG, record.etag.clone().unwrap_or_default())],
+                )
+                    .into_response(),
+            ));
+        }
+    }
+
+    // If-Modified-Since
+    if let Some(ims) = headers.get(header::IF_MODIFIED_SINCE) {
+        let since = parse_http_date(ims.to_str().map_err(|_| S3Error::InvalidArgument)?)?;
+        if record.last_modified <= since {
+            return Ok(Some(StatusCode::NOT_MODIFIED.into_response()));
+        }
+    }
+
+    // If-Unmodified-Since
+    if let Some(ius) = headers.get(header::IF_UNMODIFIED_SINCE) {
+        let since = parse_http_date(ius.to_str().map_err(|_| S3Error::InvalidArgument)?)?;
+        if record.last_modified > since {
+            return Err(S3Error::PreconditionFailed);
+        }
+    }
+
+    Ok(None) // No condition triggered, proceed normally
+}
+
+/// GET /{bucket}/{key} — download an object with range and conditional support.
 pub async fn get_object(
     State(state): State<AppState>,
     Path((bucket_name, key)): Path<(String, String)>,
@@ -49,6 +99,11 @@ pub async fn get_object(
         .get_object(&key)
         .await?
         .ok_or(S3Error::NoSuchKey)?;
+
+    // Check conditional headers
+    if let Some(response) = check_conditional(&record, &headers)? {
+        return Ok(response);
+    }
 
     let file_size = record.size.unwrap_or(0) as u64;
     let content_type = record
@@ -234,9 +289,15 @@ pub async fn delete_object(
 pub async fn head_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, S3Error> {
     let bucket = state.get_bucket(&bucket)?;
     let metadata = object_service::head_object(&bucket.storage, &bucket.metadata, &key).await?;
+
+    // Check conditional headers
+    if let Some(response) = check_conditional(&metadata, &headers)? {
+        return Ok(response);
+    }
 
     let user_meta = parse_metadata_json(&metadata.metadata);
     let mut resp_headers = vec![

@@ -51,6 +51,9 @@ pub enum S3Error {
     #[error("At least one of the pre-conditions you specified did not hold")]
     PreconditionFailed,
 
+    #[error("Not Modified")]
+    NotModified,
+
     #[error("The Range header is invalid")]
     InvalidRange,
 
@@ -81,6 +84,7 @@ impl S3Error {
             Self::MissingSecurityHeader => "MissingSecurityHeader",
             Self::NoSuchCredential => "NoSuchCredential",
             Self::PreconditionFailed => "PreconditionFailed",
+            Self::NotModified => "NotModified",
             Self::InvalidRange => "InvalidRange",
             Self::RangeNotSatisfiable => "InvalidRange",
             Self::InternalError => "InternalError",
@@ -110,6 +114,7 @@ impl S3Error {
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::BucketAlreadyExists | Self::BucketAlreadyOwnedByYou => StatusCode::CONFLICT,
             Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
+            Self::NotModified => StatusCode::NOT_MODIFIED,
             Self::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -149,6 +154,19 @@ fn escape_xml(s: &str) -> String {
 
 impl IntoResponse for S3Error {
     fn into_response(self) -> Response {
+        // 304 Not Modified must not have a body per HTTP spec.
+        if matches!(self, Self::NotModified) {
+            return axum::http::Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .body(axum::body::Body::empty())
+                .unwrap_or_else(|_| {
+                    axum::http::Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(axum::body::Body::empty())
+                        .expect("minimal 500 response must not fail")
+                });
+        }
+
         let request_id = uuid::Uuid::new_v4().to_string();
         let body = self.to_xml(&request_id);
 

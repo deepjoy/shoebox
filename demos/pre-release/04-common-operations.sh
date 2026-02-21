@@ -188,6 +188,69 @@ if echo "$RESULT" | grep -qi "InvalidRange\|416\|range"; then
 fi
 sleep "$DELAY"
 
+# ── 7. Conditional requests — If-Match ────────────────────────────────────
+
+banner "Conditional Requests"
+
+step "Get ETag of fox.txt"
+ETAG=$(aws s3api head-object --bucket photos --key animals/fox.txt --query ETag --output text 2>/dev/null || echo '""')
+note "ETag: $ETAG"
+
+step "If-Match with correct ETag (should return 200)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --if-match '$ETAG' $DEMO_ROOT/ifmatch-ok.txt"
+ok "If-Match success: returned 200"
+
+step "If-Match with wrong ETag (should return 412)"
+RESULT=$(aws s3api get-object --bucket photos --key animals/fox.txt \
+  --if-match '"wrong-etag"' "$DEMO_ROOT/ifmatch-fail.txt" 2>&1 || true)
+note "$RESULT"
+if echo "$RESULT" | grep -qi "PreconditionFailed\|Precondition\|412"; then
+  ok "If-Match failure: returned 412 Precondition Failed"
+fi
+
+# ── If-None-Match ─────────────────────────────────────────────────────────
+
+step "If-None-Match with matching ETag (should return 304)"
+RESULT=$(aws s3api get-object --bucket photos --key animals/fox.txt \
+  --if-none-match "$ETAG" "$DEMO_ROOT/ifnonematch.txt" 2>&1 || true)
+note "$RESULT"
+if echo "$RESULT" | grep -qi "NotModified\|304\|not modified"; then
+  ok "If-None-Match: returned 304 Not Modified"
+fi
+
+step "If-None-Match with different ETag (should return 200)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --if-none-match '\"different-etag\"' $DEMO_ROOT/ifnonematch-ok.txt"
+ok "If-None-Match: returned 200 (ETag differs)"
+
+# ── If-Modified-Since ─────────────────────────────────────────────────────
+
+step "If-Modified-Since with future date (should return 304)"
+RESULT=$(aws s3api get-object --bucket photos --key animals/fox.txt \
+  --if-modified-since "2099-01-01T00:00:00Z" "$DEMO_ROOT/ims-future.txt" 2>&1 || true)
+note "$RESULT"
+if echo "$RESULT" | grep -qi "NotModified\|304\|not modified"; then
+  ok "If-Modified-Since: returned 304 (not modified since future date)"
+fi
+
+step "If-Modified-Since with past date (should return 200)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --if-modified-since '1970-01-01T00:00:00Z' $DEMO_ROOT/ims-past.txt"
+ok "If-Modified-Since: returned 200 (modified since epoch)"
+
+# ── If-Unmodified-Since ───────────────────────────────────────────────────
+
+step "If-Unmodified-Since with future date (should return 200)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --if-unmodified-since '2099-01-01T00:00:00Z' $DEMO_ROOT/ius-future.txt"
+ok "If-Unmodified-Since: returned 200 (not modified since future date)"
+
+step "If-Unmodified-Since with past date (should return 412)"
+RESULT=$(aws s3api get-object --bucket photos --key animals/fox.txt \
+  --if-unmodified-since "1970-01-01T00:00:00Z" "$DEMO_ROOT/ius-past.txt" 2>&1 || true)
+note "$RESULT"
+if echo "$RESULT" | grep -qi "PreconditionFailed\|Precondition\|412"; then
+  ok "If-Unmodified-Since: returned 412 Precondition Failed"
+fi
+sleep "$DELAY"
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 
 banner "Phase 4 Demo Complete"
@@ -200,5 +263,9 @@ note "  - Range: bytes=-N (last N bytes)"
 note "  - Range: bytes=N- (offset to end)"
 note "  - Range returns 206 Partial Content"
 note "  - Invalid range returns 416"
+note "  - If-Match success and failure"
+note "  - If-None-Match returns 304"
+note "  - If-Modified-Since works"
+note "  - If-Unmodified-Since works"
 
 sleep "${END_DELAY}"
