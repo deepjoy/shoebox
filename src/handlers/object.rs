@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures::StreamExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
 use crate::api::extractors::extract_metadata_headers;
 use crate::api::responses::ObjectResponse;
@@ -36,29 +37,82 @@ fn parse_http_date(s: &str) -> Result<time::OffsetDateTime, S3Error> {
         .map_err(|_| S3Error::InvalidArgument)
 }
 
-/// GET /{bucket}/{key} — download an object.
+/// GET /{bucket}/{key} — download an object with range support.
 pub async fn get_object(
     State(state): State<AppState>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((bucket_name, key)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, S3Error> {
-    let bucket = state.get_bucket(&bucket)?;
-    let result = object_service::get_object(&bucket.storage, &bucket.metadata, &key).await?;
+    let bucket = state.get_bucket(&bucket_name)?;
+    let record = bucket
+        .metadata
+        .get_object(&key)
+        .await?
+        .ok_or(S3Error::NoSuchKey)?;
 
-    let metadata = result.record;
-    match result.content {
+    let file_size = record.size.unwrap_or(0) as u64;
+    let content_type = record
+        .content_type
+        .clone()
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let etag = record.etag.clone().unwrap_or_default();
+    let last_modified = format_http_date(&record.last_modified);
+    let user_meta = parse_metadata_json(&record.metadata);
+
+    // Check for Range header
+    if let Some(range_header) = headers.get(header::RANGE) {
+        let range_str = range_header.to_str().map_err(|_| S3Error::InvalidRange)?;
+
+        let (start, end) = parse_range(range_str, file_size)?;
+
+        // Validate range
+        if start >= file_size {
+            return Err(S3Error::RangeNotSatisfiable);
+        }
+
+        let end = end.min(file_size - 1);
+        let length = end - start + 1;
+
+        // Open file handle for seeking
+        let mut file = bucket.storage.get_file_handle(&key).await?;
+        file.seek(SeekFrom::Start(start)).await?;
+        let stream = tokio_util::io::ReaderStream::new(file.take(length));
+        let body = axum::body::Body::from_stream(stream);
+
+        let mut builder = axum::http::Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_TYPE, &content_type)
+            .header(header::CONTENT_LENGTH, length.to_string())
+            .header(
+                header::CONTENT_RANGE,
+                format!("bytes {}-{}/{}", start, end, file_size),
+            )
+            .header(header::ETAG, &etag)
+            .header(header::LAST_MODIFIED, &last_modified);
+
+        for (k, v) in &user_meta {
+            builder = builder.header(format!("x-amz-meta-{}", k), v);
+        }
+
+        return Ok(builder
+            .body(body)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()));
+    }
+
+    // Full content response
+    let content = bucket.storage.get(&key).await?;
+    match content {
         FileContent::Regular(file) => {
             let stream = tokio_util::io::ReaderStream::new(file);
             let body = axum::body::Body::from_stream(stream);
 
             Ok(ObjectResponse {
                 body,
-                content_length: metadata.size.unwrap_or(0) as u64,
-                content_type: metadata
-                    .content_type
-                    .unwrap_or_else(|| "application/octet-stream".to_string()),
-                etag: metadata.etag.unwrap_or_default(),
-                last_modified: format_http_date(&metadata.last_modified),
-                metadata: parse_metadata_json(&metadata.metadata),
+                content_length: file_size,
+                content_type,
+                etag,
+                last_modified,
+                metadata: user_meta,
             }
             .into_response())
         }
@@ -69,9 +123,9 @@ pub async fn get_object(
                 body,
                 content_length: len,
                 content_type: "application/x-symlink".to_string(),
-                etag: metadata.etag.unwrap_or_default(),
-                last_modified: format_http_date(&metadata.last_modified),
-                metadata: parse_metadata_json(&metadata.metadata),
+                etag,
+                last_modified,
+                metadata: user_meta,
             }
             .into_response())
         }
@@ -269,6 +323,27 @@ fn extract_copy_conditions(headers: &HeaderMap) -> CopyConditions {
             .get("x-amz-copy-source-if-unmodified-since")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| parse_http_date(s).ok()),
+    }
+}
+
+fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64), S3Error> {
+    let range = range.strip_prefix("bytes=").ok_or(S3Error::InvalidRange)?;
+
+    if let Some(stripped) = range.strip_prefix('-') {
+        // Suffix range: last N bytes
+        let suffix: u64 = stripped.parse().map_err(|_| S3Error::InvalidRange)?;
+        let start = file_size.saturating_sub(suffix);
+        Ok((start, file_size - 1))
+    } else if let Some(stripped) = range.strip_suffix('-') {
+        // From offset to end
+        let start: u64 = stripped.parse().map_err(|_| S3Error::InvalidRange)?;
+        Ok((start, file_size - 1))
+    } else {
+        // Explicit range
+        let (start_str, end_str) = range.split_once('-').ok_or(S3Error::InvalidRange)?;
+        let start: u64 = start_str.parse().map_err(|_| S3Error::InvalidRange)?;
+        let end: u64 = end_str.parse().map_err(|_| S3Error::InvalidRange)?;
+        Ok((start, end))
     }
 }
 

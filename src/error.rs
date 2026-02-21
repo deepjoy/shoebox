@@ -51,6 +51,12 @@ pub enum S3Error {
     #[error("At least one of the pre-conditions you specified did not hold")]
     PreconditionFailed,
 
+    #[error("The Range header is invalid")]
+    InvalidRange,
+
+    #[error("The requested range is not satisfiable")]
+    RangeNotSatisfiable,
+
     #[error("We encountered an internal error, please try again")]
     InternalError,
 }
@@ -75,6 +81,8 @@ impl S3Error {
             Self::MissingSecurityHeader => "MissingSecurityHeader",
             Self::NoSuchCredential => "NoSuchCredential",
             Self::PreconditionFailed => "PreconditionFailed",
+            Self::InvalidRange => "InvalidRange",
+            Self::RangeNotSatisfiable => "InvalidRange",
             Self::InternalError => "InternalError",
         }
     }
@@ -96,11 +104,13 @@ impl S3Error {
             | Self::BadDigest
             | Self::ExpiredToken
             | Self::AuthorizationHeaderMalformed
-            | Self::MissingSecurityHeader => StatusCode::BAD_REQUEST,
+            | Self::MissingSecurityHeader
+            | Self::InvalidRange => StatusCode::BAD_REQUEST,
             Self::NoSuchCredential => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::BucketAlreadyExists | Self::BucketAlreadyOwnedByYou => StatusCode::CONFLICT,
             Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
+            Self::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

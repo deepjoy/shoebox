@@ -146,6 +146,31 @@ impl FilesystemStorage {
         }
     }
 
+    /// Open a raw `tokio::fs::File` handle for seekable access (e.g. range requests).
+    ///
+    /// Performs the same path-traversal and symlink safety checks as `get()`,
+    /// but always returns a `tokio::fs::File` (never symlink content).
+    /// Returns `NoSuchKey` for directories and symlinks.
+    pub async fn get_file_handle(&self, key: &str) -> Result<tokio::fs::File, S3Error> {
+        let path = self.resolve_path(key).await?;
+
+        let meta = tokio::fs::symlink_metadata(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                S3Error::NoSuchKey
+            } else {
+                S3Error::InternalError
+            }
+        })?;
+
+        if meta.is_dir() || meta.file_type().is_symlink() {
+            return Err(S3Error::NoSuchKey);
+        }
+
+        tokio::fs::File::open(&path)
+            .await
+            .map_err(|_| S3Error::InternalError)
+    }
+
     /// Stream request body to disk.
     ///
     /// Returns bytes written and hex-encoded MD5 digest so the caller can set

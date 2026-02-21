@@ -157,6 +157,37 @@ if echo "$RESULT" | grep -qi "PreconditionFailed\|Precondition\|412"; then
 fi
 sleep "$DELAY"
 
+# ── 6. Range requests ─────────────────────────────────────────────────────
+
+banner "Range Requests — Partial Content"
+
+step "Range: bytes=0-9 (first 10 bytes)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --range 'bytes=0-9' $DEMO_ROOT/range1.txt"
+CONTENT=$(cat "$DEMO_ROOT/range1.txt")
+note "Body: '$CONTENT'"
+ok "Range bytes=0-9 returns 206 Partial Content"
+
+step "Range: bytes=-5 (last 5 bytes — suffix range)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --range 'bytes=-5' $DEMO_ROOT/range2.txt"
+CONTENT=$(cat "$DEMO_ROOT/range2.txt")
+note "Body: '$CONTENT'"
+ok "Suffix range (bytes=-5) works"
+
+step "Range: bytes=10- (from offset to end)"
+run "aws s3api get-object --bucket photos --key animals/fox.txt --range 'bytes=10-' $DEMO_ROOT/range3.txt"
+CONTENT=$(cat "$DEMO_ROOT/range3.txt")
+note "Body: '$CONTENT'"
+ok "Offset-to-end range (bytes=10-) works"
+
+step "Range: bytes=99999- (beyond file size — should return 416)"
+RESULT=$(aws s3api get-object --bucket photos --key animals/fox.txt \
+  --range "bytes=99999-" "$DEMO_ROOT/range-invalid.txt" 2>&1 || true)
+note "$RESULT"
+if echo "$RESULT" | grep -qi "InvalidRange\|416\|range"; then
+  ok "Invalid range correctly returns 416 Range Not Satisfiable"
+fi
+sleep "$DELAY"
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 
 banner "Phase 4 Demo Complete"
@@ -164,5 +195,10 @@ note "All Phase 4 features demonstrated so far:"
 note "  - CopyObject within same bucket"
 note "  - CopyObject across buckets"
 note "  - CopyObject conditional headers (if-match)"
+note "  - Range: bytes=0-N (first N bytes)"
+note "  - Range: bytes=-N (last N bytes)"
+note "  - Range: bytes=N- (offset to end)"
+note "  - Range returns 206 Partial Content"
+note "  - Invalid range returns 416"
 
 sleep "${END_DELAY}"
