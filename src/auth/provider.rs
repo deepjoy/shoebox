@@ -416,4 +416,21 @@ mod tests {
         assert!(!cred.has_permission("GetObject", "photos"));
         assert!(!cred.has_permission("PutObject", "photos"));
     }
+
+    #[test]
+    fn write_allows_multipart_operations() {
+        let cred = make_cred(&["write"], None);
+        assert!(cred.has_permission("InitiateMultipartUpload", "photos"));
+        assert!(cred.has_permission("UploadPart", "photos"));
+        assert!(cred.has_permission("CompleteMultipartUpload", "photos"));
+        assert!(cred.has_permission("AbortMultipartUpload", "photos"));
+    }
+
+    #[test]
+    fn read_allows_multipart_list_operations() {
+        let cred = make_cred(&["read"], None);
+        assert!(cred.has_permission("ListParts", "photos"));
+        assert!(cred.has_permission("ListMultipartUploads", "photos"));
+        assert!(!cred.has_permission("InitiateMultipartUpload", "photos"));
+    }
 }

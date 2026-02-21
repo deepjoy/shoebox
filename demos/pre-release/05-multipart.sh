@@ -246,10 +246,98 @@ ok "File uploaded correctly"
 
 sleep "$DELAY"
 
-# ── Done ───────────────────────────────────────────────────────────────────
+# ── 7. Multipart Auth with Non-Admin Credentials ────────────────────────────
+
+banner "Multipart Auth — Write-Only Credential"
+
+step "Create a write-only credential via admin API"
+CREATE_BODY="<CreateCredentialRequest>
+  <BucketName>uploads</BucketName>
+  <Permissions>write</Permissions>
+  <Description>Write-only multipart test</Description>
+</CreateCredentialRequest>"
+CREATE_RESPONSE=$(signed_curl POST "/_shoebox/credentials" -d "$CREATE_BODY")
+WRITE_ACCESS_KEY=$(echo "$CREATE_RESPONSE" | grep -o '<AccessKeyId>[^<]*</AccessKeyId>' | sed 's/<[^>]*>//g')
+WRITE_SECRET_KEY=$(echo "$CREATE_RESPONSE" | grep -o '<SecretAccessKey>[^<]*</SecretAccessKey>' | sed 's/<[^>]*>//g')
+echo "  Write-only Access Key: $WRITE_ACCESS_KEY"
+ok "Write-only credential created"
+
+# Switch to write-only credentials
+SAVED_ACCESS_KEY="$AWS_ACCESS_KEY_ID"
+SAVED_SECRET_KEY="$AWS_SECRET_ACCESS_KEY"
+export AWS_ACCESS_KEY_ID="$WRITE_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$WRITE_SECRET_KEY"
+
+step "Multipart upload with write-only credential"
+WRITE_INITIATE=$(signed_curl POST "/uploads/write-test.txt?uploads" -H "content-type: text/plain")
+WRITE_UPLOAD_ID=$(echo "$WRITE_INITIATE" | grep -o '<UploadId>[^<]*</UploadId>' | sed 's/<[^>]*>//g')
+if [[ -z "$WRITE_UPLOAD_ID" ]]; then
+  echo "  FAIL: InitiateMultipartUpload denied for write-only credential"
+  exit 1
+fi
+echo "  Upload ID: $WRITE_UPLOAD_ID"
+ok "InitiateMultipartUpload succeeded with write-only credential"
+
+step "UploadPart with write-only credential"
+WRITE_ETAG=$(signed_curl PUT "/uploads/write-test.txt?partNumber=1&uploadId=$WRITE_UPLOAD_ID" \
+  -d "write-only part data" -D- | grep -i '^etag:' | cut -d' ' -f2 | tr -d '\r')
+if [[ -z "$WRITE_ETAG" ]]; then
+  echo "  FAIL: UploadPart denied for write-only credential"
+  exit 1
+fi
+echo "  ETag: $WRITE_ETAG"
+ok "UploadPart succeeded with write-only credential"
+
+step "CompleteMultipartUpload with write-only credential"
+WRITE_COMPLETE_BODY="<CompleteMultipartUpload>
+  <Part><PartNumber>1</PartNumber><ETag>$WRITE_ETAG</ETag></Part>
+</CompleteMultipartUpload>"
+WRITE_COMPLETE=$(signed_curl POST "/uploads/write-test.txt?uploadId=$WRITE_UPLOAD_ID" -d "$WRITE_COMPLETE_BODY")
+WRITE_FINAL_ETAG=$(echo "$WRITE_COMPLETE" | grep -o '<ETag>[^<]*</ETag>' | sed 's/<[^>]*>//g')
+if [[ -z "$WRITE_FINAL_ETAG" ]]; then
+  echo "  FAIL: CompleteMultipartUpload denied for write-only credential"
+  exit 1
+fi
+echo "  Final ETag: $WRITE_FINAL_ETAG"
+ok "CompleteMultipartUpload succeeded with write-only credential"
+
+step "Read-only credential: create and test multipart is denied"
+# Restore admin credentials to create a read-only credential
+export AWS_ACCESS_KEY_ID="$SAVED_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$SAVED_SECRET_KEY"
+
+READ_CREATE_BODY="<CreateCredentialRequest>
+  <BucketName>uploads</BucketName>
+  <Permissions>read</Permissions>
+  <Description>Read-only multipart test</Description>
+</CreateCredentialRequest>"
+READ_RESPONSE=$(signed_curl POST "/_shoebox/credentials" -d "$READ_CREATE_BODY")
+READ_ACCESS_KEY=$(echo "$READ_RESPONSE" | grep -o '<AccessKeyId>[^<]*</AccessKeyId>' | sed 's/<[^>]*>//g')
+READ_SECRET_KEY=$(echo "$READ_RESPONSE" | grep -o '<SecretAccessKey>[^<]*</SecretAccessKey>' | sed 's/<[^>]*>//g')
+
+# Switch to read-only credentials
+export AWS_ACCESS_KEY_ID="$READ_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$READ_SECRET_KEY"
+
+HTTP_CODE=$(signed_curl POST "/uploads/read-test.txt?uploads" -H "content-type: text/plain" -o /dev/null -w '%{http_code}')
+echo "  HTTP status: $HTTP_CODE"
+if [[ "$HTTP_CODE" == "403" ]]; then
+  ok "InitiateMultipartUpload correctly denied for read-only credential"
+else
+  echo "  FAIL: expected 403, got $HTTP_CODE"
+  exit 1
+fi
+
+# Restore admin credentials for remaining operations
+export AWS_ACCESS_KEY_ID="$SAVED_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$SAVED_SECRET_KEY"
+
+sleep "$DELAY"
+
+# ── 8. Done ───────────────────────────────────────────────────────────────────
 
 banner "Phase 5 Demo Complete"
-note "All Phase 5 features demonstrated so far:"
+note "All Phase 5 features demonstrated successfully:"
 note "  - InitiateMultipartUpload creates upload ID"
 note "  - UploadPart uploads individual parts with ETags"
 note "  - ListParts shows uploaded parts"
@@ -262,5 +350,7 @@ note "  - ListMultipartUploads shows in-progress uploads"
 note "  - AbortMultipartUpload cleans up parts"
 note "  - Upload removed from list after abort"
 note "  - AWS CLI automatic multipart (20 MB file)"
+note "  - Write-only credential can perform multipart uploads"
+note "  - Read-only credential denied multipart initiation"
 
 sleep "${END_DELAY}"
