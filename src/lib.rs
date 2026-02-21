@@ -33,6 +33,7 @@ struct BucketRuntime {
     config: BucketConfig,
     storage: FilesystemStorage,
     metadata: MetadataStore,
+    parts_dir: std::path::PathBuf,
 }
 
 /// Main Shoebox builder and runtime.
@@ -204,6 +205,7 @@ impl Shoebox {
                                 config: b.config.clone(),
                                 storage: b.storage.clone(),
                                 metadata: b.metadata.clone(),
+                                parts_dir: b.parts_dir.clone(),
                             },
                         )
                     })
@@ -310,6 +312,8 @@ impl ShoeboxBuilder {
             let db_path = state.shoebox_dir.join(METADATA_DB);
             let metadata = MetadataStore::new(&db_path).await?;
             let storage = FilesystemStorage::new(state.root.clone());
+            let parts_dir = state.shoebox_dir.join("parts");
+            tokio::fs::create_dir_all(&parts_dir).await?;
             buckets.insert(
                 state.name.clone(),
                 BucketRuntime {
@@ -317,6 +321,7 @@ impl ShoeboxBuilder {
                     config: state.config,
                     storage,
                     metadata,
+                    parts_dir,
                 },
             );
         }

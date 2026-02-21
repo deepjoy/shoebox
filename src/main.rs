@@ -208,6 +208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let db_path = bucket.shoebox_dir.join(METADATA_DB);
         let metadata = MetadataStore::new(&db_path).await?;
         let storage = FilesystemStorage::new(bucket.root.clone());
+        let parts_dir = bucket.shoebox_dir.join("parts");
+        tokio::fs::create_dir_all(&parts_dir).await?;
 
         loaded_buckets.insert(
             bucket.name.clone(),
@@ -216,6 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config: bucket.config.clone(),
                 storage,
                 metadata,
+                parts_dir,
             },
         );
 

@@ -477,6 +477,228 @@ impl MetadataStore {
 
         Ok(())
     }
+
+    // -------------------------------------------------------------------------
+    // Multipart Upload Methods (Phase 5)
+    // -------------------------------------------------------------------------
+
+    /// Insert a new multipart upload record.
+    pub async fn insert_multipart_upload(
+        &self,
+        upload: &crate::types::multipart::MultipartUpload,
+    ) -> Result<(), S3Error> {
+        sqlx::query(
+            "INSERT INTO multipart_uploads (id, key, initiated_at, content_type, metadata) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&upload.id)
+        .bind(&upload.key)
+        .bind(&upload.initiated_at)
+        .bind(&upload.content_type)
+        .bind(&upload.metadata)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get a multipart upload by ID.
+    pub async fn get_multipart_upload(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<crate::types::multipart::MultipartUpload>, S3Error> {
+        let upload = sqlx::query_as::<_, crate::types::multipart::MultipartUpload>(
+            "SELECT id, key, initiated_at, content_type, metadata FROM multipart_uploads WHERE id = ?",
+        )
+        .bind(upload_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(upload)
+    }
+
+    /// Delete a multipart upload (cascades to parts).
+    pub async fn delete_multipart_upload(&self, upload_id: &str) -> Result<(), S3Error> {
+        sqlx::query("DELETE FROM multipart_uploads WHERE id = ?")
+            .bind(upload_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Insert or update a part record.
+    pub async fn upsert_part(&self, part: &crate::types::multipart::Part) -> Result<(), S3Error> {
+        sqlx::query(
+            "INSERT INTO parts (id, upload_id, part_number, size, etag, uploaded_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(upload_id, part_number) DO UPDATE SET \
+                size = excluded.size, \
+                etag = excluded.etag, \
+                uploaded_at = excluded.uploaded_at",
+        )
+        .bind(&part.id)
+        .bind(&part.upload_id)
+        .bind(part.part_number)
+        .bind(part.size)
+        .bind(&part.etag)
+        .bind(&part.uploaded_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// List all parts for a multipart upload.
+    pub async fn list_parts(
+        &self,
+        upload_id: &str,
+    ) -> Result<Vec<crate::types::multipart::Part>, S3Error> {
+        let parts = sqlx::query_as::<_, crate::types::multipart::Part>(
+            "SELECT id, upload_id, part_number, size, etag, uploaded_at FROM parts \
+             WHERE upload_id = ? ORDER BY part_number",
+        )
+        .bind(upload_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(parts)
+    }
+
+    /// List parts with pagination.
+    pub async fn list_parts_paginated(
+        &self,
+        upload_id: &str,
+        max_parts: i32,
+        part_number_marker: Option<i32>,
+    ) -> Result<Vec<crate::types::multipart::Part>, S3Error> {
+        let parts = if let Some(marker) = part_number_marker {
+            sqlx::query_as::<_, crate::types::multipart::Part>(
+                "SELECT id, upload_id, part_number, size, etag, uploaded_at FROM parts \
+                 WHERE upload_id = ? AND part_number > ? ORDER BY part_number LIMIT ?",
+            )
+            .bind(upload_id)
+            .bind(marker)
+            .bind(max_parts)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, crate::types::multipart::Part>(
+                "SELECT id, upload_id, part_number, size, etag, uploaded_at FROM parts \
+                 WHERE upload_id = ? ORDER BY part_number LIMIT ?",
+            )
+            .bind(upload_id)
+            .bind(max_parts)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(parts)
+    }
+
+    /// List all multipart uploads, optionally filtered by prefix.
+    pub async fn list_multipart_uploads(
+        &self,
+        prefix: Option<&str>,
+        max_uploads: i32,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+    ) -> Result<Vec<crate::types::multipart::MultipartUpload>, S3Error> {
+        let uploads = match (prefix, key_marker, upload_id_marker) {
+            (Some(pfx), Some(km), Some(um)) => {
+                let pattern = format!("{}%", pfx.replace('%', "\\%").replace('_', "\\_"));
+                sqlx::query_as::<_, crate::types::multipart::MultipartUpload>(
+                    "SELECT id, key, initiated_at, content_type, metadata FROM multipart_uploads \
+                     WHERE key LIKE ? ESCAPE '\\' AND (key > ? OR (key = ? AND id > ?)) \
+                     ORDER BY key, id LIMIT ?",
+                )
+                .bind(&pattern)
+                .bind(km)
+                .bind(km)
+                .bind(um)
+                .bind(max_uploads)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(pfx), Some(km), None) => {
+                let pattern = format!("{}%", pfx.replace('%', "\\%").replace('_', "\\_"));
+                sqlx::query_as::<_, crate::types::multipart::MultipartUpload>(
+                    "SELECT id, key, initiated_at, content_type, metadata FROM multipart_uploads \
+                     WHERE key LIKE ? ESCAPE '\\' AND key > ? \
+                     ORDER BY key, id LIMIT ?",
+                )
+                .bind(&pattern)
+                .bind(km)
+                .bind(max_uploads)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(pfx), None, None) => {
+                let pattern = format!("{}%", pfx.replace('%', "\\%").replace('_', "\\_"));
+                sqlx::query_as::<_, crate::types::multipart::MultipartUpload>(
+                    "SELECT id, key, initiated_at, content_type, metadata FROM multipart_uploads \
+                     WHERE key LIKE ? ESCAPE '\\' \
+                     ORDER BY key, id LIMIT ?",
+                )
+                .bind(&pattern)
+                .bind(max_uploads)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(km), Some(um)) => {
+                sqlx::query_as::<_, crate::types::multipart::MultipartUpload>(
+                    "SELECT id, key, initiated_at, content_type, metadata FROM multipart_uploads \
+                     WHERE (key > ? OR (key = ? AND id > ?)) \
+                     ORDER BY key, id LIMIT ?",
+                )
+                .bind(km)
+                .bind(km)
+                .bind(um)
+                .bind(max_uploads)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(km), None) => {
+                sqlx::query_as::<_, crate::types::multipart::MultipartUpload>(
+                    "SELECT id, key, initiated_at, content_type, metadata FROM multipart_uploads \
+                     WHERE key > ? \
+                     ORDER BY key, id LIMIT ?",
+                )
+                .bind(km)
+                .bind(max_uploads)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None, None) => {
+                sqlx::query_as::<_, crate::types::multipart::MultipartUpload>(
+                    "SELECT id, key, initiated_at, content_type, metadata FROM multipart_uploads \
+                     ORDER BY key, id LIMIT ?",
+                )
+                .bind(max_uploads)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            _ => Vec::new(), // Invalid marker combination
+        };
+
+        Ok(uploads)
+    }
+
+    /// Find abandoned multipart uploads older than cutoff time.
+    pub async fn find_abandoned_uploads(
+        &self,
+        cutoff: &str,
+    ) -> Result<Vec<crate::types::multipart::MultipartUpload>, S3Error> {
+        let uploads = sqlx::query_as::<_, crate::types::multipart::MultipartUpload>(
+            "SELECT id, key, initiated_at, content_type, metadata FROM multipart_uploads \
+             WHERE initiated_at < ?",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(uploads)
+    }
 }
 
 /// Object tag key-value pair.
