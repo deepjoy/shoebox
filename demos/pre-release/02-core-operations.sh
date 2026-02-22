@@ -37,16 +37,10 @@ if [[ ! -x "$SHOEBOX" ]]; then
   exit 1
 fi
 
-# AWS CLI configuration — auth is not enforced yet (TODO(#9)),
-# but the CLI requires credentials to be set.
-export AWS_ACCESS_KEY_ID=test
-export AWS_SECRET_ACCESS_KEY=test
 export AWS_DEFAULT_REGION=us-east-1
 
-AWS="aws --endpoint-url $ENDPOINT"
-
-# Start shoebox in the background
-SHOEBOX_LOG=off "$SHOEBOX" --host 127.0.0.1 --port "$PORT" "$BUCKET_DIR" &
+# Start shoebox in the background (credentials are auto-generated)
+SHOEBOX_LOG=off "$SHOEBOX" --host 127.0.0.1 --port "$PORT" --show-secrets "$BUCKET_DIR" > "$DEMO_ROOT/startup.txt" 2>&1 &
 SERVER_PID=$!
 
 # Wait for server to be ready
@@ -56,6 +50,13 @@ for i in $(seq 1 30); do
   fi
   sleep 0.1
 done
+
+# Extract real credentials from the generated config
+export AWS_ACCESS_KEY_ID=$(grep access_key_id "$BUCKET_DIR/.shoebox/config.toml" | head -1 | cut -d'"' -f2)
+export AWS_SECRET_ACCESS_KEY=$(grep secret_access_key "$BUCKET_DIR/.shoebox/config.toml" | head -1 | cut -d'"' -f2)
+export AWS_ENDPOINT_URL="$ENDPOINT"
+
+AWS="aws --endpoint-url $ENDPOINT"
 
 # ============================================================================
 # Part 1 — Upload objects (aws s3 cp)
