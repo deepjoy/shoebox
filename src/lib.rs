@@ -4,6 +4,7 @@ pub mod config;
 pub mod error;
 pub mod handlers;
 pub mod metadata;
+pub mod scanner;
 pub mod services;
 pub mod storage;
 pub mod types;
