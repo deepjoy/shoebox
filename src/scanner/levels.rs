@@ -5,8 +5,9 @@ use futures::StreamExt;
 
 use crate::config::SHOEBOX_DIR;
 use crate::error::S3Error;
-use crate::metadata::sqlite::ObjectRecord;
+use crate::metadata::sqlite::{ObjectMetadataUpdate, ObjectRecord};
 use crate::metadata::MetadataStore;
+use crate::scanner::platform;
 use crate::scanner::scope::ScanScope;
 
 /// Maximum number of rows per batch transaction.
@@ -20,6 +21,13 @@ pub struct L1Report {
     pub discovered: u64,
     pub deleted: u64,
     pub unchanged: u64,
+}
+
+/// Result of an L2 (metadata) scan.
+#[derive(Debug, Default)]
+pub struct L2Report {
+    pub updated: u64,
+    pub errors: u64,
 }
 
 /// Check whether a path component represents the .shoebox directory.
@@ -203,6 +211,78 @@ pub async fn scan_l1(
     Ok(report)
 }
 
+/// L2: stat() each file for metadata (size, mtime, ctime, inode, device_id).
+pub async fn scan_l2(
+    metadata: &MetadataStore,
+    root: &Path,
+    keys: &[String],
+) -> Result<L2Report, S3Error> {
+    let mut report = L2Report::default();
+    let total = keys.len();
+
+    tracing::info!(files = total, "L2 metadata scan starting");
+
+    let mut batch: Vec<(String, ObjectMetadataUpdate)> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch_start = std::time::Instant::now();
+
+    for (i, key) in keys.iter().enumerate() {
+        let path = root.join(key);
+        let fs_meta = match tokio::fs::symlink_metadata(&path).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("L2 scan: cannot stat {key}: {e}");
+                report.errors += 1;
+                continue;
+            }
+        };
+
+        let (inode, device_id) = platform::file_identity(&fs_meta);
+
+        let size = fs_meta.len() as i64;
+        let file_mtime = fs_meta.modified().ok().map(time::OffsetDateTime::from);
+        let file_ctime = fs_meta.created().ok().map(time::OffsetDateTime::from);
+
+        let update = ObjectMetadataUpdate {
+            size,
+            file_mtime,
+            file_ctime,
+            inode,
+            device_id,
+            scan_level: 2,
+        };
+        batch.push((key.clone(), update));
+        report.updated += 1;
+
+        tracing::info!(
+            key = %key,
+            size = size,
+            progress = format_args!("[{}/{}]", i + 1, total),
+            "L2 stat complete"
+        );
+
+        if batch.len() >= BATCH_SIZE
+            || (!batch.is_empty() && batch_start.elapsed() >= BATCH_TIMEOUT)
+        {
+            metadata.update_objects_metadata_batch(&batch).await?;
+            batch.clear();
+            batch_start = std::time::Instant::now();
+        }
+    }
+
+    // Flush remaining batch
+    if !batch.is_empty() {
+        metadata.update_objects_metadata_batch(&batch).await?;
+    }
+
+    tracing::info!(
+        updated = report.updated,
+        errors = report.errors,
+        "L2 metadata scan complete"
+    );
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +390,28 @@ mod tests {
             .unwrap();
         assert_eq!(r2.discovered, 0);
         assert_eq!(r2.unchanged, 1);
+    }
+
+    #[tokio::test]
+    async fn test_l2_collects_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket_root).unwrap();
+        std::fs::write(bucket_root.join("file.txt"), "hello world").unwrap();
+
+        let store = make_store(&tmp).await;
+        scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+
+        let report = scan_l2(&store, &bucket_root, &["file.txt".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(report.updated, 1);
+
+        let obj = store.get_object("file.txt").await.unwrap().unwrap();
+        assert_eq!(obj.scan_level, 2);
+        assert_eq!(obj.size, Some(11)); // "hello world" = 11 bytes
+        assert!(obj.file_mtime.is_some());
     }
 }
