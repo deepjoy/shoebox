@@ -28,6 +28,9 @@ pub struct ObjectRecord {
     // L2 metadata (None until scanned)
     pub size: Option<i64>,
     pub file_mtime: Option<time::OffsetDateTime>,
+    pub file_ctime: Option<time::OffsetDateTime>,
+    pub inode: Option<i64>,
+    pub device_id: Option<i64>,
 
     // L3 metadata (None until content-hashed)
     pub etag: Option<String>,
@@ -53,6 +56,9 @@ impl Default for ObjectRecord {
             symlink_target: None,
             size: None,
             file_mtime: None,
+            file_ctime: None,
+            inode: None,
+            device_id: None,
             etag: None,
             content_hash: None,
             content_type: None,
@@ -76,7 +82,11 @@ impl MetadataStore {
         let options = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .pragma("synchronous", "normal")
+            .pragma("cache_size", "-64000")
+            .pragma("journal_size_limit", "67108864")
+            .pragma("temp_store", "memory");
 
         // TODO(#4): Make max_connections configurable (per-bucket or global).
         // https://github.com/deepjoy/shoebox/issues/4
@@ -120,9 +130,10 @@ impl MetadataStore {
         sqlx::query(
             r#"INSERT INTO objects (
                 id, key, parent_directory, is_directory, is_symlink, symlink_target,
-                size, file_mtime, etag, content_hash,
+                size, file_mtime, file_ctime, inode, device_id,
+                etag, content_hash,
                 content_type, last_modified, created_at, metadata, scan_level
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&obj.id)
         .bind(&obj.key)
@@ -132,6 +143,9 @@ impl MetadataStore {
         .bind(&obj.symlink_target)
         .bind(obj.size)
         .bind(obj.file_mtime)
+        .bind(obj.file_ctime)
+        .bind(obj.inode)
+        .bind(obj.device_id)
         .bind(&obj.etag)
         .bind(&obj.content_hash)
         .bind(&obj.content_type)
@@ -145,6 +159,46 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Insert multiple object records in a single transaction.
+    pub async fn insert_objects_batch(&self, objects: &[ObjectRecord]) -> Result<(), S3Error> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for obj in objects {
+            sqlx::query(
+                r#"INSERT INTO objects (
+                    id, key, parent_directory, is_directory, is_symlink, symlink_target,
+                    size, file_mtime, file_ctime, inode, device_id,
+                    etag, content_hash,
+                    content_type, last_modified, created_at, metadata, scan_level
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&obj.id)
+            .bind(&obj.key)
+            .bind(&obj.parent_directory)
+            .bind(obj.is_directory)
+            .bind(obj.is_symlink)
+            .bind(&obj.symlink_target)
+            .bind(obj.size)
+            .bind(obj.file_mtime)
+            .bind(obj.file_ctime)
+            .bind(obj.inode)
+            .bind(obj.device_id)
+            .bind(&obj.etag)
+            .bind(&obj.content_hash)
+            .bind(&obj.content_type)
+            .bind(obj.last_modified)
+            .bind(obj.created_at)
+            .bind(&obj.metadata)
+            .bind(obj.scan_level)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Insert or update an object record, keyed by `key`.
     ///
     /// On conflict the existing row's `id` and `created_at` are preserved
@@ -154,9 +208,10 @@ impl MetadataStore {
         sqlx::query(
             r#"INSERT INTO objects (
                 id, key, parent_directory, is_directory, is_symlink, symlink_target,
-                size, file_mtime, etag, content_hash,
+                size, file_mtime, file_ctime, inode, device_id,
+                etag, content_hash,
                 content_type, last_modified, created_at, metadata, scan_level
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET
                 parent_directory = excluded.parent_directory,
                 is_directory = excluded.is_directory,
@@ -164,6 +219,9 @@ impl MetadataStore {
                 symlink_target = excluded.symlink_target,
                 size = excluded.size,
                 file_mtime = excluded.file_mtime,
+                file_ctime = excluded.file_ctime,
+                inode = excluded.inode,
+                device_id = excluded.device_id,
                 etag = excluded.etag,
                 content_hash = excluded.content_hash,
                 content_type = excluded.content_type,
@@ -179,6 +237,9 @@ impl MetadataStore {
         .bind(&obj.symlink_target)
         .bind(obj.size)
         .bind(obj.file_mtime)
+        .bind(obj.file_ctime)
+        .bind(obj.inode)
+        .bind(obj.device_id)
         .bind(&obj.etag)
         .bind(&obj.content_hash)
         .bind(&obj.content_type)
@@ -479,6 +540,47 @@ impl MetadataStore {
     }
 
     // -------------------------------------------------------------------------
+    // Scanner Methods (Phase 6)
+    // -------------------------------------------------------------------------
+
+    /// List object keys with scan_level below the given threshold.
+    pub async fn list_keys_below_scan_level(
+        &self,
+        level: i32,
+        limit: i64,
+    ) -> Result<Vec<String>, S3Error> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT key FROM objects WHERE scan_level < ? ORDER BY key LIMIT ?")
+                .bind(level)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?;
+
+        Ok(rows.into_iter().map(|(k,)| k).collect())
+    }
+
+    /// Get all object keys in the store.
+    pub async fn get_all_keys(&self) -> Result<Vec<String>, S3Error> {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT key FROM objects ORDER BY key")
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows.into_iter().map(|(k,)| k).collect())
+    }
+
+    /// Reset an object's scan level (e.g. after a file is modified on disk).
+    pub async fn reset_scan_level(&self, key: &str, level: i32) -> Result<(), S3Error> {
+        sqlx::query("UPDATE objects SET scan_level = ? WHERE key = ? AND scan_level > ?")
+            .bind(level)
+            .bind(key)
+            .bind(level)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
     // Multipart Upload Methods (Phase 5)
     // -------------------------------------------------------------------------
 
@@ -730,18 +832,13 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             key: key.to_string(),
             parent_directory: parent,
-            is_directory: false,
-            is_symlink: false,
-            symlink_target: None,
             size: Some(1024),
             file_mtime: Some(now),
-            etag: None,
-            content_hash: None,
             content_type: Some("application/octet-stream".to_string()),
             last_modified: now,
             created_at: now,
-            metadata: None,
             scan_level: 1,
+            ..Default::default()
         }
     }
 
@@ -900,19 +997,13 @@ mod tests {
         let obj = ObjectRecord {
             id: uuid::Uuid::new_v4().to_string(),
             key: "my-link".to_string(),
-            parent_directory: String::new(),
-            is_directory: false,
             is_symlink: true,
             symlink_target: Some("/some/target".to_string()),
-            size: None,
-            file_mtime: None,
-            etag: None,
-            content_hash: None,
             content_type: Some("application/x-symlink".to_string()),
             last_modified: now,
             created_at: now,
-            metadata: None,
             scan_level: 1,
+            ..Default::default()
         };
 
         store.insert_object(&obj).await.unwrap();

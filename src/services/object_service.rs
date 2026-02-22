@@ -67,9 +67,6 @@ pub async fn put_object(
             .rsplit_once('/')
             .map(|(p, _)| p.to_string())
             .unwrap_or_default(),
-        is_directory: false,
-        is_symlink: false,
-        symlink_target: None,
         size: Some(result.bytes_written as i64),
         file_mtime: Some(now),
         etag: Some(etag.clone()),
@@ -83,6 +80,7 @@ pub async fn put_object(
             Some(serde_json::to_string(&input.user_metadata).unwrap())
         },
         scan_level: 3,
+        ..Default::default()
     };
 
     metadata.upsert_object(&obj).await?;
