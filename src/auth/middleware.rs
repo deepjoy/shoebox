@@ -118,16 +118,18 @@ fn check_permission(
         return Ok(());
     }
 
+    // ListBuckets has no bucket context — any authenticated credential may list
+    // bucket names, matching AWS behaviour.
+    if operation == "ListBuckets" {
+        return Ok(());
+    }
+
     let bucket = extract_bucket_from_path(request.uri().path());
 
     if let Some(bucket_name) = bucket {
         if !credential.has_permission(&operation, &bucket_name) {
             return Err(S3Error::AccessDenied);
         }
-    }
-    // For operations without a bucket context (ListBuckets), check with empty bucket
-    else if !credential.has_permission(&operation, "") {
-        return Err(S3Error::AccessDenied);
     }
 
     Ok(())
