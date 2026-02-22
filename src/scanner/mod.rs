@@ -1,4 +1,5 @@
 pub mod backpressure;
+pub mod checkpoint;
 pub mod levels;
 pub mod platform;
 pub mod scheduler;
