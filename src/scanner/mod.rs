@@ -1,1 +1,4 @@
-// Phase 6: Filesystem scanner (progressive scan levels)
+pub mod platform;
+pub mod scope;
+
+pub use scope::ScanScope;
