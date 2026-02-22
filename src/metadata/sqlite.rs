@@ -580,6 +580,128 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Update L2 metadata for an object (size, timestamps, file identity).
+    pub async fn update_object_metadata(
+        &self,
+        key: &str,
+        update: &ObjectMetadataUpdate,
+    ) -> Result<(), S3Error> {
+        let result = sqlx::query(
+            "UPDATE objects SET size = ?, file_mtime = ?, file_ctime = ?, \
+             inode = ?, device_id = ?, scan_level = ?, last_modified = ? \
+             WHERE key = ? AND scan_level < ?",
+        )
+        .bind(update.size)
+        .bind(update.file_mtime)
+        .bind(update.file_ctime)
+        .bind(update.inode.map(|v| v as i64))
+        .bind(update.device_id.map(|v| v as i64))
+        .bind(update.scan_level)
+        .bind(time::OffsetDateTime::now_utc())
+        .bind(key)
+        .bind(update.scan_level)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            tracing::trace!(
+                key,
+                "L2 update skipped (already at target level or missing)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Update L2 metadata for multiple objects in a single transaction.
+    pub async fn update_objects_metadata_batch(
+        &self,
+        updates: &[(String, ObjectMetadataUpdate)],
+    ) -> Result<(), S3Error> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        let now = time::OffsetDateTime::now_utc();
+        for (key, update) in updates {
+            sqlx::query(
+                "UPDATE objects SET size = ?, file_mtime = ?, file_ctime = ?, \
+                 inode = ?, device_id = ?, scan_level = ?, last_modified = ? \
+                 WHERE key = ? AND scan_level < ?",
+            )
+            .bind(update.size)
+            .bind(update.file_mtime)
+            .bind(update.file_ctime)
+            .bind(update.inode.map(|v| v as i64))
+            .bind(update.device_id.map(|v| v as i64))
+            .bind(update.scan_level)
+            .bind(now)
+            .bind(key.as_str())
+            .bind(update.scan_level)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Update L3 content hashes for an object.
+    pub async fn update_object_hashes(
+        &self,
+        key: &str,
+        etag: &str,
+        content_hash: &str,
+        scan_level: i32,
+    ) -> Result<(), S3Error> {
+        let result = sqlx::query(
+            "UPDATE objects SET etag = ?, content_hash = ?, scan_level = ?, last_modified = ? \
+             WHERE key = ? AND scan_level < ?",
+        )
+        .bind(etag)
+        .bind(content_hash)
+        .bind(scan_level)
+        .bind(time::OffsetDateTime::now_utc())
+        .bind(key)
+        .bind(scan_level)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            tracing::trace!(
+                key,
+                "L3 update skipped (already at target level or missing)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Update L3 content hashes for multiple objects in a single transaction.
+    pub async fn update_objects_hashes_batch(
+        &self,
+        updates: &[(String, String, String, i32)],
+    ) -> Result<(), S3Error> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        let now = time::OffsetDateTime::now_utc();
+        for (key, etag, content_hash, scan_level) in updates {
+            sqlx::query(
+                "UPDATE objects SET etag = ?, content_hash = ?, scan_level = ?, last_modified = ? \
+                 WHERE key = ? AND scan_level < ?",
+            )
+            .bind(etag)
+            .bind(content_hash)
+            .bind(scan_level)
+            .bind(now)
+            .bind(key.as_str())
+            .bind(scan_level)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     // -------------------------------------------------------------------------
     // Multipart Upload Methods (Phase 5)
     // -------------------------------------------------------------------------
@@ -801,6 +923,16 @@ impl MetadataStore {
 
         Ok(uploads)
     }
+}
+
+/// L2 metadata update payload (used by scanner).
+pub struct ObjectMetadataUpdate {
+    pub size: i64,
+    pub file_mtime: Option<time::OffsetDateTime>,
+    pub file_ctime: Option<time::OffsetDateTime>,
+    pub inode: Option<u64>,
+    pub device_id: Option<u64>,
+    pub scan_level: i32,
 }
 
 /// Object tag key-value pair.

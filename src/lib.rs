@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::routes::create_router;
@@ -23,8 +24,12 @@ use crate::config::{resolve_bucket, BucketConfig, METADATA_DB};
 use crate::error::S3Error;
 use crate::metadata::sqlite::{ObjectRecord, Tag};
 use crate::metadata::MetadataStore;
+use crate::scanner::backpressure::ScannerResources;
 use crate::scanner::levels;
+use crate::scanner::scheduler::{Priority, ScanJob, ScanLevel, ScanScheduler};
 use crate::scanner::scope::ScanScope;
+use crate::scanner::watcher::FilesystemWatcher;
+use crate::scanner::worker;
 use crate::services::copy_service::{self, CopyConditions, CopyResult};
 use crate::services::object_service::{self, GetObjectResult, PutObjectInput, PutObjectResult};
 use crate::services::{tagging_service, AppState, LoadedBucket};
@@ -37,6 +42,10 @@ struct BucketRuntime {
     storage: FilesystemStorage,
     metadata: MetadataStore,
     parts_dir: std::path::PathBuf,
+    // Scanner state (Phase 6)
+    #[allow(dead_code)]
+    watcher: Option<FilesystemWatcher>,
+    scheduler: Arc<Mutex<ScanScheduler>>,
 }
 
 /// Main Shoebox builder and runtime.
@@ -264,6 +273,15 @@ impl Shoebox {
 
     // -- Scanner methods (Phase 6) --
 
+    /// Trigger a scan at the given level for a bucket.
+    pub async fn scan(&self, bucket: &str, level: ScanLevel) -> Result<(), S3Error> {
+        let b = self.get_bucket(bucket)?;
+        let job = ScanJob::new(Priority::Reconcile, ScanScope::Bucket, level);
+        let mut sched = b.scheduler.lock().await;
+        sched.schedule(job);
+        Ok(())
+    }
+
     /// Run a blocking L1 scan and return the report.
     pub async fn scan_l1(&self, bucket: &str) -> Result<scanner::L1Report, S3Error> {
         let b = self.get_bucket(bucket)?;
@@ -388,7 +406,10 @@ impl ShoeboxBuilder {
     }
 
     pub async fn build(self) -> Result<Shoebox, Box<dyn std::error::Error>> {
+        let shutdown_token = CancellationToken::new();
+        let resources = Arc::new(ScannerResources::new(100));
         let mut buckets = HashMap::new();
+
         for path in &self.paths {
             let state = resolve_bucket(path, self.data_dir.as_deref()).await?;
             let db_path = state.shoebox_dir.join(METADATA_DB);
@@ -409,6 +430,54 @@ impl ShoeboxBuilder {
                 );
             }
 
+            let scheduler = Arc::new(Mutex::new(ScanScheduler::new()));
+
+            // Schedule background L2+L3 scan
+            {
+                let mut sched = scheduler.lock().await;
+                sched.schedule(ScanJob::new(
+                    Priority::Reconcile,
+                    ScanScope::Bucket,
+                    ScanLevel::Content,
+                ));
+            }
+
+            // Start filesystem watcher
+            let watcher = {
+                let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(1000);
+                match FilesystemWatcher::new(state.root.clone(), watch_tx) {
+                    Ok(w) => {
+                        tracing::debug!(bucket = %state.name, "Filesystem watcher started");
+                        // Spawn watch processor
+                        tokio::spawn(worker::run_watch_processor(
+                            metadata.clone(),
+                            state.root.clone(),
+                            watch_rx,
+                            scheduler.clone(),
+                            shutdown_token.clone(),
+                        ));
+                        Some(w)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            bucket = %state.name,
+                            error = %e,
+                            "Failed to start filesystem watcher"
+                        );
+                        None
+                    }
+                }
+            };
+
+            // Spawn scan worker for this bucket
+            tokio::spawn(worker::run_scan_workers(
+                metadata.clone(),
+                state.root.clone(),
+                scheduler.clone(),
+                resources.clone(),
+                shutdown_token.clone(),
+            ));
+
             buckets.insert(
                 state.name.clone(),
                 BucketRuntime {
@@ -417,6 +486,8 @@ impl ShoeboxBuilder {
                     storage,
                     metadata,
                     parts_dir,
+                    watcher,
+                    scheduler,
                 },
             );
         }
@@ -434,7 +505,7 @@ impl ShoeboxBuilder {
             credential_provider,
             host: self.host,
             port: self.port,
-            shutdown_token: CancellationToken::new(),
+            shutdown_token,
         })
     }
 }
