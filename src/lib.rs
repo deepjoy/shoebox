@@ -28,6 +28,7 @@ use crate::scanner::backpressure::ScannerResources;
 use crate::scanner::levels;
 use crate::scanner::scheduler::{Priority, ScanJob, ScanLevel, ScanScheduler};
 use crate::scanner::scope::ScanScope;
+use crate::scanner::watcher::FilesystemWatcher;
 use crate::scanner::worker;
 use crate::services::copy_service::{self, CopyConditions, CopyResult};
 use crate::services::object_service::{self, GetObjectResult, PutObjectInput, PutObjectResult};
@@ -42,6 +43,8 @@ struct BucketRuntime {
     metadata: MetadataStore,
     parts_dir: std::path::PathBuf,
     // Scanner state (Phase 6)
+    #[allow(dead_code)]
+    watcher: Option<FilesystemWatcher>,
     scheduler: Arc<Mutex<ScanScheduler>>,
 }
 
@@ -439,6 +442,33 @@ impl ShoeboxBuilder {
                 ));
             }
 
+            // Start filesystem watcher
+            let watcher = {
+                let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(1000);
+                match FilesystemWatcher::new(state.root.clone(), watch_tx) {
+                    Ok(w) => {
+                        tracing::debug!(bucket = %state.name, "Filesystem watcher started");
+                        // Spawn watch processor
+                        tokio::spawn(worker::run_watch_processor(
+                            metadata.clone(),
+                            state.root.clone(),
+                            watch_rx,
+                            scheduler.clone(),
+                            shutdown_token.clone(),
+                        ));
+                        Some(w)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            bucket = %state.name,
+                            error = %e,
+                            "Failed to start filesystem watcher"
+                        );
+                        None
+                    }
+                }
+            };
+
             // Spawn scan worker for this bucket
             tokio::spawn(worker::run_scan_workers(
                 metadata.clone(),
@@ -456,6 +486,7 @@ impl ShoeboxBuilder {
                     storage,
                     metadata,
                     parts_dir,
+                    watcher,
                     scheduler,
                 },
             );

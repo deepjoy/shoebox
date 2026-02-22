@@ -12,7 +12,10 @@ use shoebox::config::{
     ServerConfig, METADATA_DB,
 };
 use shoebox::metadata::MetadataStore;
-use shoebox::scanner::{self, worker, Priority, ScanJob, ScanLevel, ScanScheduler, ScanScope};
+use shoebox::scanner::{
+    self, watcher::FilesystemWatcher, worker, Priority, ScanJob, ScanLevel, ScanScheduler,
+    ScanScope,
+};
 use shoebox::services::{AppState, LoadedBucket};
 use shoebox::storage::FilesystemStorage;
 use tokio::sync::Mutex;
@@ -226,6 +229,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ScanScope::Bucket,
                 ScanLevel::Content,
             ));
+        }
+
+        // Start filesystem watcher
+        {
+            let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(1000);
+            match FilesystemWatcher::new(bucket.root.clone(), watch_tx) {
+                Ok(_watcher) => {
+                    tracing::debug!(bucket = %bucket.name, "Filesystem watcher started");
+                    tokio::spawn(worker::run_watch_processor(
+                        metadata.clone(),
+                        bucket.root.clone(),
+                        watch_rx,
+                        scheduler.clone(),
+                        shutdown_token.clone(),
+                    ));
+                    // Keep _watcher alive by leaking it (owned by the server process)
+                    std::mem::forget(_watcher);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        bucket = %bucket.name,
+                        error = %e,
+                        "Failed to start filesystem watcher"
+                    );
+                }
+            }
         }
 
         // Spawn scan worker for this bucket
