@@ -12,8 +12,10 @@ use shoebox::config::{
     ServerConfig, METADATA_DB,
 };
 use shoebox::metadata::MetadataStore;
+use shoebox::scanner::{self, worker, Priority, ScanJob, ScanLevel, ScanScheduler, ScanScope};
 use shoebox::services::{AppState, LoadedBucket};
 use shoebox::storage::FilesystemStorage;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 /// Top-level CLI -- subcommands OR serve mode, never both.
@@ -203,6 +205,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let buckets = resolve_all_buckets(&config).await?;
 
+    let shutdown_token = CancellationToken::new();
+    let scanner_resources = Arc::new(scanner::backpressure::ScannerResources::new(100));
+
     let mut loaded_buckets = HashMap::new();
     for bucket in &buckets {
         let db_path = bucket.shoebox_dir.join(METADATA_DB);
@@ -210,6 +215,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let storage = FilesystemStorage::new(bucket.root.clone());
         let parts_dir = bucket.shoebox_dir.join("parts");
         tokio::fs::create_dir_all(&parts_dir).await?;
+
+        let scheduler = Arc::new(Mutex::new(ScanScheduler::new()));
+
+        // Schedule background L1+L2+L3 scan (L1 runs first inside execute_scan_job)
+        {
+            let mut sched = scheduler.lock().await;
+            sched.schedule(ScanJob::new(
+                Priority::Reconcile,
+                ScanScope::Bucket,
+                ScanLevel::Content,
+            ));
+        }
+
+        // Spawn scan worker for this bucket
+        tokio::spawn(worker::run_scan_workers(
+            metadata.clone(),
+            bucket.root.clone(),
+            scheduler.clone(),
+            scanner_resources.clone(),
+            shutdown_token.clone(),
+        ));
 
         loaded_buckets.insert(
             bucket.name.clone(),
@@ -333,8 +359,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let bucket_names: Vec<String> = loaded_buckets.keys().cloned().collect();
-
-    let shutdown_token = CancellationToken::new();
 
     let state = AppState {
         buckets: Arc::new(loaded_buckets),
