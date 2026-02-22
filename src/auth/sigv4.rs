@@ -231,8 +231,8 @@ fn canonicalize_query_string(query: &str) -> String {
             let key = parts.next().unwrap_or("");
             let value = parts.next().unwrap_or("");
             (
-                uri_encode_component(&percent_decode(key)),
-                uri_encode_component(&percent_decode(value)),
+                uri_encode_component(&query_param_decode(key)),
+                uri_encode_component(&query_param_decode(value)),
             )
         })
         .collect();
@@ -243,6 +243,33 @@ fn canonicalize_query_string(query: &str) -> String {
         .map(|(k, v)| format!("{}={}", k, v))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// Decode a query-string component: handles both `%XX` percent-encoding
+/// and `+` as space (application/x-www-form-urlencoded convention).
+/// Many S3 clients encode spaces as `+` in query parameters, but SigV4
+/// canonical requests always use `%20`. Decoding `+` here ensures the
+/// subsequent re-encode produces the correct `%20`.
+fn query_param_decode(s: &str) -> String {
+    let mut result = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                result.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            result.push(b' ');
+            i += 1;
+            continue;
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(result).unwrap_or_else(|_| s.to_string())
 }
 
 /// Trim and collapse whitespace in a header value.
@@ -317,8 +344,42 @@ mod tests {
     }
 
     #[test]
+    fn test_canonicalize_query_string_plus_as_space() {
+        // Some S3 clients encode spaces as `+` in query parameters.
+        // The canonical form must use `%20` for spaces.
+        let query = "list-type=2&prefix=My+Folder%2F&delimiter=%2F";
+        let canonical = canonicalize_query_string(query);
+        assert_eq!(canonical, "delimiter=%2F&list-type=2&prefix=My%20Folder%2F");
+    }
+
+    #[test]
+    fn test_canonicalize_query_string_percent20_space() {
+        // Standard %20 encoding for spaces should also work.
+        let query = "list-type=2&prefix=My%20Folder%2F&delimiter=%2F";
+        let canonical = canonicalize_query_string(query);
+        assert_eq!(canonical, "delimiter=%2F&list-type=2&prefix=My%20Folder%2F");
+    }
+
+    #[test]
+    fn test_canonicalize_query_string_literal_plus() {
+        // A literal `+` in a param value is sent as `%2B`.
+        // After decode: `+`, after re-encode: `%2B`.
+        let query = "prefix=a%2Bb";
+        let canonical = canonicalize_query_string(query);
+        assert_eq!(canonical, "prefix=a%2Bb");
+    }
+
+    #[test]
     fn test_canonicalize_query_string_empty() {
         assert_eq!(canonicalize_query_string(""), "");
+    }
+
+    #[test]
+    fn test_query_param_decode() {
+        assert_eq!(query_param_decode("hello+world"), "hello world");
+        assert_eq!(query_param_decode("hello%20world"), "hello world");
+        assert_eq!(query_param_decode("a%2Bb"), "a+b");
+        assert_eq!(query_param_decode("no-encoding"), "no-encoding");
     }
 
     #[test]
