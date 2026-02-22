@@ -23,6 +23,8 @@ use crate::config::{resolve_bucket, BucketConfig, METADATA_DB};
 use crate::error::S3Error;
 use crate::metadata::sqlite::{ObjectRecord, Tag};
 use crate::metadata::MetadataStore;
+use crate::scanner::levels;
+use crate::scanner::scope::ScanScope;
 use crate::services::copy_service::{self, CopyConditions, CopyResult};
 use crate::services::object_service::{self, GetObjectResult, PutObjectInput, PutObjectResult};
 use crate::services::{tagging_service, AppState, LoadedBucket};
@@ -260,6 +262,14 @@ impl Shoebox {
         ))
     }
 
+    // -- Scanner methods (Phase 6) --
+
+    /// Run a blocking L1 scan and return the report.
+    pub async fn scan_l1(&self, bucket: &str) -> Result<scanner::L1Report, S3Error> {
+        let b = self.get_bucket(bucket)?;
+        levels::scan_l1(&b.metadata, b.storage.root(), &ScanScope::Bucket).await
+    }
+
     // -- HTTP layer bridge --
 
     // -- Helper methods for HTTP layer --
@@ -386,6 +396,19 @@ impl ShoeboxBuilder {
             let storage = FilesystemStorage::new(state.root.clone());
             let parts_dir = state.shoebox_dir.join("parts");
             tokio::fs::create_dir_all(&parts_dir).await?;
+
+            // Phase 6: Blocking L1 scan — discover files before serving
+            let l1_report = levels::scan_l1(&metadata, &state.root, &ScanScope::Bucket).await?;
+            if l1_report.discovered > 0 || l1_report.deleted > 0 {
+                tracing::info!(
+                    bucket = %state.name,
+                    discovered = l1_report.discovered,
+                    deleted = l1_report.deleted,
+                    unchanged = l1_report.unchanged,
+                    "L1 scan complete"
+                );
+            }
+
             buckets.insert(
                 state.name.clone(),
                 BucketRuntime {
@@ -754,5 +777,145 @@ mod tests {
             axum::http::StatusCode::OK,
             "Signed request should succeed"
         );
+    }
+
+    // -- Scanner tests (Phase 6) --
+
+    #[tokio::test]
+    async fn test_scanner_discovers_preexisting_files() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("photos");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        // Create files BEFORE building Shoebox (simulates pre-existing content)
+        std::fs::write(bucket_dir.join("hello.txt"), "hello world").unwrap();
+        std::fs::create_dir_all(bucket_dir.join("subdir")).unwrap();
+        std::fs::write(bucket_dir.join("subdir/nested.txt"), "nested").unwrap();
+
+        let shoebox = Shoebox::builder()
+            .bucket(&bucket_dir)
+            .build()
+            .await
+            .unwrap();
+
+        // L1 scan should have discovered the files during build()
+        let (objects, _, _, _) = shoebox
+            .list_objects("photos", "", None, 100, None)
+            .await
+            .unwrap();
+
+        assert_eq!(objects.len(), 2);
+        let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
+        assert!(keys.contains(&"hello.txt"));
+        assert!(keys.contains(&"subdir/nested.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_scanner_skips_shoebox_dir() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("mybucket");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        // Create a visible file and a file inside .shoebox/
+        std::fs::write(bucket_dir.join("visible.txt"), "visible").unwrap();
+        std::fs::create_dir_all(bucket_dir.join(".shoebox")).unwrap();
+        std::fs::write(bucket_dir.join(".shoebox/secret.toml"), "secret").unwrap();
+
+        let shoebox = Shoebox::builder()
+            .bucket(&bucket_dir)
+            .build()
+            .await
+            .unwrap();
+
+        let (objects, _, _, _) = shoebox
+            .list_objects("mybucket", "", None, 100, None)
+            .await
+            .unwrap();
+
+        // Only the visible file should be listed
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].key, "visible.txt");
+    }
+
+    #[tokio::test]
+    async fn test_scanner_coexists_with_api_uploads() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("mixed");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        // Pre-existing file
+        std::fs::write(bucket_dir.join("pre-existing.txt"), "pre").unwrap();
+
+        let shoebox = Shoebox::builder()
+            .bucket(&bucket_dir)
+            .build()
+            .await
+            .unwrap();
+
+        // Upload via API
+        let data = Bytes::from_static(b"uploaded via API");
+        let stream = stream::iter(vec![Ok::<_, std::io::Error>(data)]);
+        shoebox
+            .put_object(
+                "mixed",
+                "api-uploaded.txt",
+                stream,
+                PutObjectInput {
+                    content_type: "text/plain".to_string(),
+                    user_metadata: HashMap::new(),
+                    content_md5: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Both should be listable
+        let (objects, _, _, _) = shoebox
+            .list_objects("mixed", "", None, 100, None)
+            .await
+            .unwrap();
+
+        assert_eq!(objects.len(), 2);
+        let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
+        assert!(keys.contains(&"pre-existing.txt"));
+        assert!(keys.contains(&"api-uploaded.txt"));
+
+        // Scanner-discovered file has scan_level 1, API-uploaded has scan_level 3
+        let pre = objects
+            .iter()
+            .find(|o| o.key == "pre-existing.txt")
+            .unwrap();
+        let api = objects
+            .iter()
+            .find(|o| o.key == "api-uploaded.txt")
+            .unwrap();
+        assert_eq!(pre.scan_level, 1);
+        assert_eq!(api.scan_level, 3);
+    }
+
+    #[tokio::test]
+    async fn test_scan_l1_library_method() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("scantest");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        std::fs::write(bucket_dir.join("a.txt"), "a").unwrap();
+
+        let shoebox = Shoebox::builder()
+            .bucket(&bucket_dir)
+            .build()
+            .await
+            .unwrap();
+
+        // Files already discovered on build, so re-scan should find 0 new
+        let report = shoebox.scan_l1("scantest").await.unwrap();
+        assert_eq!(report.discovered, 0);
+        assert_eq!(report.unchanged, 1);
+
+        // Add a new file
+        std::fs::write(bucket_dir.join("b.txt"), "b").unwrap();
+
+        // Re-scan should find the new file
+        let report = shoebox.scan_l1("scantest").await.unwrap();
+        assert_eq!(report.discovered, 1);
     }
 }
