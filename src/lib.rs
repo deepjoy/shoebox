@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::routes::create_router;
 use crate::auth::presigned;
 use crate::auth::provider::CredentialProvider;
-use crate::config::{resolve_bucket, BucketConfig, METADATA_DB};
+use crate::config::{resolve_bucket, METADATA_DB};
 use crate::error::S3Error;
 use crate::metadata::sqlite::{ObjectRecord, Tag};
 use crate::metadata::MetadataStore;
@@ -35,19 +35,6 @@ use crate::services::object_service::{self, GetObjectResult, PutObjectInput, Put
 use crate::services::{tagging_service, AppState, LoadedBucket};
 use crate::storage::filesystem::FilesystemStorage;
 
-/// Per-bucket runtime state owned by Shoebox.
-struct BucketRuntime {
-    name: String,
-    config: BucketConfig,
-    storage: FilesystemStorage,
-    metadata: MetadataStore,
-    parts_dir: std::path::PathBuf,
-    // Scanner state (Phase 6)
-    #[allow(dead_code)]
-    watcher: Option<FilesystemWatcher>,
-    scheduler: Arc<Mutex<ScanScheduler>>,
-}
-
 /// Main Shoebox builder and runtime.
 ///
 /// `Shoebox` is the Rust-native library API. Each public method maps to an
@@ -55,7 +42,7 @@ struct BucketRuntime {
 /// When HTTP serving is needed, `router()` or `run()` build an internal
 /// `AppState` and hand it to the Axum router.
 pub struct Shoebox {
-    buckets: HashMap<String, BucketRuntime>,
+    buckets: Arc<HashMap<String, LoadedBucket>>,
     credential_provider: Arc<tokio::sync::RwLock<CredentialProvider>>,
     host: String,
     port: u16,
@@ -294,23 +281,7 @@ impl Shoebox {
 
     fn to_app_state(&self) -> AppState {
         AppState {
-            buckets: Arc::new(
-                self.buckets
-                    .iter()
-                    .map(|(name, b)| {
-                        (
-                            name.clone(),
-                            LoadedBucket {
-                                name: b.name.clone(),
-                                config: b.config.clone(),
-                                storage: b.storage.clone(),
-                                metadata: b.metadata.clone(),
-                                parts_dir: b.parts_dir.clone(),
-                            },
-                        )
-                    })
-                    .collect(),
-            ),
+            buckets: self.buckets.clone(),
             credential_provider: self.credential_provider.clone(),
             bucket_names: Arc::new(self.buckets.keys().cloned().collect()),
         }
@@ -352,7 +323,7 @@ impl Shoebox {
         Ok(())
     }
 
-    fn get_bucket(&self, name: &str) -> Result<&BucketRuntime, S3Error> {
+    fn get_bucket(&self, name: &str) -> Result<&LoadedBucket, S3Error> {
         self.buckets.get(name).ok_or(S3Error::NoSuchBucket)
     }
 
@@ -480,7 +451,7 @@ impl ShoeboxBuilder {
 
             buckets.insert(
                 state.name.clone(),
-                BucketRuntime {
+                LoadedBucket {
                     name: state.name,
                     config: state.config,
                     storage,
@@ -501,7 +472,7 @@ impl ShoeboxBuilder {
             )));
 
         Ok(Shoebox {
-            buckets,
+            buckets: Arc::new(buckets),
             credential_provider,
             host: self.host,
             port: self.port,
