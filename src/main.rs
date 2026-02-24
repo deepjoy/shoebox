@@ -232,10 +232,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Start filesystem watcher
-        {
+        let watcher = {
             let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(1000);
             match FilesystemWatcher::new(bucket.root.clone(), watch_tx) {
-                Ok(_watcher) => {
+                Ok(w) => {
                     tracing::debug!(bucket = %bucket.name, "Filesystem watcher started");
                     tokio::spawn(worker::run_watch_processor(
                         metadata.clone(),
@@ -244,8 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         scheduler.clone(),
                         shutdown_token.clone(),
                     ));
-                    // Keep _watcher alive by leaking it (owned by the server process)
-                    std::mem::forget(_watcher);
+                    Some(w)
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -253,9 +252,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         error = %e,
                         "Failed to start filesystem watcher"
                     );
+                    None
                 }
             }
-        }
+        };
 
         // Spawn scan worker for this bucket
         tokio::spawn(worker::run_scan_workers(
@@ -274,6 +274,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 storage,
                 metadata,
                 parts_dir,
+                watcher,
+                scheduler,
             },
         );
 

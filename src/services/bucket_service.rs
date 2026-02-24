@@ -1,19 +1,32 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
+
 use crate::auth::provider::CredentialProvider;
 use crate::config::BucketConfig;
 use crate::error::S3Error;
 use crate::metadata::MetadataStore;
+use crate::scanner::scheduler::ScanScheduler;
+use crate::scanner::watcher::FilesystemWatcher;
 use crate::storage::FilesystemStorage;
 
 /// Runtime state for a single loaded bucket.
+///
+/// Holds both the core S3 state (storage, metadata, config) and scanner
+/// state (watcher, scheduler). Used by both the HTTP layer (`AppState`)
+/// and the library API (`Shoebox`).
 pub struct LoadedBucket {
     pub name: String,
     pub config: BucketConfig,
     pub storage: FilesystemStorage,
     pub metadata: MetadataStore,
     pub parts_dir: std::path::PathBuf,
+    /// Filesystem watcher — kept alive to receive change events.
+    /// Dropping this stops the watcher.
+    pub watcher: Option<FilesystemWatcher>,
+    /// Scanner job scheduler for background L2/L3 scans.
+    pub scheduler: Arc<Mutex<ScanScheduler>>,
 }
 
 /// Shared application state passed to all handlers.
