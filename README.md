@@ -21,11 +21,26 @@ Your photos accessible via S3. Files stay where they are. No configuration. No c
 - Works with rclone, AWS CLI, and standard SDKs
 - Single binary, ~10MB
 
-## Current Status
+## Current Status — v0.1.0
 
-**This project is in early development. Nothing works yet.**
+**Phases 1–6 complete.** 127 tests passing. Works with AWS CLI, rclone, any S3 SDK.
 
-The implementation plan is complete. The code is not. If you're interested in where this is going, check back or watch the repo.
+**What works today:**
+- **Core operations** — ListBuckets, PutObject, GetObject, DeleteObject, HeadObject, ListObjectsV2, DeleteObjects
+- **Authentication** — AWS Signature V4 (header and pre-signed URLs), per-bucket and global credentials, runtime credential CRUD via CLI and API
+- **Virtual-hosted routing** — `bucket.localhost:9000/key` style requests alongside path-style
+- **Copy & rename** — Same-bucket and cross-bucket copy, atomic rename
+- **Range requests** — Partial content reads (206 responses)
+- **Conditional requests** — If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since
+- **Object tagging** — Get, put, delete tags with S3-compatible XML
+- **Multipart uploads** — Initiate, upload parts, complete, abort, list uploads/parts
+- **Filesystem scanner** — Multi-level scanning (L1 walk, L2 stat, L3 dual hashing), background workers, real-time filesystem watching, checkpoint and resume
+- **Library API** — Rust-native `Shoebox` struct with methods that map 1:1 to S3 operations, usable without an HTTP server
+- **Graceful shutdown** — Clean SIGINT/SIGTERM handling with WAL flush
+
+Files already on disk appear in S3 without uploading — the scanner picks them up automatically.
+
+Versioning, sync, and duplicate detection are next.
 
 ## The Problem
 
@@ -74,6 +89,6 @@ MIT
 
 ## Following Along
 
-This is a personal project built in public. Implementation is just beginning.
+This is a personal project built in public. v0.1.0 is the first tagged release — early preview, expect breaking changes before 1.0.
 
 If you're curious about local-first S3 storage or have thoughts on the approach, I'd like to hear from you. Open an issue or start a discussion.
