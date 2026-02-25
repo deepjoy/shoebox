@@ -9,7 +9,7 @@ use crate::error::S3Error;
 use crate::metadata::MetadataStore;
 use crate::scanner::backpressure::ScannerResources;
 use crate::scanner::levels;
-use crate::scanner::scheduler::{Priority, ScanLevel, ScanScheduler};
+use crate::scanner::scheduler::{Priority, ScanJob, ScanLevel, ScanScheduler};
 use crate::scanner::scope::ScanScope;
 
 /// Run the scan worker loop — polls the scheduler for jobs and executes them.
@@ -74,7 +74,21 @@ pub async fn run_scan_workers(
         {
             let mut sched = scheduler.lock().await;
             match result {
-                Ok(()) => sched.complete(job.id),
+                Ok(has_remaining) => {
+                    sched.complete(job.id);
+                    if has_remaining {
+                        tracing::debug!(
+                            priority = ?job.priority,
+                            target_level = ?job.target_level,
+                            "Batch limit reached, scheduling continuation job"
+                        );
+                        sched.schedule(ScanJob::new(
+                            job.priority,
+                            job.scope.clone(),
+                            job.target_level,
+                        ));
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(job_id = %job.id, error = %e, "Scan job failed");
                     sched.fail(job.id);
@@ -94,7 +108,6 @@ pub async fn run_watch_processor(
     scheduler: Arc<Mutex<ScanScheduler>>,
     token: CancellationToken,
 ) {
-    use crate::scanner::scheduler::ScanJob;
     use crate::scanner::watcher::WatchEvent;
 
     tracing::debug!("Watch processor started");
@@ -229,13 +242,19 @@ async fn handle_file_changed(
     Ok(true)
 }
 
+const L2_BATCH_LIMIT: i64 = 10_000;
+const L3_BATCH_LIMIT: i64 = 1_000;
+
 /// Execute a single scan job — runs L1, then optionally L2 and L3 up to target level.
+///
+/// Returns `true` if there are remaining keys that need processing (i.e. the
+/// batch limit was reached and a continuation job should be scheduled).
 async fn execute_scan_job(
     metadata: &MetadataStore,
     root: &Path,
     scope: &ScanScope,
     target_level: ScanLevel,
-) -> Result<(), S3Error> {
+) -> Result<bool, S3Error> {
     // L1 discovery is always needed for non-Files scopes
     match scope {
         ScanScope::Files(_) => {}
@@ -244,10 +263,20 @@ async fn execute_scan_job(
         }
     }
 
+    let mut has_remaining = false;
+
     if target_level.as_i32() >= ScanLevel::Metadata.as_i32() {
         let keys = match scope {
             ScanScope::Files(keys) => keys.clone(),
-            _ => metadata.list_keys_below_scan_level(2, 10000).await?,
+            _ => {
+                let keys = metadata
+                    .list_keys_below_scan_level(2, L2_BATCH_LIMIT)
+                    .await?;
+                if keys.len() as i64 >= L2_BATCH_LIMIT {
+                    has_remaining = true;
+                }
+                keys
+            }
         };
         if !keys.is_empty() {
             levels::scan_l2(metadata, root, &keys).await?;
@@ -257,12 +286,20 @@ async fn execute_scan_job(
     if target_level.as_i32() >= ScanLevel::Content.as_i32() {
         let keys = match scope {
             ScanScope::Files(keys) => keys.clone(),
-            _ => metadata.list_keys_below_scan_level(3, 1000).await?,
+            _ => {
+                let keys = metadata
+                    .list_keys_below_scan_level(3, L3_BATCH_LIMIT)
+                    .await?;
+                if keys.len() as i64 >= L3_BATCH_LIMIT {
+                    has_remaining = true;
+                }
+                keys
+            }
         };
         if !keys.is_empty() {
             levels::scan_l3(metadata, root, &keys).await?;
         }
     }
 
-    Ok(())
+    Ok(has_remaining)
 }
