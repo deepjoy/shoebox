@@ -44,13 +44,15 @@ graph LR
 
 ### L1 — Discovery (`scan_l1`)
 
+- Acquires a dedicated SQLite connection and creates a temp table (`l1_disk`) to collect discovered files.
 - Walks the bucket root using `async_walkdir`, skipping the `.shoebox` metadata directory.
-- Loads all known keys from the DB into memory upfront for O(1) lookups.
 - For each file on disk within the `ScanScope`:
-  - Skips if already in the database (unchanged).
-  - Otherwise creates an `ObjectRecord` with UUID, key, parent directory, size, content type, and `scan_level = 1`.
-- Batches inserts (1000 rows or 500ms flush timeout).
-- For bucket-wide scans, detects **deleted files** — keys in the DB but no longer on disk — and removes them.
+  - Creates an `ObjectRecord` with UUID, key, parent directory, size, content type.
+  - Batch-inserts into the temp table (1000 rows or 500ms flush timeout).
+- After the walk completes, merges the temp table into `objects` with two SQL statements:
+  - **INSERT** new objects that exist on disk but not in the catalog (`scan_level = 1`).
+  - **DELETE** stale objects that are in the catalog but no longer on disk (bucket-wide scans only).
+- Memory usage is O(1) regardless of file count — all working-set pressure is handled by SQLite's page cache rather than an in-memory `HashSet`.
 - Idempotent: running L1 twice with no filesystem changes produces zero new discoveries.
 
 ### L2 — Metadata (`scan_l2`)

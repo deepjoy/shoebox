@@ -669,13 +669,104 @@ impl MetadataStore {
         Ok(rows.into_iter().map(|(k,)| k).collect())
     }
 
-    /// Get all object keys in the store.
-    pub async fn get_all_keys(&self) -> Result<Vec<String>, S3Error> {
-        let rows: Vec<(String,)> = sqlx::query_as("SELECT key FROM objects ORDER BY key")
-            .fetch_all(&self.pool)
+    /// Begin an L1 scan session by acquiring a dedicated connection and creating
+    /// a temp table to collect discovered disk keys. The returned connection must
+    /// be reused for all subsequent `l1_scan_*` calls so the temp table remains
+    /// visible.
+    pub(crate) async fn l1_scan_begin(
+        &self,
+    ) -> Result<sqlx::pool::PoolConnection<sqlx::Sqlite>, S3Error> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
+            "CREATE TEMP TABLE l1_disk (
+                key TEXT NOT NULL PRIMARY KEY,
+                id TEXT NOT NULL,
+                parent_directory TEXT NOT NULL,
+                is_symlink BOOLEAN NOT NULL DEFAULT FALSE,
+                symlink_target TEXT,
+                size INTEGER,
+                content_type TEXT,
+                last_modified TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&mut *conn)
+        .await?;
+        Ok(conn)
+    }
+
+    /// Batch-insert discovered disk files into the L1 temp table.
+    pub(crate) async fn l1_scan_insert_batch(
+        conn: &mut sqlx::SqliteConnection,
+        records: &[ObjectRecord],
+    ) -> Result<(), S3Error> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut tx = sqlx::Acquire::begin(&mut *conn).await?;
+        for obj in records {
+            sqlx::query(
+                "INSERT OR IGNORE INTO l1_disk (
+                    key, id, parent_directory, is_symlink, symlink_target,
+                    size, content_type, last_modified, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&obj.key)
+            .bind(&obj.id)
+            .bind(&obj.parent_directory)
+            .bind(obj.is_symlink)
+            .bind(&obj.symlink_target)
+            .bind(obj.size)
+            .bind(&obj.content_type)
+            .bind(obj.last_modified)
+            .bind(obj.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Merge the L1 temp table into `objects`: insert newly discovered files,
+    /// optionally delete stale entries, and return `(discovered, deleted)`.
+    /// Drops the temp table when done.
+    pub(crate) async fn l1_scan_finish(
+        conn: &mut sqlx::SqliteConnection,
+        delete_stale: bool,
+    ) -> Result<(u64, u64), S3Error> {
+        // Insert new objects that exist on disk but not in the catalog
+        let inserted = sqlx::query(
+            "INSERT INTO objects (
+                id, key, parent_directory, is_directory, is_symlink, symlink_target,
+                size, content_type, last_modified, created_at, scan_level
+            )
+            SELECT
+                d.id, d.key, d.parent_directory, FALSE, d.is_symlink, d.symlink_target,
+                d.size, d.content_type, d.last_modified, d.created_at, 1
+            FROM l1_disk d
+            WHERE d.key NOT IN (SELECT key FROM objects)",
+        )
+        .execute(&mut *conn)
+        .await?;
+        let discovered = inserted.rows_affected();
+
+        // Delete objects that are in the catalog but no longer on disk
+        let deleted = if delete_stale {
+            let result =
+                sqlx::query("DELETE FROM objects WHERE key NOT IN (SELECT key FROM l1_disk)")
+                    .execute(&mut *conn)
+                    .await?;
+            result.rows_affected()
+        } else {
+            0
+        };
+
+        // Clean up
+        sqlx::query("DROP TABLE IF EXISTS l1_disk")
+            .execute(&mut *conn)
             .await?;
 
-        Ok(rows.into_iter().map(|(k,)| k).collect())
+        Ok((discovered, deleted))
     }
 
     /// Reset an object's scan level (e.g. after a file is modified on disk).

@@ -50,6 +50,11 @@ fn is_shoebox_dir(path: &Path) -> bool {
 
 /// L1: Fast directory walk — discovers files on disk and inserts new records.
 ///
+/// Uses a SQLite temp table to collect all discovered disk keys during the walk,
+/// then merges against the `objects` table in two SQL statements (INSERT new,
+/// DELETE stale). This keeps memory usage O(1) regardless of file count — all
+/// working set pressure is handled by SQLite's page cache.
+///
 /// This is a free function per the library-first design principle. Both HTTP
 /// handlers and `Shoebox` library methods can call it directly.
 pub async fn scan_l1(
@@ -57,19 +62,18 @@ pub async fn scan_l1(
     root: &Path,
     scope: &ScanScope,
 ) -> Result<L1Report, S3Error> {
-    let mut report = L1Report::default();
     let scan_start = std::time::Instant::now();
 
-    // Load all known keys up front — one query instead of per-file lookups
-    let db_keys: std::collections::HashSet<String> =
-        metadata.get_all_keys().await?.into_iter().collect();
-    tracing::info!(db_keys = db_keys.len(), "L1 loaded existing keys");
+    // Acquire a dedicated connection and create a temp table for disk keys.
+    // The connection must be reused for all temp table operations.
+    let mut conn = metadata.l1_scan_begin().await?;
+    tracing::info!("L1 scan started, temp table created");
 
-    // Collect all keys currently on disk within scope
-    let mut disk_keys = std::collections::HashSet::new();
+    // Walk the filesystem and batch-insert every discovered file into the temp table
     let mut batch: Vec<ObjectRecord> = Vec::with_capacity(BATCH_SIZE);
     let mut batch_start = std::time::Instant::now();
     let mut last_progress = std::time::Instant::now();
+    let mut files_walked: u64 = 0;
 
     let mut walker = WalkDir::new(root);
     walker = walker.filter(|entry| async move {
@@ -125,31 +129,22 @@ pub async fn scan_l1(
             continue;
         }
 
-        let parent = key
-            .rsplit_once('/')
-            .map(|(p, _)| p.to_string())
-            .unwrap_or_default();
-
-        disk_keys.insert(key.clone());
+        files_walked += 1;
 
         // Log progress every 5 seconds
         if last_progress.elapsed() >= std::time::Duration::from_secs(5) {
-            let total = report.discovered + report.unchanged;
             tracing::info!(
-                files = total,
-                discovered = report.discovered,
-                unchanged = report.unchanged,
+                files = files_walked,
                 elapsed = ?scan_start.elapsed(),
                 "L1 scan in progress"
             );
             last_progress = std::time::Instant::now();
         }
 
-        // Check if already in DB (in-memory lookup)
-        if db_keys.contains(&key) {
-            report.unchanged += 1;
-            continue;
-        }
+        let parent = key
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
 
         // Read symlink target if applicable
         let symlink_target = if is_symlink {
@@ -187,12 +182,11 @@ pub async fn scan_l1(
         };
 
         batch.push(obj);
-        report.discovered += 1;
 
         if batch.len() >= BATCH_SIZE
             || (!batch.is_empty() && batch_start.elapsed() >= BATCH_TIMEOUT)
         {
-            metadata.insert_objects_batch(&batch).await?;
+            MetadataStore::l1_scan_insert_batch(&mut conn, &batch).await?;
             batch.clear();
             batch_start = std::time::Instant::now();
         }
@@ -200,26 +194,34 @@ pub async fn scan_l1(
 
     // Flush remaining batch
     if !batch.is_empty() {
-        metadata.insert_objects_batch(&batch).await?;
+        MetadataStore::l1_scan_insert_batch(&mut conn, &batch).await?;
     }
 
-    // Find deleted files: objects in DB but not on disk
-    if matches!(scope, ScanScope::Bucket) {
-        tracing::info!(
-            disk_files = disk_keys.len(),
-            elapsed = ?scan_start.elapsed(),
-            "L1 walk complete, checking for deleted files"
-        );
-        let to_delete: Vec<String> = db_keys
-            .into_iter()
-            .filter(|k| !disk_keys.contains(k))
-            .collect();
-        for chunk in to_delete.chunks(BATCH_SIZE) {
-            report.deleted += metadata.delete_objects(chunk).await?;
-        }
-    }
+    tracing::info!(
+        files = files_walked,
+        elapsed = ?scan_start.elapsed(),
+        "L1 walk complete, merging into catalog"
+    );
 
-    Ok(report)
+    // Merge: insert new objects and delete stale ones in two SQL statements
+    let delete_stale = matches!(scope, ScanScope::Bucket);
+    let (discovered, deleted) = MetadataStore::l1_scan_finish(&mut conn, delete_stale).await?;
+
+    let unchanged = files_walked.saturating_sub(discovered);
+
+    tracing::info!(
+        discovered = discovered,
+        unchanged = unchanged,
+        deleted = deleted,
+        elapsed = ?scan_start.elapsed(),
+        "L1 scan complete"
+    );
+
+    Ok(L1Report {
+        discovered,
+        deleted,
+        unchanged,
+    })
 }
 
 /// L2: stat() each file for metadata (size, mtime, ctime, inode, device_id).
