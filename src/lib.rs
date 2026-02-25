@@ -22,8 +22,9 @@ use crate::auth::presigned;
 use crate::auth::provider::CredentialProvider;
 use crate::config::{resolve_bucket, METADATA_DB};
 use crate::error::S3Error;
-use crate::metadata::sqlite::{ObjectRecord, Tag};
+use crate::metadata::sqlite::{ListEntry, ObjectRecord, Tag};
 use crate::metadata::MetadataStore;
+
 use crate::scanner::backpressure::ScannerResources;
 use crate::scanner::levels;
 use crate::scanner::scheduler::{Priority, ScanJob, ScanLevel, ScanScheduler};
@@ -34,6 +35,11 @@ use crate::services::copy_service::{self, CopyConditions, CopyResult};
 use crate::services::object_service::{self, GetObjectResult, PutObjectInput, PutObjectResult};
 use crate::services::{tagging_service, AppState, LoadedBucket};
 use crate::storage::filesystem::FilesystemStorage;
+use std::pin::Pin;
+
+/// A boxed, sendable stream of list entries.
+pub type ListStream<'a> =
+    Pin<Box<dyn futures::Stream<Item = Result<ListEntry, S3Error>> + Send + 'a>>;
 
 /// Main Shoebox builder and runtime.
 ///
@@ -87,18 +93,21 @@ impl Shoebox {
         object_service::head_object(&b.storage, &b.metadata, key).await
     }
 
-    pub async fn list_objects(
+    /// Stream list entries for a bucket, ordered by key.
+    ///
+    /// Returns a stream of [`ListEntry`] items (objects and/or common
+    /// prefixes when a delimiter is provided). The caller controls how
+    /// many entries to consume (e.g. via `.take(n)`).
+    pub fn list_objects(
         &self,
         bucket: &str,
         prefix: &str,
         delimiter: Option<&str>,
-        max_keys: i32,
         start_after: Option<&str>,
-    ) -> Result<(Vec<ObjectRecord>, Vec<String>, bool, Option<String>), S3Error> {
+    ) -> Result<ListStream<'_>, S3Error> {
         let b = self.get_bucket(bucket)?;
-        b.metadata
-            .list_objects_v2(prefix, delimiter, max_keys, start_after)
-            .await
+        Ok(b.metadata
+            .list_objects_stream(prefix, delimiter, start_after))
     }
 
     pub async fn copy_object(
@@ -451,15 +460,15 @@ impl ShoeboxBuilder {
 
             buckets.insert(
                 state.name.clone(),
-                LoadedBucket::new(
-                    state.name,
-                    state.config,
+                LoadedBucket {
+                    name: state.name,
+                    config: state.config,
                     storage,
                     metadata,
                     parts_dir,
                     watcher,
                     scheduler,
-                ),
+                },
             );
         }
 
@@ -486,8 +495,24 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures::stream;
+    use futures::TryStreamExt;
     use services::object_service::PutObjectInput;
     use tempfile::TempDir;
+
+    /// Collect all `ListEntry::Object` records from a list_objects stream.
+    async fn collect_objects(shoebox: &Shoebox, bucket: &str) -> Vec<ObjectRecord> {
+        let stream = shoebox.list_objects(bucket, "", None, None).unwrap();
+        stream
+            .try_filter_map(|entry| async move {
+                match entry {
+                    ListEntry::Object(r) => Ok(Some(*r)),
+                    ListEntry::CommonPrefix(_) => Ok(None),
+                }
+            })
+            .try_collect()
+            .await
+            .unwrap()
+    }
 
     async fn build_shoebox(tmp: &TempDir, bucket_name: &str) -> Shoebox {
         let bucket_dir = tmp.path().join(bucket_name);
@@ -620,10 +645,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (objects, _prefixes, _is_truncated, _next_token) = shoebox
-            .list_objects("test-bucket", "", None, 100, None)
-            .await
-            .unwrap();
+        let objects = collect_objects(&shoebox, "test-bucket").await;
         assert_eq!(objects.len(), 2);
         let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
         assert!(keys.contains(&"a.txt"));
@@ -841,11 +863,7 @@ mod tests {
             .unwrap();
 
         // L1 scan should have discovered the files during build()
-        let (objects, _, _, _) = shoebox
-            .list_objects("photos", "", None, 100, None)
-            .await
-            .unwrap();
-
+        let objects = collect_objects(&shoebox, "photos").await;
         assert_eq!(objects.len(), 2);
         let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
         assert!(keys.contains(&"hello.txt"));
@@ -869,10 +887,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (objects, _, _, _) = shoebox
-            .list_objects("mybucket", "", None, 100, None)
-            .await
-            .unwrap();
+        let objects = collect_objects(&shoebox, "mybucket").await;
 
         // Only the visible file should be listed
         assert_eq!(objects.len(), 1);
@@ -912,11 +927,7 @@ mod tests {
             .unwrap();
 
         // Both should be listable
-        let (objects, _, _, _) = shoebox
-            .list_objects("mixed", "", None, 100, None)
-            .await
-            .unwrap();
-
+        let objects = collect_objects(&shoebox, "mixed").await;
         assert_eq!(objects.len(), 2);
         let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
         assert!(keys.contains(&"pre-existing.txt"));

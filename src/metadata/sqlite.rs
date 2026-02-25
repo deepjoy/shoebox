@@ -1,9 +1,22 @@
+use std::collections::BTreeSet;
 use std::path::Path;
+use std::pin::Pin;
 
+use futures::stream::TryStreamExt;
+use futures::Stream;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
 use crate::error::S3Error;
+
+/// A single entry from a streaming list operation.
+#[derive(Debug, Clone)]
+pub enum ListEntry {
+    /// A concrete object.
+    Object(Box<ObjectRecord>),
+    /// A collapsed common prefix (only emitted when a delimiter is provided).
+    CommonPrefix(String),
+}
 
 /// Object metadata record, matching the `objects` table schema.
 ///
@@ -302,6 +315,103 @@ impl MetadataStore {
         .await?;
 
         Ok(records)
+    }
+
+    /// Stream list entries matching a prefix, ordered by key.
+    ///
+    /// When `delimiter` is `None`, every matching row is yielded as
+    /// `ListEntry::Object`. When a delimiter is provided, keys that contain
+    /// the delimiter after the prefix are collapsed into
+    /// `ListEntry::CommonPrefix` (each unique prefix emitted exactly once).
+    ///
+    /// Unlike `list_objects` / `list_objects_v2`, this does not load all
+    /// results into memory. The caller controls consumption by dropping the
+    /// stream or using `.take(n)`.
+    pub fn list_objects_stream(
+        &self,
+        prefix: &str,
+        delimiter: Option<&str>,
+        start_after: Option<&str>,
+    ) -> Pin<Box<dyn Stream<Item = Result<ListEntry, S3Error>> + Send + '_>> {
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+
+        let raw_stream: Pin<Box<dyn Stream<Item = Result<ObjectRecord, sqlx::Error>> + Send + '_>> =
+            if let Some(after) = start_after {
+                let after = after.to_string();
+                Box::pin(
+                    sqlx::query_as::<_, ObjectRecord>(
+                        "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' AND key > ? ORDER BY key",
+                    )
+                    .bind(pattern)
+                    .bind(after)
+                    .fetch(&self.pool),
+                )
+            } else {
+                Box::pin(
+                    sqlx::query_as::<_, ObjectRecord>(
+                        "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
+                    )
+                    .bind(pattern)
+                    .fetch(&self.pool),
+                )
+            };
+
+        match delimiter {
+            None => {
+                // Flat listing — every row is an object.
+                Box::pin(
+                    raw_stream
+                        .map_ok(|r| ListEntry::Object(Box::new(r)))
+                        .map_err(S3Error::from),
+                )
+            }
+            Some(delim) => {
+                // Delimiter grouping — collapse matching keys into common prefixes,
+                // deduplicating so each prefix is emitted only once.
+                let prefix_owned = prefix.to_string();
+                let delim_owned = delim.to_string();
+                let prefix_len = prefix.len();
+
+                Box::pin(futures::stream::try_unfold(
+                    (
+                        raw_stream,
+                        BTreeSet::new(),
+                        prefix_owned,
+                        delim_owned,
+                        prefix_len,
+                    ),
+                    |(mut stream, mut seen, pfx, delim, pfx_len)| async move {
+                        loop {
+                            match stream.try_next().await.map_err(S3Error::from)? {
+                                None => return Ok(None),
+                                Some(record) => {
+                                    let suffix = &record.key[pfx_len..];
+                                    if let Some(pos) = suffix.find(delim.as_str()) {
+                                        let cp = format!("{}{}", pfx, &suffix[..pos + delim.len()]);
+                                        if seen.insert(cp.clone()) {
+                                            return Ok(Some((
+                                                ListEntry::CommonPrefix(cp),
+                                                (stream, seen, pfx, delim, pfx_len),
+                                            )));
+                                        }
+                                        // Already emitted this common prefix — skip row.
+                                    } else {
+                                        return Ok(Some((
+                                            ListEntry::Object(Box::new(record)),
+                                            (stream, seen, pfx, delim, pfx_len),
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    },
+                ))
+            }
+        }
     }
 
     /// List objects within a specific parent directory.
