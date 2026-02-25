@@ -317,7 +317,17 @@ impl Shoebox {
 
         let app_state = self.to_app_state();
         let router = create_router(app_state);
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                format!(
+                    "Port {} is already in use. Is another Shoebox instance running?\n\
+                     Try a different port with .port(<PORT>)",
+                    self.port
+                )
+            } else {
+                format!("Failed to bind to {}: {}", addr, e)
+            }
+        })?;
         tracing::info!("Serving on http://{addr}");
 
         axum::serve(listener, router)
@@ -427,7 +437,17 @@ impl ShoeboxBuilder {
         let mut buckets = HashMap::new();
 
         for path in &paths {
-            let state = resolve_bucket(path, self.data_dir.as_deref()).await?;
+            let state = resolve_bucket(path, self.data_dir.as_deref())
+                .await
+                .map_err(|e| match e.downcast_ref::<std::io::Error>() {
+                    Some(io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied => {
+                        format!(
+                            "{}: permission denied; use --data-dir to store state elsewhere",
+                            path.display()
+                        )
+                    }
+                    _ => e.to_string(),
+                })?;
             let db_path = state.shoebox_dir.join(METADATA_DB);
             let metadata = MetadataStore::new(&db_path).await?;
             let storage = FilesystemStorage::new(state.root.clone());

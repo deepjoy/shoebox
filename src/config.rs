@@ -389,15 +389,39 @@ pub async fn resolve_all_buckets(config: &ServerConfig) -> Result<Vec<BucketStat
             return Err(ConfigError::NotADirectory(path.clone()));
         }
         if config.data_dir.is_none() {
-            let meta = std::fs::metadata(path)?;
-            if meta.permissions().readonly() {
+            // Probe actual writability — permissions().readonly() only checks
+            // the owner write bit and is unreliable for non-owner users, ACLs,
+            // and read-only mounts.
+            if !is_dir_writable(path) {
                 return Err(ConfigError::ReadOnlyPath(path.clone()));
             }
         }
-        let bucket = resolve_bucket(path, config.data_dir.as_deref()).await?;
+        let bucket = resolve_bucket(path, config.data_dir.as_deref())
+            .await
+            .map_err(|e| match e.downcast_ref::<std::io::Error>() {
+                Some(io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    ConfigError::ReadOnlyPath(path.clone())
+                }
+                _ => ConfigError::Other(e),
+            })?;
         buckets.push(bucket);
     }
     Ok(buckets)
+}
+
+/// Check if a directory is actually writable by attempting to create and
+/// remove a temporary file. This is more reliable than inspecting permission
+/// bits, which don't account for effective user identity, ACLs, or read-only
+/// mounts.
+fn is_dir_writable(path: &Path) -> bool {
+    let probe = path.join(".shoebox_write_probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -649,5 +673,67 @@ description = "Global admin"
 
         let result = load_global_config(&config_path).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_all_buckets_readonly_without_data_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("readonly-bucket");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        // Make the directory read-only
+        std::fs::set_permissions(&bucket_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let config = ServerConfig {
+            paths: vec![bucket_dir.clone()],
+            host: "127.0.0.1".into(),
+            port: 9000,
+            show_secrets: false,
+            data_dir: None,
+        };
+
+        let result = resolve_all_buckets(&config).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("--data-dir"),
+            "Error should suggest --data-dir, got: {err_msg}"
+        );
+
+        // Restore permissions so TempDir cleanup works
+        std::fs::set_permissions(&bucket_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_resolve_all_buckets_readonly_with_data_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("readonly-bucket2");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        let data_dir = tmp.path().join("state");
+
+        // Make the bucket directory read-only
+        std::fs::set_permissions(&bucket_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let config = ServerConfig {
+            paths: vec![bucket_dir.clone()],
+            host: "127.0.0.1".into(),
+            port: 9000,
+            show_secrets: false,
+            data_dir: Some(data_dir),
+        };
+
+        let result = resolve_all_buckets(&config).await;
+        assert!(
+            result.is_ok(),
+            "Should succeed with --data-dir: {:?}",
+            result.err()
+        );
+
+        // Restore permissions so TempDir cleanup works
+        std::fs::set_permissions(&bucket_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

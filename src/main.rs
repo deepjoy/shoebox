@@ -406,7 +406,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    let listener = tokio::net::TcpListener::bind(&listen_addr)
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                format!(
+                    "Port {} is already in use. Is another Shoebox instance running?\n\
+                 Try a different port with --port <PORT>",
+                    config.port
+                )
+            } else {
+                format!("Failed to bind to {}: {}", listen_addr, e)
+            }
+        })?;
     tracing::info!("Listening on {}", listen_addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_token.cancelled_owned())
