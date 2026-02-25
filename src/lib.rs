@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::routes::create_router;
 use crate::auth::presigned;
 use crate::auth::provider::CredentialProvider;
-use crate::config::{resolve_bucket, METADATA_DB};
+use crate::config::{load_global_config, resolve_bucket, GlobalConfig, METADATA_DB};
 use crate::error::S3Error;
 use crate::metadata::sqlite::{ListEntry, ObjectRecord, Tag};
 use crate::metadata::MetadataStore;
@@ -341,11 +341,14 @@ impl Shoebox {
     }
 }
 
+#[derive(Default)]
 pub struct ShoeboxBuilder {
     paths: Vec<PathBuf>,
-    host: String,
-    port: u16,
+    host: Option<String>,
+    port: Option<u16>,
     data_dir: Option<PathBuf>,
+    global_config: Option<GlobalConfig>,
+    config_file: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -356,41 +359,74 @@ impl Shoebox {
     }
 }
 
-impl Default for ShoeboxBuilder {
-    fn default() -> Self {
-        Self {
-            paths: vec![],
-            host: "0.0.0.0".into(),
-            port: 9000,
-            data_dir: None,
-        }
-    }
-}
-
 impl ShoeboxBuilder {
     pub fn bucket(mut self, path: impl AsRef<Path>) -> Self {
         self.paths.push(path.as_ref().to_path_buf());
         self
     }
     pub fn host(mut self, host: impl Into<String>) -> Self {
-        self.host = host.into();
+        self.host = Some(host.into());
         self
     }
     pub fn port(mut self, port: u16) -> Self {
-        self.port = port;
+        self.port = Some(port);
         self
     }
     pub fn data_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.data_dir = Some(dir.as_ref().to_path_buf());
         self
     }
+    /// Set a pre-built global configuration.
+    ///
+    /// Global config provides bucket paths, host/port defaults, and
+    /// cross-bucket credentials. Explicit builder setters (`.host()`,
+    /// `.port()`, `.bucket()`) take precedence over values in the config.
+    pub fn global_config(mut self, config: GlobalConfig) -> Self {
+        self.global_config = Some(config);
+        self
+    }
+    /// Load a global configuration from a TOML file during `.build()`.
+    ///
+    /// If both `.config_file()` and `.global_config()` are set, the
+    /// pre-built config from `.global_config()` wins.
+    pub fn config_file(mut self, path: impl AsRef<Path>) -> Self {
+        self.config_file = Some(path.as_ref().to_path_buf());
+        self
+    }
 
     pub async fn build(self) -> Result<Shoebox, Box<dyn std::error::Error>> {
+        // Resolve global config: explicit object takes priority over file
+        let global_config = match (self.global_config, self.config_file) {
+            (Some(gc), _) => Some(gc),
+            (None, Some(path)) => Some(load_global_config(&path).await?),
+            (None, None) => None,
+        };
+
+        // Merge paths: explicit .bucket() calls > global config
+        let paths = if self.paths.is_empty() {
+            global_config
+                .as_ref()
+                .map(|gc| gc.buckets.clone())
+                .unwrap_or_default()
+        } else {
+            self.paths
+        };
+
+        // Merge host/port: explicit setter > global config > default
+        let host = self
+            .host
+            .or_else(|| global_config.as_ref().and_then(|gc| gc.host.clone()))
+            .unwrap_or_else(|| "0.0.0.0".into());
+        let port = self
+            .port
+            .or_else(|| global_config.as_ref().and_then(|gc| gc.port))
+            .unwrap_or(9000);
+
         let shutdown_token = CancellationToken::new();
         let resources = Arc::new(ScannerResources::new(100));
         let mut buckets = HashMap::new();
 
-        for path in &self.paths {
+        for path in &paths {
             let state = resolve_bucket(path, self.data_dir.as_deref()).await?;
             let db_path = state.shoebox_dir.join(METADATA_DB);
             let metadata = MetadataStore::new(&db_path).await?;
@@ -472,19 +508,24 @@ impl ShoeboxBuilder {
             );
         }
 
-        let credential_provider =
-            Arc::new(tokio::sync::RwLock::new(CredentialProvider::from_buckets(
-                &buckets
-                    .values()
-                    .map(|b| (b.name.clone(), &b.config))
-                    .collect::<Vec<_>>(),
-            )));
+        let mut provider = CredentialProvider::from_buckets(
+            &buckets
+                .values()
+                .map(|b| (b.name.clone(), &b.config))
+                .collect::<Vec<_>>(),
+        );
+
+        if let Some(ref gc) = global_config {
+            provider.add_global_credentials(&gc.credentials);
+        }
+
+        let credential_provider = Arc::new(tokio::sync::RwLock::new(provider));
 
         Ok(Shoebox {
             buckets: Arc::new(buckets),
             credential_provider,
-            host: self.host,
-            port: self.port,
+            host,
+            port,
             shutdown_token,
         })
     }
@@ -970,5 +1011,89 @@ mod tests {
         // Re-scan should find the new file
         let report = shoebox.scan_l1("scantest").await.unwrap();
         assert_eq!(report.discovered, 1);
+    }
+
+    #[tokio::test]
+    async fn test_builder_with_global_config() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("gc-bucket");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let gc = config::GlobalConfig {
+            buckets: vec![bucket_dir],
+            host: Some("127.0.0.1".into()),
+            port: Some(3333),
+            credentials: vec![config::Credential {
+                access_key_id: "AKIAGLOBALTEST000000".into(),
+                secret_access_key: "globalsecret".into(),
+                description: Some("global cred".into()),
+                permissions: Some(vec!["read".into()]),
+            }],
+        };
+
+        // Build using global_config — no explicit .bucket() calls
+        let shoebox = Shoebox::builder().global_config(gc).build().await.unwrap();
+
+        assert_eq!(shoebox.host, "127.0.0.1");
+        assert_eq!(shoebox.port, 3333);
+        assert!(shoebox.buckets.contains_key("gc-bucket"));
+
+        // Global credential should be present
+        let provider = shoebox.credential_provider.read().await;
+        let cred = provider.lookup("AKIAGLOBALTEST000000");
+        assert!(cred.is_some());
+        assert!(cred.unwrap().bucket_name.is_none()); // global, not bucket-scoped
+    }
+
+    #[tokio::test]
+    async fn test_builder_explicit_overrides_global_config() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("override-test");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let gc = config::GlobalConfig {
+            buckets: vec![],
+            host: Some("10.0.0.1".into()),
+            port: Some(4444),
+            credentials: vec![],
+        };
+
+        let shoebox = Shoebox::builder()
+            .global_config(gc)
+            .bucket(&bucket_dir)
+            .host("192.168.1.1")
+            .port(5555)
+            .build()
+            .await
+            .unwrap();
+
+        // Explicit builder values win
+        assert_eq!(shoebox.host, "192.168.1.1");
+        assert_eq!(shoebox.port, 5555);
+        assert!(shoebox.buckets.contains_key("override-test"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_config_file() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("file-cfg");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let config_path = tmp.path().join("shoebox.toml");
+        let toml_content = format!(
+            "host = \"1.2.3.4\"\nport = 7777\nbuckets = [\"{}\"]\n",
+            bucket_dir.display()
+        );
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        let shoebox = Shoebox::builder()
+            .config_file(&config_path)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(shoebox.host, "1.2.3.4");
+        assert_eq!(shoebox.port, 7777);
+        assert!(shoebox.buckets.contains_key("file-cfg"));
     }
 }
