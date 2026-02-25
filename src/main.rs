@@ -268,15 +268,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         loaded_buckets.insert(
             bucket.name.clone(),
-            LoadedBucket {
-                name: bucket.name.clone(),
-                config: bucket.config.clone(),
+            LoadedBucket::new(
+                bucket.name.clone(),
+                bucket.config.clone(),
                 storage,
                 metadata,
                 parts_dir,
                 watcher,
                 scheduler,
-            },
+            ),
         );
 
         // Print bucket info
