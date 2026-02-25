@@ -51,12 +51,9 @@ echo "Hello from a pre-existing file" > "$BUCKET/readme.txt"
 dd if=/dev/urandom of="$BUCKET/vacation/photo-beach.dat" bs=1M count=50 2>/dev/null
 dd if=/dev/urandom of="$BUCKET/vacation/photo-mountain.dat" bs=1M count=50 2>/dev/null
 
-banner "Phase 6 — Multi-Level Scanner"
+# ── 1. Server startup ──────────────────────────────────────────────────────
 
-# =============================================================================
-# TEST: L1 scan discovers all files
-# TEST: Startup L1 scan completes before API serves
-# =============================================================================
+banner "Phase 6 — Multi-Level Scanner"
 
 step "Start server (L1 scan runs on startup, discovering pre-existing files)"
 SHOEBOX_LOG=info $SHOEBOX --port "$PORT" "$BUCKET" &>"$DEMO_ROOT/server.log" &
@@ -76,29 +73,27 @@ export AWS_ACCESS_KEY_ID="$ACCESS_KEY"
 export AWS_SECRET_ACCESS_KEY="$SECRET_KEY"
 export AWS_DEFAULT_REGION="us-east-1"
 export AWS_PAGER=""
+export AWS_ENDPOINT_URL="$ENDPOINT"
 
 ok "Server started — L1 scan discovered pre-existing files"
+sleep "$DELAY"
 
-# =============================================================================
-# TEST: HEAD after L1 — no size or ETag yet
-# The background scan worker polls every 500ms. By issuing this HEAD
-# immediately after startup, the server handles it BEFORE the worker
-# starts L2/L3 scans — so we see the L1-only state.
-# =============================================================================
+# ── 2. L1 scan verification ───────────────────────────────────────────────
+
+banner "L1 Scan — Immediate Discovery"
 
 step "HEAD object immediately — L1 data only (no size, no ETag)"
 note "The background scan hasn't started yet (worker polls every 500ms)."
-run "aws --endpoint-url $ENDPOINT s3api head-object --bucket photos --key readme.txt"
+run "aws s3api head-object --bucket photos --key readme.txt"
 
 step "List objects — pre-existing files are visible immediately"
-run "aws --endpoint-url $ENDPOINT s3 ls s3://photos/ --recursive"
+run "aws s3 ls s3://photos/ --recursive"
 ok "L1 scan discovers all files: 3 pre-existing files found"
+sleep "$DELAY"
 
-# =============================================================================
-# TEST: L2 scan collects metadata (size populated via Content-Length)
-# TEST: L3 scan computes correct hashes (ETag populated)
-# TEST: Background scans don't block API
-# =============================================================================
+# ── 3. Background L2+L3 scans ─────────────────────────────────────────────
+
+banner "L2+L3 Background Scans"
 
 step "Wait for background L2+L3 scans (per-file progress in server log)"
 note "L2 runs stat() for metadata, then L3 streams each file through MD5+SHA-256."
@@ -114,9 +109,9 @@ grep -E 'L[23].*(scan starting|complete)' "$DEMO_ROOT/server.log" | head -20 || 
 
 step "HEAD object after L2+L3 — size and ETag now populated"
 note "L2 added ContentLength (file size); L3 added ETag (MD5 content hash)."
-run "aws --endpoint-url $ENDPOINT s3api head-object --bucket photos --key readme.txt"
+run "aws s3api head-object --bucket photos --key readme.txt"
 
-ETAG=$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket photos --key readme.txt --query ETag --output text 2>/dev/null || echo "")
+ETAG=$(aws s3api head-object --bucket photos --key readme.txt --query ETag --output text 2>/dev/null || echo "")
 if [[ -n "$ETAG" && "$ETAG" != "None" && "$ETAG" != "\"\"" ]]; then
   ok "L3 scan computed content hash: ETag=$ETAG"
 else
@@ -124,10 +119,11 @@ else
 fi
 
 note "API operations continue to work during background scans"
+sleep "$DELAY"
 
-# =============================================================================
-# TEST: Filesystem watcher detects new files
-# =============================================================================
+# ── 4. Filesystem watcher — new files ─────────────────────────────────────
+
+banner "Filesystem Watcher — New Files"
 
 step "Add a new file directly to the filesystem (bypassing S3 API)"
 echo "New file added while server is running" > "$BUCKET/new-file.txt"
@@ -135,12 +131,13 @@ note "Waiting for filesystem watcher to detect the change..."
 sleep 2
 
 step "List objects — watcher should have detected the new file"
-run "aws --endpoint-url $ENDPOINT s3 ls s3://photos/ --recursive"
+run "aws s3 ls s3://photos/ --recursive"
 ok "Filesystem watcher detected the new file"
+sleep "$DELAY"
 
-# =============================================================================
-# TEST: Filesystem watcher detects modifications
-# =============================================================================
+# ── 5. Filesystem watcher — modifications ─────────────────────────────────
+
+banner "Filesystem Watcher — Modifications"
 
 step "Modify an existing file directly on the filesystem"
 echo "Modified content — this file has been changed" > "$BUCKET/readme.txt"
@@ -148,12 +145,13 @@ note "Waiting for filesystem watcher to detect the modification..."
 sleep 2
 
 step "Verify modification detected — HEAD shows updated Content-Length"
-run "aws --endpoint-url $ENDPOINT s3api head-object --bucket photos --key readme.txt"
+run "aws s3api head-object --bucket photos --key readme.txt"
 ok "Filesystem watcher detected the modification"
+sleep "$DELAY"
 
-# =============================================================================
-# TEST: Filesystem watcher detects deletions
-# =============================================================================
+# ── 6. Filesystem watcher — deletions ─────────────────────────────────────
+
+banner "Filesystem Watcher — Deletions"
 
 step "Delete a file directly from the filesystem"
 rm "$BUCKET/vacation/photo-beach.dat"
@@ -161,12 +159,13 @@ note "Waiting for filesystem watcher to detect the deletion..."
 sleep 2
 
 step "List objects — deleted file should be removed"
-run "aws --endpoint-url $ENDPOINT s3 ls s3://photos/ --recursive"
+run "aws s3 ls s3://photos/ --recursive"
 ok "Filesystem watcher detected the deletion"
+sleep "$DELAY"
 
-# =============================================================================
-# TEST: L1 scan detects deleted files (explicit re-scan on restart)
-# =============================================================================
+# ── 7. L1 deletion detection on restart ───────────────────────────────────
+
+banner "L1 Deletion Detection — Restart"
 
 step "Test L1 deletion detection: stop server, remove a file, restart"
 kill "$SERVER_PID" 2>/dev/null || true
@@ -191,23 +190,25 @@ export AWS_ACCESS_KEY_ID="$ACCESS_KEY"
 export AWS_SECRET_ACCESS_KEY="$SECRET_KEY"
 
 step "List objects after restart — L1 scan should detect the missing file"
-run "aws --endpoint-url $ENDPOINT s3 ls s3://photos/ --recursive"
+run "aws s3 ls s3://photos/ --recursive"
 ok "L1 scan detects deleted files: photo-mountain.dat is gone"
+sleep "$DELAY"
 
-# =============================================================================
-# TEST: S3 API uploads coexist with scanner
-# =============================================================================
+# ── 8. S3 API coexistence ─────────────────────────────────────────────────
+
+banner "S3 API Coexistence"
 
 step "Upload via S3 API still works alongside scanner"
-echo "Uploaded via API" | aws --endpoint-url "$ENDPOINT" s3 cp - s3://photos/api-upload.txt
-run "aws --endpoint-url $ENDPOINT s3 ls s3://photos/ --recursive"
+echo "Uploaded via API" | aws s3 cp - s3://photos/api-upload.txt
+run "aws s3 ls s3://photos/ --recursive"
 ok "API uploads coexist with scanner-discovered files"
+sleep "$DELAY"
 
-# =============================================================================
-# TEST: Docker image builds and runs (optional — requires Docker)
-# =============================================================================
+# ── 9. Docker build and run (optional) ────────────────────────────────────
 
 if command -v docker &>/dev/null; then
+  banner "Docker — Build & Run"
+
   step "Docker: build image"
   run "docker build -t shoebox:phase6-test $PROJECT_ROOT"
   ok "Docker image builds successfully"
@@ -243,14 +244,15 @@ if command -v docker &>/dev/null; then
 
   docker stop "$CONTAINER_ID" 2>/dev/null || true
   docker rmi shoebox:phase6-test 2>/dev/null || true
+  sleep "$DELAY"
 else
   note "Docker not available — skipping Docker build/run tests"
   note "  (Docker tests: image build, container start, serve buckets)"
 fi
 
-# --- Done ---------------------------------------------------------------------
+# ── 10. Done ──────────────────────────────────────────────────────────────
 
-banner "Phase 6 demo complete"
+banner "Phase 6 Demo Complete"
 note "Scanner checklist items demonstrated:"
 note "  [x] L1 scan discovers all files"
 note "  [x] L1 scan detects deleted files"
@@ -271,3 +273,5 @@ note "  [x] P0 scan preempts P1/P2"
 note "  [x] Debouncing prevents duplicate events"
 note "  [x] Multi-arch build (CI-only)"
 note "  [x] docker pull from registries (CI-only)"
+
+sleep "${END_DELAY}"
