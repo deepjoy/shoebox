@@ -27,175 +27,137 @@ trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; rm -rf "$D
 BUCKET_DIR="$DEMO_ROOT/photos"
 mkdir -p "$BUCKET_DIR"
 
-SHOEBOX="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/target/release/shoebox"
+require_shoebox
+
 PORT=9876
 ENDPOINT="http://127.0.0.1:$PORT"
-
-if [[ ! -x "$SHOEBOX" ]]; then
-  echo "Error: shoebox binary not found at $SHOEBOX"
-  echo "Run 'cargo build --release' first."
-  exit 1
-fi
-
-export AWS_DEFAULT_REGION=us-east-1
 
 # Start shoebox in the background (credentials are auto-generated)
 SHOEBOX_LOG=off "$SHOEBOX" --host 127.0.0.1 --port "$PORT" --show-secrets "$BUCKET_DIR" > "$DEMO_ROOT/startup.txt" 2>&1 &
 SERVER_PID=$!
+wait_for_server "$ENDPOINT"
 
-# Wait for server to be ready
-for i in $(seq 1 30); do
-  if curl -s -o /dev/null "$ENDPOINT/" 2>/dev/null; then
-    break
-  fi
-  sleep 0.1
-done
-
-# Extract real credentials from the generated config
-export AWS_ACCESS_KEY_ID=$(grep access_key_id "$BUCKET_DIR/.shoebox/config.toml" | head -1 | cut -d'"' -f2)
-export AWS_SECRET_ACCESS_KEY=$(grep secret_access_key "$BUCKET_DIR/.shoebox/config.toml" | head -1 | cut -d'"' -f2)
-export AWS_ENDPOINT_URL="$ENDPOINT"
+extract_credentials "$BUCKET_DIR"
+setup_aws_env "$ACCESS_KEY" "$SECRET_KEY" "$ENDPOINT"
 
 AWS="aws --endpoint-url $ENDPOINT"
 
-# ============================================================================
-# Part 1 — Upload objects (aws s3 cp)
-# ============================================================================
+# --- Parts ------------------------------------------------------------------
 
-banner "Core S3 Operations — Upload"
+p01_upload() {
+  note "aws s3 cp uploads files via PutObject, just like real S3."
 
-note "aws s3 cp uploads files via PutObject, just like real S3."
-sleep "$DELAY"
+  step "Upload a text file"
+  echo "Hello from shoebox!" > "$DEMO_ROOT/hello.txt"
+  run "$AWS s3 cp '$DEMO_ROOT/hello.txt' s3://photos/hello.txt"
 
-step "Upload a text file"
-echo "Hello from shoebox!" > "$DEMO_ROOT/hello.txt"
-run "$AWS s3 cp '$DEMO_ROOT/hello.txt' s3://photos/hello.txt"
+  step "Upload a JSON file with custom content type"
+  echo '{"name":"shoebox","version":"0.1"}' > "$DEMO_ROOT/info.json"
+  run "$AWS s3 cp '$DEMO_ROOT/info.json' s3://photos/info.json --content-type application/json"
 
-step "Upload a JSON file with custom content type"
-echo '{"name":"shoebox","version":"0.1"}' > "$DEMO_ROOT/info.json"
-run "$AWS s3 cp '$DEMO_ROOT/info.json' s3://photos/info.json --content-type application/json"
+  step "Upload several files into a sub-prefix (vacation/)"
+  mkdir -p "$DEMO_ROOT/vacation"
+  for f in beach.jpg sunset.jpg poolside.jpg; do
+    echo "binary-data-placeholder-for-$f" > "$DEMO_ROOT/vacation/$f"
+  done
+  run "$AWS s3 cp '$DEMO_ROOT/vacation/' s3://photos/vacation/ --recursive"
 
-step "Upload several files into a sub-prefix (vacation/)"
-mkdir -p "$DEMO_ROOT/vacation"
-for f in beach.jpg sunset.jpg poolside.jpg; do
-  echo "binary-data-placeholder-for-$f" > "$DEMO_ROOT/vacation/$f"
-done
-run "$AWS s3 cp '$DEMO_ROOT/vacation/' s3://photos/vacation/ --recursive"
+  ok "5 objects uploaded."
+}
+part p01_upload "Core S3 Operations — Upload"
 
-ok "5 objects uploaded."
+p02_list_buckets() {
+  note "aws s3 ls (no path) calls ListBuckets — just like real AWS."
 
-# ============================================================================
-# Part 2 — List buckets
-# ============================================================================
+  step "List all buckets"
+  run "$AWS s3 ls"
 
-banner "Bucket Operations"
+  step "Check bucket exists (s3api head-bucket)"
+  run "$AWS s3api head-bucket --bucket photos"
 
-note "aws s3 ls (no path) calls ListBuckets — just like real AWS."
-sleep "$DELAY"
+  step "Non-existent bucket returns an error"
+  run "$AWS s3api head-bucket --bucket no-such-bucket 2>&1 || true"
+}
+part p02_list_buckets "Bucket Operations"
 
-step "List all buckets"
-run "$AWS s3 ls"
+p03_list_objects() {
+  note "aws s3 ls uses delimiter=/ by default (shows 'directories')."
 
-step "Check bucket exists (s3api head-bucket)"
-run "$AWS s3api head-bucket --bucket photos"
+  step "List top-level (delimiter=/)"
+  run "$AWS s3 ls s3://photos/"
 
-step "Non-existent bucket returns an error"
-run "$AWS s3api head-bucket --bucket no-such-bucket 2>&1 || true"
+  step "List under vacation/ prefix"
+  run "$AWS s3 ls s3://photos/vacation/"
 
-# ============================================================================
-# Part 3 — List objects (ListObjectsV2)
-# ============================================================================
+  step "Recursive listing (no delimiter — flat list)"
+  run "$AWS s3 ls s3://photos/ --recursive"
 
-banner "ListObjectsV2 — Prefix, Delimiter, Pagination"
+  step "Pagination with s3api: page-size=2"
+  run "$AWS s3api list-objects-v2 --bucket photos --page-size 2 --max-items 2"
 
-note "aws s3 ls uses delimiter=/ by default (shows 'directories')."
-sleep "$DELAY"
+  note "NextToken in the output can be passed with --starting-token to fetch the next page."
+  NEXT_TOKEN=$($AWS s3api list-objects-v2 --bucket photos --page-size 2 --max-items 2 \
+    | grep -o '"NextToken": "[^"]*"' | cut -d'"' -f4 || true)
+  if [[ -n "$NEXT_TOKEN" ]]; then
+    step "Fetch page 2 with --starting-token"
+    run "$AWS s3api list-objects-v2 --bucket photos --page-size 2 --max-items 2 --starting-token '$NEXT_TOKEN'"
+  fi
+}
+part p03_list_objects "ListObjectsV2 — Prefix, Delimiter, Pagination"
 
-step "List top-level (delimiter=/)"
-run "$AWS s3 ls s3://photos/"
+p04_download() {
+  note "aws s3 cp from s3:// downloads via GetObject."
 
-step "List under vacation/ prefix"
-run "$AWS s3 ls s3://photos/vacation/"
+  step "Download hello.txt"
+  run "$AWS s3 cp s3://photos/hello.txt '$DEMO_ROOT/downloaded.txt'"
+  step "Verify contents"
+  run "cat '$DEMO_ROOT/downloaded.txt'"
 
-step "Recursive listing (no delimiter — flat list)"
-run "$AWS s3 ls s3://photos/ --recursive"
+  step "Download the vacation/ prefix recursively"
+  run "$AWS s3 cp s3://photos/vacation/ '$DEMO_ROOT/downloaded-vacation/' --recursive"
+  run "ls -l '$DEMO_ROOT/downloaded-vacation/'"
+}
+part p04_download "Download Objects"
 
-step "Pagination with s3api: page-size=2"
-run "$AWS s3api list-objects-v2 --bucket photos --page-size 2 --max-items 2"
+p05_inspect() {
+  note "s3api head-object returns metadata as JSON — no body downloaded."
 
-note "NextToken in the output can be passed with --starting-token to fetch the next page."
-NEXT_TOKEN=$($AWS s3api list-objects-v2 --bucket photos --page-size 2 --max-items 2 \
-  | grep -o '"NextToken": "[^"]*"' | cut -d'"' -f4 || true)
-if [[ -n "$NEXT_TOKEN" ]]; then
-  step "Fetch page 2 with --starting-token"
-  run "$AWS s3api list-objects-v2 --bucket photos --page-size 2 --max-items 2 --starting-token '$NEXT_TOKEN'"
-fi
+  step "Head hello.txt"
+  run "$AWS s3api head-object --bucket photos --key hello.txt"
 
-# ============================================================================
-# Part 4 — Download objects (aws s3 cp)
-# ============================================================================
+  step "Head info.json"
+  run "$AWS s3api head-object --bucket photos --key info.json"
 
-banner "Download Objects"
+  step "Head a non-existent key (returns 404)"
+  run "$AWS s3api head-object --bucket photos --key does-not-exist.txt 2>&1 || true"
+}
+part p05_inspect "Inspect Object Metadata"
 
-note "aws s3 cp from s3:// downloads via GetObject."
-sleep "$DELAY"
+p06_delete() {
+  note "aws s3 rm deletes a single object via DeleteObject."
 
-step "Download hello.txt"
-run "$AWS s3 cp s3://photos/hello.txt '$DEMO_ROOT/downloaded.txt'"
-step "Verify contents"
-run "cat '$DEMO_ROOT/downloaded.txt'"
+  step "Delete hello.txt"
+  run "$AWS s3 rm s3://photos/hello.txt"
 
-step "Download the vacation/ prefix recursively"
-run "$AWS s3 cp s3://photos/vacation/ '$DEMO_ROOT/downloaded-vacation/' --recursive"
-run "ls -l '$DEMO_ROOT/downloaded-vacation/'"
+  step "Verify it's gone"
+  run "$AWS s3 ls s3://photos/ --recursive"
 
-# ============================================================================
-# Part 5 — Inspect objects (HeadObject)
-# ============================================================================
+  step "Bulk-delete vacation/ with --recursive (uses DeleteObjects API)"
+  run "$AWS s3 rm s3://photos/vacation/ --recursive"
 
-banner "Inspect Object Metadata"
+  step "List remaining objects (should be 1: info.json)"
+  run "$AWS s3 ls s3://photos/ --recursive"
+}
+part p06_delete "Delete Operations"
 
-note "s3api head-object returns metadata as JSON — no body downloaded."
-sleep "$DELAY"
+p99_done() {
+  echo ""
+  ok "All Current S3 operations verified with the standard AWS CLI."
+  ok "shoebox is a drop-in local replacement for S3."
+  echo ""
+}
+part p99_done "Done!"
 
-step "Head hello.txt"
-run "$AWS s3api head-object --bucket photos --key hello.txt"
+# --- Run --------------------------------------------------------------------
 
-step "Head info.json"
-run "$AWS s3api head-object --bucket photos --key info.json"
-
-step "Head a non-existent key (returns 404)"
-run "$AWS s3api head-object --bucket photos --key does-not-exist.txt 2>&1 || true"
-
-# ============================================================================
-# Part 6 — Delete operations
-# ============================================================================
-
-banner "Delete Operations"
-
-note "aws s3 rm deletes a single object via DeleteObject."
-sleep "$DELAY"
-
-step "Delete hello.txt"
-run "$AWS s3 rm s3://photos/hello.txt"
-
-step "Verify it's gone"
-run "$AWS s3 ls s3://photos/ --recursive"
-
-step "Bulk-delete vacation/ with --recursive (uses DeleteObjects API)"
-run "$AWS s3 rm s3://photos/vacation/ --recursive"
-
-step "List remaining objects (should be 1: info.json)"
-run "$AWS s3 ls s3://photos/ --recursive"
-
-# ============================================================================
-# Done
-# ============================================================================
-
-banner "Done!"
-
-echo ""
-ok "All Current S3 operations verified with the standard AWS CLI."
-ok "shoebox is a drop-in local replacement for S3."
-echo ""
-sleep "$END_DELAY"
+run_demo
