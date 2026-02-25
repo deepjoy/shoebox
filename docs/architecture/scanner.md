@@ -55,16 +55,17 @@ graph LR
 
 ### L2 — Metadata (`scan_l2`)
 
-- Operates on a list of keys (from the scheduler or queried as `scan_level < 2`).
+- Receives a pre-fetched list of keys from the worker (see [Batch limits](#batch-limits-and-continuation)).
 - Calls `stat()` / `symlink_metadata()` on each file.
 - Collects: `size`, `file_mtime`, `file_ctime`, `inode`, `device_id`.
 - Platform-specific identity extraction via `platform::file_identity()` (Unix inode/dev, Windows file_index/volume_serial).
 - Batched updates, same size/timeout thresholds as L1.
+- Logs per-file progress with `[i/total]` format.
 - Sets `scan_level = 2`.
 
 ### L3 — Content hash (`scan_l3`)
 
-- Operates on a list of keys (from the scheduler or queried as `scan_level < 3`).
+- Receives a pre-fetched list of keys from the worker (see [Batch limits](#batch-limits-and-continuation)).
 - Streams file contents through dual hashers in a single pass:
   - **MD5** → stored as the S3 `ETag` (quoted hex).
   - **SHA-256** → stored as `content_hash` (`sha256:<hex>`).
@@ -102,6 +103,26 @@ stateDiagram-v2
 ### Preemption
 
 When a `Realtime` (P0) job is scheduled, all currently active non-Realtime jobs are moved back to `Paused` status and re-queued. This ensures API-triggered scans get immediate attention.
+
+## Batch limits and continuation
+
+To prevent memory pressure and allow interleaving with higher-priority work, the worker caps the number of keys processed per job:
+
+| Level | Batch limit | Constant |
+|-------|-------------|----------|
+| L2 — Metadata | 10,000 keys | `L2_BATCH_LIMIT` |
+| L3 — Content | 1,000 keys | `L3_BATCH_LIMIT` |
+
+The worker queries `list_keys_below_scan_level(level, limit)` to fetch the next batch. When the returned key count reaches the limit, `execute_scan_job` returns `has_remaining = true` and the worker schedules a **continuation job** with the same priority, scope, and target level. This repeats until all keys are processed.
+
+```mermaid
+graph LR
+    JOB1["Job (L3, 1000 keys)"] -->|has_remaining=true| JOB2["Continuation job<br>(same priority/scope)"]
+    JOB2 -->|has_remaining=true| JOB3["Continuation job"]
+    JOB3 -->|has_remaining=false| DONE[All keys processed]
+```
+
+Between continuation jobs the scheduler can interleave higher-priority work (e.g. a `Realtime` API-triggered scan), and backpressure checks run normally. `Files` scopes bypass batch limits since the caller already provides a bounded key list.
 
 ## Scan scope
 
@@ -225,7 +246,12 @@ sequenceDiagram
     S-->>W: Reconcile/Bucket/Content job
 
     W->>W: execute_scan_job()
-    Note over W: L1 → L2 → L3 sequentially
+    Note over W: L1 → L2 (≤10K) → L3 (≤1K)
+
+    alt has_remaining = true
+        W->>S: schedule continuation job
+        Note over W: Next poll picks up continuation
+    end
 
     Note over FW: Concurrent with scan
     FW-->>WP: WatchEvent::Changed(path)
