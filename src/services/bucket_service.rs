@@ -16,7 +16,6 @@ use crate::storage::FilesystemStorage;
 /// Holds both the core S3 state (storage, metadata, config) and scanner
 /// state (watcher, scheduler). Used by both the HTTP layer (`AppState`)
 /// and the library API (`Shoebox`).
-#[non_exhaustive]
 pub struct LoadedBucket {
     pub name: String,
     pub config: BucketConfig,
@@ -28,28 +27,6 @@ pub struct LoadedBucket {
     pub watcher: Option<FilesystemWatcher>,
     /// Scanner job scheduler for background L2/L3 scans.
     pub scheduler: Arc<Mutex<ScanScheduler>>,
-}
-
-impl LoadedBucket {
-    pub fn new(
-        name: String,
-        config: BucketConfig,
-        storage: FilesystemStorage,
-        metadata: MetadataStore,
-        parts_dir: std::path::PathBuf,
-        watcher: Option<FilesystemWatcher>,
-        scheduler: Arc<Mutex<ScanScheduler>>,
-    ) -> Self {
-        Self {
-            name,
-            config,
-            storage,
-            metadata,
-            parts_dir,
-            watcher,
-            scheduler,
-        }
-    }
 }
 
 /// Shared application state passed to all handlers.

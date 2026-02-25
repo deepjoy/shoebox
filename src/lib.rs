@@ -460,15 +460,15 @@ impl ShoeboxBuilder {
 
             buckets.insert(
                 state.name.clone(),
-                LoadedBucket::new(
-                    state.name,
-                    state.config,
+                LoadedBucket {
+                    name: state.name,
+                    config: state.config,
                     storage,
                     metadata,
                     parts_dir,
                     watcher,
                     scheduler,
-                ),
+                },
             );
         }
 
