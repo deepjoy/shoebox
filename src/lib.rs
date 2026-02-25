@@ -451,15 +451,15 @@ impl ShoeboxBuilder {
 
             buckets.insert(
                 state.name.clone(),
-                LoadedBucket {
-                    name: state.name,
-                    config: state.config,
+                LoadedBucket::new(
+                    state.name,
+                    state.config,
                     storage,
                     metadata,
                     parts_dir,
                     watcher,
                     scheduler,
-                },
+                ),
             );
         }
 
