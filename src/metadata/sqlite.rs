@@ -706,6 +706,64 @@ impl MetadataStore {
         Ok(rows.into_iter().map(|(k,)| k).collect())
     }
 
+    /// List object keys with sizes, with scan_level below the given threshold,
+    /// accumulating until a byte budget is reached.
+    ///
+    /// Returns `(keys, exhausted)` where `exhausted` is true when fewer rows
+    /// remain than the safety cap (i.e. all remaining work fits in this batch).
+    /// Rows are fetched up to a 10,000-row safety cap and accumulated in memory
+    /// until `byte_budget` is exceeded.
+    pub async fn list_keys_by_byte_budget(
+        &self,
+        level: i32,
+        byte_budget: i64,
+        after_key: Option<&str>,
+    ) -> Result<(Vec<String>, bool, i64), S3Error> {
+        const ROW_CAP: i64 = 10_000;
+
+        let rows: Vec<(String, i64)> = match after_key {
+            Some(key) => {
+                sqlx::query_as(
+                    "SELECT key, COALESCE(size, 0) FROM objects WHERE scan_level < ? AND key > ? ORDER BY key LIMIT ?",
+                )
+                .bind(level)
+                .bind(key)
+                .bind(ROW_CAP)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT key, COALESCE(size, 0) FROM objects WHERE scan_level < ? ORDER BY key LIMIT ?",
+                )
+                .bind(level)
+                .bind(ROW_CAP)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        let hit_row_cap = rows.len() as i64 >= ROW_CAP;
+        let mut keys = Vec::new();
+        let mut cumulative: i64 = 0;
+        let mut budget_exceeded = false;
+
+        for (key, size) in &rows {
+            // Always include at least one file (even if it alone exceeds budget)
+            if budget_exceeded {
+                break;
+            }
+            cumulative += size;
+            keys.push(key.clone());
+            if cumulative >= byte_budget {
+                budget_exceeded = true;
+            }
+        }
+
+        let exhausted = !budget_exceeded && !hit_row_cap;
+        Ok((keys, exhausted, cumulative))
+    }
+
     /// Begin an L1 scan session by acquiring a dedicated connection and creating
     /// a temp table to collect discovered disk keys. The returned connection must
     /// be reused for all subsequent `l1_scan_*` calls so the temp table remains

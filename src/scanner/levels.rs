@@ -308,118 +308,169 @@ pub async fn scan_l2(
     Ok(report)
 }
 
-/// L3: Read file and compute hashes (MD5 for ETag, SHA-256 for content_hash).
+/// Result of hashing a single file.
+enum L3FileResult {
+    Hashed {
+        key: String,
+        etag: String,
+        content_hash: String,
+        size: u64,
+    },
+    Skipped,
+}
+
+/// Hash a single file, computing MD5 (ETag) and SHA-256 (content_hash).
+///
+/// Returns `L3FileResult::Hashed` on success or `L3FileResult::Skipped` if the
+/// file is missing, unreadable, a directory, or was modified during the scan.
+async fn hash_one_file(root: &Path, key: &str, index: usize, total: usize) -> L3FileResult {
+    let path = root.join(key);
+
+    // Record mtime before reading
+    let pre_meta = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!("L3 scan: skipping dangling symlink {key}");
+            return L3FileResult::Skipped;
+        }
+        Err(e) => {
+            tracing::warn!("L3 scan: cannot access {key}: {e}");
+            return L3FileResult::Skipped;
+        }
+    };
+
+    // Skip directories (e.g. symlinks whose target is a directory)
+    if pre_meta.is_dir() {
+        return L3FileResult::Skipped;
+    }
+
+    let mtime_before = pre_meta.modified().ok();
+
+    // Stream through MD5 and SHA-256
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("L3 scan: cannot open {key}: {e}");
+            return L3FileResult::Skipped;
+        }
+    };
+    let mut reader = tokio::io::BufReader::new(file);
+
+    let mut md5_hasher = Md5::new();
+    let mut sha256_hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut size = 0u64;
+    let mut read_error = false;
+
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("L3 scan: read error for {key}: {e}");
+                read_error = true;
+                break;
+            }
+        };
+        md5_hasher.update(&buf[..n]);
+        sha256_hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+
+    if read_error {
+        return L3FileResult::Skipped;
+    }
+
+    // Verify mtime unchanged (file wasn't modified during scan)
+    let mtime_after = tokio::fs::metadata(&path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok());
+
+    if mtime_before != mtime_after {
+        tracing::debug!(
+            key = %key,
+            progress = format_args!("[{}/{}]", index + 1, total),
+            "L3 skipped (modified during scan)"
+        );
+        return L3FileResult::Skipped;
+    }
+
+    let etag = format!("\"{}\"", hex::encode(md5_hasher.finalize()));
+    let content_hash = format!("sha256:{}", hex::encode(sha256_hasher.finalize()));
+
+    tracing::debug!(
+        key = %key,
+        size = format_human_size(size),
+        progress = format_args!("[{}/{}]", index + 1, total),
+        "L3 hash complete"
+    );
+
+    L3FileResult::Hashed {
+        key: key.to_string(),
+        etag,
+        content_hash,
+        size,
+    }
+}
+
+/// L3: Read files and compute hashes (MD5 for ETag, SHA-256 for content_hash).
+///
+/// Files are hashed concurrently using `buffer_unordered(concurrency)`.
+/// Use higher concurrency for small files (syscall-bound) and lower for large
+/// files (I/O-bound).
 pub async fn scan_l3(
     metadata: &MetadataStore,
     root: &Path,
     keys: &[String],
+    concurrency: usize,
 ) -> Result<L3Report, S3Error> {
     let mut report = L3Report::default();
     let total = keys.len();
 
     if total > 1 {
-        tracing::info!(files = total, "L3 content-hash scan starting");
+        tracing::info!(files = total, concurrency, "L3 content-hash scan starting");
     } else {
-        tracing::debug!(files = total, "L3 content-hash scan starting");
+        tracing::debug!(files = total, concurrency, "L3 content-hash scan starting");
     }
 
+    // Hash files concurrently — clone keys up-front so the futures are 'static
+    let root = root.to_owned();
+    let tasks: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let root = root.clone();
+            let key = key.clone();
+            async move { hash_one_file(&root, &key, i, total).await }
+        })
+        .collect();
+    let results: Vec<L3FileResult> = futures::stream::iter(tasks)
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
+    // Batch-write results to the database
     let mut batch: Vec<(String, String, String, i32)> = Vec::with_capacity(BATCH_SIZE);
-    let mut batch_start = std::time::Instant::now();
-
-    for (i, key) in keys.iter().enumerate() {
-        let path = root.join(key);
-
-        // Record mtime before reading
-        let pre_meta = match tokio::fs::metadata(&path).await {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::debug!("L3 scan: skipping dangling symlink {key}");
-                report.skipped += 1;
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!("L3 scan: cannot access {key}: {e}");
-                report.skipped += 1;
-                continue;
-            }
-        };
-
-        // Skip directories (e.g. symlinks whose target is a directory)
-        if pre_meta.is_dir() {
-            report.skipped += 1;
-            continue;
-        }
-
-        let mtime_before = pre_meta.modified().ok();
-
-        // Stream through MD5 and SHA-256
-        let file = match tokio::fs::File::open(&path).await {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!("L3 scan: cannot open {key}: {e}");
-                report.skipped += 1;
-                continue;
-            }
-        };
-        let mut reader = tokio::io::BufReader::new(file);
-
-        let mut md5_hasher = Md5::new();
-        let mut sha256_hasher = Sha256::new();
-        let mut buf = [0u8; 64 * 1024];
-        let mut size = 0u64;
-
-        loop {
-            let n = match reader.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!("L3 scan: read error for {key}: {e}");
-                    report.skipped += 1;
-                    break;
+    for result in results {
+        match result {
+            L3FileResult::Hashed {
+                key,
+                etag,
+                content_hash,
+                size,
+            } => {
+                report.hashed += 1;
+                report.bytes += size;
+                batch.push((key, etag, content_hash, 3));
+                if batch.len() >= BATCH_SIZE {
+                    metadata.update_objects_hashes_batch(&batch).await?;
+                    batch.clear();
                 }
-            };
-            md5_hasher.update(&buf[..n]);
-            sha256_hasher.update(&buf[..n]);
-            size += n as u64;
-        }
-
-        // Verify mtime unchanged (file wasn't modified during scan)
-        let mtime_after = tokio::fs::metadata(&path)
-            .await
-            .ok()
-            .and_then(|m| m.modified().ok());
-
-        if mtime_before != mtime_after {
-            tracing::debug!(
-                key = %key,
-                progress = format_args!("[{}/{}]", i + 1, total),
-                "L3 skipped (modified during scan)"
-            );
-            report.skipped += 1;
-            continue;
-        }
-
-        let etag = format!("\"{}\"", hex::encode(md5_hasher.finalize()));
-        let content_hash = format!("sha256:{}", hex::encode(sha256_hasher.finalize()));
-
-        report.hashed += 1;
-        report.bytes += size;
-
-        batch.push((key.clone(), etag, content_hash, 3));
-
-        tracing::debug!(
-            key = %key,
-            size = format_human_size(size),
-            progress = format_args!("[{}/{}]", i + 1, total),
-            "L3 hash complete"
-        );
-
-        if batch.len() >= BATCH_SIZE
-            || (!batch.is_empty() && batch_start.elapsed() >= BATCH_TIMEOUT)
-        {
-            metadata.update_objects_hashes_batch(&batch).await?;
-            batch.clear();
-            batch_start = std::time::Instant::now();
+            }
+            L3FileResult::Skipped => {
+                report.skipped += 1;
+            }
         }
     }
 
@@ -607,7 +658,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = scan_l3(&store, &bucket_root, &["file.txt".to_string()])
+        let report = scan_l3(&store, &bucket_root, &["file.txt".to_string()], 1)
             .await
             .unwrap();
         assert_eq!(report.hashed, 1);

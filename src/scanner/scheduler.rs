@@ -68,6 +68,10 @@ pub struct ScanJob {
     pub l2_cursor: Option<String>,
     /// Keyset pagination cursor for L3 — when set, L3 queries skip keys ≤ this value.
     pub l3_cursor: Option<String>,
+    /// Estimated L3 throughput from the previous batch (bytes/sec).
+    /// Used to compute the byte budget for the next L3 batch so each batch
+    /// targets ~2 minutes of wall-clock time.
+    pub l3_bytes_per_sec: Option<f64>,
 }
 
 impl ScanJob {
@@ -81,6 +85,7 @@ impl ScanJob {
             status: JobStatus::Pending,
             l2_cursor: None,
             l3_cursor: None,
+            l3_bytes_per_sec: None,
         }
     }
 
@@ -91,10 +96,12 @@ impl ScanJob {
         target_level: ScanLevel,
         l2_cursor: Option<String>,
         l3_cursor: Option<String>,
+        l3_bytes_per_sec: Option<f64>,
     ) -> Self {
         Self {
             l2_cursor,
             l3_cursor,
+            l3_bytes_per_sec,
             ..Self::new(priority, scope, target_level)
         }
     }

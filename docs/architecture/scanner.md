@@ -67,12 +67,14 @@ graph LR
 
 ### L3 — Content hash (`scan_l3`)
 
-- Receives a pre-fetched list of keys from the worker (see [Batch limits](#batch-limits-and-continuation)).
-- Streams file contents through dual hashers in a single pass:
-  - **MD5** → stored as the S3 `ETag` (quoted hex).
-  - **SHA-256** → stored as `content_hash` (`sha256:<hex>`).
-- Uses 64 KB read buffer for streaming I/O.
-- **Integrity check**: records `mtime` before and after reading. If the file was modified during the scan, the result is discarded and the file is skipped.
+- Receives a pre-fetched list of keys and a **concurrency** level from the worker (see [Batch limits](#batch-limits-and-continuation)).
+- Hashes files **concurrently** using `futures::stream::buffer_unordered(concurrency)`. Each file is processed by `hash_one_file()`, which:
+  - Streams file contents through dual hashers in a single pass:
+    - **MD5** → stored as the S3 `ETag` (quoted hex).
+    - **SHA-256** → stored as `content_hash` (`sha256:<hex>`).
+  - Uses 64 KB read buffer for streaming I/O.
+  - **Integrity check**: records `mtime` before and after reading. If the file was modified during the scan, the result is discarded and the file is skipped.
+- After all files in the batch are hashed, results are written to the database in chunks of `BATCH_SIZE`.
 - Sets `scan_level = 3`.
 
 ## Scheduler
@@ -108,19 +110,48 @@ When a `Realtime` (P0) job is scheduled, all currently active non-Realtime jobs 
 
 ## Batch limits and continuation
 
-To prevent memory pressure and allow interleaving with higher-priority work, the worker caps the number of keys processed per job:
+To prevent memory pressure and allow interleaving with higher-priority work, the worker caps work per job:
 
-| Level | Batch limit | Constant |
-|-------|-------------|----------|
-| L2 — Metadata | 10,000 keys | `L2_BATCH_LIMIT` |
-| L3 — Content | 1,000 keys | `L3_BATCH_LIMIT` |
+| Level | Batching strategy |
+|-------|-------------------|
+| L2 — Metadata | Fixed count: 10,000 keys (`L2_BATCH_LIMIT`) |
+| L3 — Content | **Adaptive byte budget** targeting ~2 minutes per batch |
 
-The worker queries `list_keys_below_scan_level(level, limit, after_key)` to fetch the next batch. L2 and L3 use **independent cursors** (`l2_cursor` and `l3_cursor`) so each level advances through the keyspace at its own pace. When either level's returned key count reaches its limit, `execute_scan_job` returns `has_remaining=true` and the worker schedules a **continuation job** carrying both cursors so the next query uses keyset pagination (`WHERE key > ?`) to skip directly to unprocessed work. This repeats until all keys are processed.
+### L2 batching
+
+L2 uses `list_keys_below_scan_level(level, limit, after_key)` to fetch the next batch by key count.
+
+### L3 adaptive byte budget
+
+L3 batches are sized by **total bytes** rather than file count, so each batch takes roughly the same wall-clock time regardless of whether it contains many small files or a few large ones.
+
+1. **Seed batch**: The first L3 batch uses a 50 MB byte budget (`L3_SEED_BYTES`) to calibrate throughput.
+2. **Measure**: After each batch, the worker computes `bytes_per_sec` from elapsed time and total bytes attempted (including skipped files).
+3. **Smooth**: The throughput estimate is updated using an exponential weighted moving average (EWMA, α=0.3). The first batch sets the baseline directly; subsequent batches blend 30% new measurement with 70% previous estimate to dampen oscillations from cache effects, file size skew, and other I/O variability.
+4. **Adapt**: The next batch's byte budget is set to `smoothed_bytes_per_sec × 120s` (2-minute target), capped at 50 GB (`L3_MAX_BUDGET`).
+5. **Carry forward**: The smoothed throughput estimate (`l3_bytes_per_sec`) is passed to continuation jobs so it persists across batches.
+
+The worker queries `list_keys_by_byte_budget(level, byte_budget, after_key)` which fetches keys with their sizes and accumulates until the budget is exceeded (with a 10,000-row safety cap).
+
+### L3 concurrency
+
+L3 hashing concurrency is determined by average file size in the batch. Smaller files are syscall-bound and benefit from parallelism; larger files are I/O-bound and run sequentially.
+
+| Avg file size | Concurrency |
+|---------------|-------------|
+| ≤ 500 KB | 32 |
+| 500 KB – 1 MB | 16 |
+| 1 – 8 MB | 8 |
+| > 8 MB | 1 |
+
+### Continuation jobs
+
+L2 and L3 use **independent cursors** (`l2_cursor` and `l3_cursor`) so each level advances through the keyspace at its own pace. When either level has remaining work, `execute_scan_job` returns `has_remaining=true` and the worker schedules a **continuation job** carrying both cursors and the L3 throughput estimate, so the next query uses keyset pagination (`WHERE key > ?`) to skip directly to unprocessed work.
 
 ```mermaid
 graph LR
-    JOB1["Job (L2: 10k, L3: 1k)"] -->|l2='m.jpg', l3='b.txt'| JOB2["Continuation job"]
-    JOB2 -->|l2='z.txt', l3='m.jpg'| JOB3["Continuation job"]
+    JOB1["Job (L2: 10k, L3: 50MB seed)"] -->|cursors + throughput| JOB2["Continuation (budget: rate×2min)"]
+    JOB2 -->|cursors + throughput| JOB3["Continuation (budget: rate×2min)"]
     JOB3 -->|has_remaining=false| DONE[All keys processed]
 ```
 
@@ -197,12 +228,13 @@ For changed files, the processor calls `reset_scan_level(key, 1)` to mark the ob
 
 ## Checkpointing
 
-`ScanJob` tracks progress via independent keyset pagination cursors:
+`ScanJob` tracks progress via independent keyset pagination cursors and throughput state:
 
 - `l2_cursor` — the last key processed by L2 metadata scans.
 - `l3_cursor` — the last key processed by L3 content-hash scans.
+- `l3_bytes_per_sec` — measured L3 throughput used to size the next batch's byte budget.
 
-When a batch completes with remaining work, the continuation job carries both cursors so each level resumes from its own position rather than sharing a single cursor.
+When a batch completes with remaining work, the continuation job carries all three values so each level resumes from its own position and L3 batches stay calibrated.
 
 ## Database schema
 
@@ -248,7 +280,7 @@ sequenceDiagram
     S-->>W: Reconcile/Bucket/Content job
 
     W->>W: execute_scan_job()
-    Note over W: L1 → L2 (≤10K) → L3 (≤1K)
+    Note over W: L1 → L2 (≤10K) → L3 (byte budget)
 
     alt has_remaining = true
         W->>S: schedule continuation job
