@@ -1030,9 +1030,11 @@ mod tests {
         // Add a new file
         std::fs::write(bucket_dir.join("b.txt"), "b").unwrap();
 
-        // Re-scan should find the new file
+        // Re-scan should see 2 total files. The new file may have been
+        // discovered by the background filesystem watcher before scan_l1
+        // runs, so we check the total rather than asserting discovered == 1.
         let report = shoebox.scan_l1("scantest").await.unwrap();
-        assert_eq!(report.discovered, 1);
+        assert_eq!(report.discovered + report.unchanged, 2);
     }
 
     #[tokio::test]
