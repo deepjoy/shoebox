@@ -32,6 +32,7 @@ pub fn create_router(state: AppState) -> Router {
             "/_shoebox/reload",
             post(crate::api::credentials::reload_config),
         )
+        .route("/_shoebox/scan/status", get(crate::api::scan::scan_status))
         // Bucket-level
         .route("/{bucket}", head(handlers::bucket::head_bucket))
         .route("/{bucket}", get(handlers::bucket::bucket_or_list))

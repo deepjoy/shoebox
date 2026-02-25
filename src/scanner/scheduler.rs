@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::scanner::scope::ScanScope;
 
 /// Scanner priority levels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[repr(u8)]
 pub enum Priority {
     /// API call waiting — blocks until complete. L2 max.
@@ -19,7 +19,7 @@ pub enum Priority {
 }
 
 /// Target scan depth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[repr(i32)]
 pub enum ScanLevel {
     Discovery = 1,
@@ -34,7 +34,7 @@ impl ScanLevel {
 }
 
 /// Job status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum JobStatus {
     Pending,
     Running,
@@ -56,7 +56,7 @@ impl JobStatus {
 }
 
 /// A single scan job in the priority queue.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanJob {
     pub id: Uuid,
     pub priority: Priority,
@@ -64,6 +64,10 @@ pub struct ScanJob {
     pub target_level: ScanLevel,
     pub created_at: OffsetDateTime,
     pub status: JobStatus,
+    /// Keyset pagination cursor for L2 — when set, L2 queries skip keys ≤ this value.
+    pub l2_cursor: Option<String>,
+    /// Keyset pagination cursor for L3 — when set, L3 queries skip keys ≤ this value.
+    pub l3_cursor: Option<String>,
 }
 
 impl ScanJob {
@@ -75,7 +79,29 @@ impl ScanJob {
             target_level,
             created_at: OffsetDateTime::now_utc(),
             status: JobStatus::Pending,
+            l2_cursor: None,
+            l3_cursor: None,
         }
+    }
+
+    /// Create a continuation job that resumes from where the previous batch left off.
+    pub fn new_continuation(
+        priority: Priority,
+        scope: ScanScope,
+        target_level: ScanLevel,
+        l2_cursor: Option<String>,
+        l3_cursor: Option<String>,
+    ) -> Self {
+        Self {
+            l2_cursor,
+            l3_cursor,
+            ..Self::new(priority, scope, target_level)
+        }
+    }
+
+    /// Returns true when this is a continuation of a previous batch.
+    pub fn is_continuation(&self) -> bool {
+        self.l2_cursor.is_some() || self.l3_cursor.is_some()
     }
 }
 
@@ -163,6 +189,16 @@ impl ScanScheduler {
     /// Check if there are pending jobs.
     pub fn has_pending(&self) -> bool {
         !self.jobs.is_empty()
+    }
+
+    /// Return a snapshot of all currently active (running) jobs.
+    pub fn active_jobs(&self) -> Vec<&ScanJob> {
+        self.active.values().collect()
+    }
+
+    /// Return a snapshot of all pending jobs in the queue.
+    pub fn pending_jobs(&self) -> Vec<&ScanJob> {
+        self.jobs.iter().collect()
     }
 
     /// Preempt lower priority jobs by moving them back to pending.

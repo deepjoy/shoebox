@@ -653,18 +653,55 @@ impl MetadataStore {
     // Scanner Methods (Phase 6)
     // -------------------------------------------------------------------------
 
+    /// Count files and total bytes remaining below a given scan level.
+    ///
+    /// Returns `(file_count, total_bytes)` for objects with `scan_level < level`.
+    /// `total_bytes` sums the `size` column (NULLs are treated as 0).
+    pub async fn count_remaining_below_scan_level(
+        &self,
+        level: i32,
+    ) -> Result<(i64, i64), S3Error> {
+        let row: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM objects WHERE scan_level < ?",
+        )
+        .bind(level)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
     /// List object keys with scan_level below the given threshold.
+    ///
+    /// When `after_key` is provided, only keys lexicographically greater than it
+    /// are returned (keyset pagination). This lets continuation jobs skip
+    /// directly to unprocessed work instead of re-scanning the index from the
+    /// beginning.
     pub async fn list_keys_below_scan_level(
         &self,
         level: i32,
         limit: i64,
+        after_key: Option<&str>,
     ) -> Result<Vec<String>, S3Error> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT key FROM objects WHERE scan_level < ? ORDER BY key LIMIT ?")
+        let rows: Vec<(String,)> = match after_key {
+            Some(key) => {
+                sqlx::query_as(
+                    "SELECT key FROM objects WHERE scan_level < ? AND key > ? ORDER BY key LIMIT ?",
+                )
                 .bind(level)
+                .bind(key)
                 .bind(limit)
                 .fetch_all(&self.pool)
-                .await?;
+                .await?
+            }
+            None => {
+                sqlx::query_as("SELECT key FROM objects WHERE scan_level < ? ORDER BY key LIMIT ?")
+                    .bind(level)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
 
         Ok(rows.into_iter().map(|(k,)| k).collect())
     }

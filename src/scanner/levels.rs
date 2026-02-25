@@ -233,7 +233,11 @@ pub async fn scan_l2(
     let mut report = L2Report::default();
     let total = keys.len();
 
-    tracing::info!(files = total, "L2 metadata scan starting");
+    if total > 1 {
+        tracing::info!(files = total, "L2 metadata scan starting");
+    } else {
+        tracing::debug!(files = total, "L2 metadata scan starting");
+    }
 
     let mut batch: Vec<(String, ObjectMetadataUpdate)> = Vec::with_capacity(BATCH_SIZE);
     let mut batch_start = std::time::Instant::now();
@@ -266,7 +270,7 @@ pub async fn scan_l2(
         batch.push((key.clone(), update));
         report.updated += 1;
 
-        tracing::info!(
+        tracing::debug!(
             key = %key,
             size = size,
             progress = format_args!("[{}/{}]", i + 1, total),
@@ -287,11 +291,19 @@ pub async fn scan_l2(
         metadata.update_objects_metadata_batch(&batch).await?;
     }
 
-    tracing::info!(
-        updated = report.updated,
-        errors = report.errors,
-        "L2 metadata scan complete"
-    );
+    if total > 1 {
+        tracing::info!(
+            updated = report.updated,
+            errors = report.errors,
+            "L2 metadata scan complete"
+        );
+    } else {
+        tracing::debug!(
+            updated = report.updated,
+            errors = report.errors,
+            "L2 metadata scan complete"
+        );
+    }
 
     Ok(report)
 }
@@ -305,7 +317,11 @@ pub async fn scan_l3(
     let mut report = L3Report::default();
     let total = keys.len();
 
-    tracing::info!(files = total, "L3 content-hash scan starting");
+    if total > 1 {
+        tracing::info!(files = total, "L3 content-hash scan starting");
+    } else {
+        tracing::debug!(files = total, "L3 content-hash scan starting");
+    }
 
     let mut batch: Vec<(String, String, String, i32)> = Vec::with_capacity(BATCH_SIZE);
     let mut batch_start = std::time::Instant::now();
@@ -316,6 +332,11 @@ pub async fn scan_l3(
         // Record mtime before reading
         let pre_meta = match tokio::fs::metadata(&path).await {
             Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!("L3 scan: skipping dangling symlink {key}");
+                report.skipped += 1;
+                continue;
+            }
             Err(e) => {
                 tracing::warn!("L3 scan: cannot access {key}: {e}");
                 report.skipped += 1;
@@ -369,7 +390,7 @@ pub async fn scan_l3(
             .and_then(|m| m.modified().ok());
 
         if mtime_before != mtime_after {
-            tracing::info!(
+            tracing::debug!(
                 key = %key,
                 progress = format_args!("[{}/{}]", i + 1, total),
                 "L3 skipped (modified during scan)"
@@ -386,7 +407,7 @@ pub async fn scan_l3(
 
         batch.push((key.clone(), etag, content_hash, 3));
 
-        tracing::info!(
+        tracing::debug!(
             key = %key,
             size = format_human_size(size),
             progress = format_args!("[{}/{}]", i + 1, total),
@@ -407,18 +428,27 @@ pub async fn scan_l3(
         metadata.update_objects_hashes_batch(&batch).await?;
     }
 
-    tracing::info!(
-        hashed = report.hashed,
-        bytes = report.bytes,
-        skipped = report.skipped,
-        "L3 content-hash scan complete"
-    );
+    if total > 1 {
+        tracing::info!(
+            hashed = report.hashed,
+            bytes = format_human_size(report.bytes),
+            skipped = report.skipped,
+            "L3 content-hash scan complete"
+        );
+    } else {
+        tracing::debug!(
+            hashed = report.hashed,
+            bytes = format_human_size(report.bytes),
+            skipped = report.skipped,
+            "L3 content-hash scan complete"
+        );
+    }
 
     Ok(report)
 }
 
 /// Format bytes as a human-readable size string.
-fn format_human_size(bytes: u64) -> String {
+pub fn format_human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;

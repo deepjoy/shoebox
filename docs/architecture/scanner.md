@@ -115,16 +115,16 @@ To prevent memory pressure and allow interleaving with higher-priority work, the
 | L2 — Metadata | 10,000 keys | `L2_BATCH_LIMIT` |
 | L3 — Content | 1,000 keys | `L3_BATCH_LIMIT` |
 
-The worker queries `list_keys_below_scan_level(level, limit)` to fetch the next batch. When the returned key count reaches the limit, `execute_scan_job` returns `has_remaining = true` and the worker schedules a **continuation job** with the same priority, scope, and target level. This repeats until all keys are processed.
+The worker queries `list_keys_below_scan_level(level, limit, after_key)` to fetch the next batch. L2 and L3 use **independent cursors** (`l2_cursor` and `l3_cursor`) so each level advances through the keyspace at its own pace. When either level's returned key count reaches its limit, `execute_scan_job` returns `has_remaining=true` and the worker schedules a **continuation job** carrying both cursors so the next query uses keyset pagination (`WHERE key > ?`) to skip directly to unprocessed work. This repeats until all keys are processed.
 
 ```mermaid
 graph LR
-    JOB1["Job (L3, 1000 keys)"] -->|has_remaining=true| JOB2["Continuation job<br>(same priority/scope)"]
-    JOB2 -->|has_remaining=true| JOB3["Continuation job"]
+    JOB1["Job (L2: 10k, L3: 1k)"] -->|l2='m.jpg', l3='b.txt'| JOB2["Continuation job"]
+    JOB2 -->|l2='z.txt', l3='m.jpg'| JOB3["Continuation job"]
     JOB3 -->|has_remaining=false| DONE[All keys processed]
 ```
 
-Between continuation jobs the scheduler can interleave higher-priority work (e.g. a `Realtime` API-triggered scan), and backpressure checks run normally. `Files` scopes bypass batch limits since the caller already provides a bounded key list.
+Between continuation jobs the scheduler can interleave higher-priority work (e.g. a `Realtime` API-triggered scan), and backpressure checks run normally. `Files` scopes bypass batch limits since the caller already provides a bounded key list. L1 discovery only runs on the first batch (when the job is not a continuation) — continuation jobs skip L1 since the filesystem walk is already complete.
 
 ## Scan scope
 
@@ -197,12 +197,12 @@ For changed files, the processor calls `reset_scan_level(key, 1)` to mark the ob
 
 ## Checkpointing
 
-`ScanCheckpoint` tracks progress within a scan job for pause/resume support. It records:
+`ScanJob` tracks progress via independent keyset pagination cursors:
 
-- `last_processed_key` — the key of the last successfully processed file.
-- `files_completed` / `files_total` — for progress reporting.
+- `l2_cursor` — the last key processed by L2 metadata scans.
+- `l3_cursor` — the last key processed by L3 content-hash scans.
 
-When a job is preempted or the server shuts down, the checkpoint allows resumption from the last processed key rather than restarting from scratch.
+When a batch completes with remaining work, the continuation job carries both cursors so each level resumes from its own position rather than sharing a single cursor.
 
 ## Database schema
 

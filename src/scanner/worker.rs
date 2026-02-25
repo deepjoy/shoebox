@@ -69,23 +69,36 @@ pub async fn run_scan_workers(
             "Executing scan job"
         );
 
-        let result = execute_scan_job(&metadata, &root, &job.scope, job.target_level).await;
+        let result = execute_scan_job(
+            &metadata,
+            &root,
+            &job.scope,
+            job.target_level,
+            job.is_continuation(),
+            job.l2_cursor.as_deref(),
+            job.l3_cursor.as_deref(),
+        )
+        .await;
 
         {
             let mut sched = scheduler.lock().await;
             match result {
-                Ok(has_remaining) => {
+                Ok((has_remaining, l2_cursor, l3_cursor)) => {
                     sched.complete(job.id);
                     if has_remaining {
                         tracing::debug!(
                             priority = ?job.priority,
                             target_level = ?job.target_level,
+                            l2_cursor = ?l2_cursor,
+                            l3_cursor = ?l3_cursor,
                             "Batch limit reached, scheduling continuation job"
                         );
-                        sched.schedule(ScanJob::new(
+                        sched.schedule(ScanJob::new_continuation(
                             job.priority,
                             job.scope.clone(),
                             job.target_level,
+                            l2_cursor,
+                            l3_cursor,
                         ));
                     }
                 }
@@ -247,30 +260,44 @@ const L3_BATCH_LIMIT: i64 = 1_000;
 
 /// Execute a single scan job — runs L1, then optionally L2 and L3 up to target level.
 ///
-/// Returns `true` if there are remaining keys that need processing (i.e. the
-/// batch limit was reached and a continuation job should be scheduled).
+/// Returns `(has_remaining, l2_cursor, l3_cursor)`. When `has_remaining` is true
+/// the caller should schedule a continuation job carrying the cursors so the next
+/// batch can skip directly to unprocessed work via keyset pagination.
+///
+/// L2 and L3 use independent cursors so that each level advances through the
+/// keyspace at its own pace. Without this, L3 would inherit L2's cursor and
+/// skip files that L2 just promoted to level 2 but that still need L3 hashing.
 async fn execute_scan_job(
     metadata: &MetadataStore,
     root: &Path,
     scope: &ScanScope,
     target_level: ScanLevel,
-) -> Result<bool, S3Error> {
-    // L1 discovery is always needed for non-Files scopes
-    match scope {
-        ScanScope::Files(_) => {}
-        _ => {
-            levels::scan_l1(metadata, root, scope).await?;
+    is_continuation: bool,
+    l2_cursor: Option<&str>,
+    l3_cursor: Option<&str>,
+) -> Result<(bool, Option<String>, Option<String>), S3Error> {
+    // L1 discovery is always needed for non-Files scopes.
+    // Only run on the first batch — subsequent continuation jobs skip L1
+    // since discovery is already complete.
+    if !is_continuation {
+        match scope {
+            ScanScope::Files(_) => {}
+            _ => {
+                levels::scan_l1(metadata, root, scope).await?;
+            }
         }
     }
 
     let mut has_remaining = false;
+    let mut new_l2_cursor: Option<String> = l2_cursor.map(|s| s.to_string());
+    let mut new_l3_cursor: Option<String> = l3_cursor.map(|s| s.to_string());
 
     if target_level.as_i32() >= ScanLevel::Metadata.as_i32() {
         let keys = match scope {
             ScanScope::Files(keys) => keys.clone(),
             _ => {
                 let keys = metadata
-                    .list_keys_below_scan_level(2, L2_BATCH_LIMIT)
+                    .list_keys_below_scan_level(2, L2_BATCH_LIMIT, l2_cursor)
                     .await?;
                 if keys.len() as i64 >= L2_BATCH_LIMIT {
                     has_remaining = true;
@@ -278,6 +305,9 @@ async fn execute_scan_job(
                 keys
             }
         };
+        if let Some(k) = keys.last() {
+            new_l2_cursor = Some(k.clone());
+        }
         if !keys.is_empty() {
             levels::scan_l2(metadata, root, &keys).await?;
         }
@@ -288,7 +318,7 @@ async fn execute_scan_job(
             ScanScope::Files(keys) => keys.clone(),
             _ => {
                 let keys = metadata
-                    .list_keys_below_scan_level(3, L3_BATCH_LIMIT)
+                    .list_keys_below_scan_level(3, L3_BATCH_LIMIT, l3_cursor)
                     .await?;
                 if keys.len() as i64 >= L3_BATCH_LIMIT {
                     has_remaining = true;
@@ -296,10 +326,40 @@ async fn execute_scan_job(
                 keys
             }
         };
+        if let Some(k) = keys.last() {
+            new_l3_cursor = Some(k.clone());
+        }
         if !keys.is_empty() {
             levels::scan_l3(metadata, root, &keys).await?;
         }
     }
 
-    Ok(has_remaining)
+    // Log remaining work for non-Files scopes when there's more to do
+    if has_remaining && !matches!(scope, ScanScope::Files(_)) {
+        log_scan_remaining(metadata, target_level).await;
+    }
+
+    Ok((has_remaining, new_l2_cursor, new_l3_cursor))
+}
+
+/// Log the number of files and bytes remaining for L2 and L3 scans.
+async fn log_scan_remaining(metadata: &MetadataStore, target_level: ScanLevel) {
+    if target_level.as_i32() >= ScanLevel::Content.as_i32() {
+        // When target is Content, show L3 remaining (scan_level < 3 covers both L2 and L3 work)
+        if let Ok((files, bytes)) = metadata.count_remaining_below_scan_level(3).await {
+            tracing::info!(
+                remaining_files = files,
+                remaining_bytes = levels::format_human_size(bytes as u64),
+                "Scan progress: L3 content-hash"
+            );
+        }
+    } else if target_level.as_i32() >= ScanLevel::Metadata.as_i32() {
+        if let Ok((files, bytes)) = metadata.count_remaining_below_scan_level(2).await {
+            tracing::info!(
+                remaining_files = files,
+                remaining_bytes = levels::format_human_size(bytes as u64),
+                "Scan progress: L2 metadata"
+            );
+        }
+    }
 }
