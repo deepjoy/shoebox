@@ -164,6 +164,15 @@ impl CredentialProvider {
         self.credentials.values().collect()
     }
 
+    /// Add global credentials (not scoped to any specific bucket).
+    pub fn add_global_credentials(&mut self, credentials: &[Credential]) {
+        for cred in credentials {
+            let resolved = resolve_credential(cred, None);
+            self.credentials
+                .insert(resolved.access_key_id.clone(), resolved);
+        }
+    }
+
     /// Replace all credentials (used by reload).
     pub fn replace_all(&mut self, new: CredentialProvider) {
         self.credentials = new.credentials;

@@ -312,25 +312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Add global credentials (bucket_name = None, applies to all buckets)
     if let Some(ref gc) = global_config {
-        for cred in &gc.credentials {
-            let permissions = cred
-                .permissions
-                .as_ref()
-                .map(|perms| {
-                    perms
-                        .iter()
-                        .filter_map(|s| shoebox::auth::provider::Permission::parse(s))
-                        .collect()
-                })
-                .unwrap_or_default();
-            provider.insert(shoebox::auth::provider::ResolvedCredential {
-                access_key_id: cred.access_key_id.clone(),
-                secret_access_key: cred.secret_access_key.clone(),
-                permissions,
-                bucket_name: None,
-                description: cred.description.clone(),
-            });
-        }
+        provider.add_global_credentials(&gc.credentials);
     }
 
     let _bucket_names: Vec<String> = loaded_buckets.keys().cloned().collect();
