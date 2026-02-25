@@ -213,8 +213,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut loaded_buckets = HashMap::new();
     for bucket in &buckets {
+        let bucket_start = std::time::Instant::now();
+
         let db_path = bucket.shoebox_dir.join(METADATA_DB);
         let metadata = MetadataStore::new(&db_path).await?;
+        tracing::info!(
+            bucket = %bucket.name,
+            elapsed = ?bucket_start.elapsed(),
+            "Metadata store ready"
+        );
+
         let storage = FilesystemStorage::new(bucket.root.clone());
         let parts_dir = bucket.shoebox_dir.join("parts");
         tokio::fs::create_dir_all(&parts_dir).await?;
@@ -231,10 +239,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
         }
 
-        // Start filesystem watcher
+        // Start filesystem watcher (uses spawn_blocking to avoid blocking the runtime
+        // during recursive inotify watch setup on large directory trees)
+        let watcher_start = std::time::Instant::now();
         let watcher = {
             let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(1000);
-            match FilesystemWatcher::new(bucket.root.clone(), watch_tx) {
+            match FilesystemWatcher::spawn(bucket.root.clone(), watch_tx).await {
                 Ok(w) => {
                     tracing::debug!(bucket = %bucket.name, "Filesystem watcher started");
                     tokio::spawn(worker::run_watch_processor(
@@ -256,6 +266,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         };
+        tracing::info!(
+            bucket = %bucket.name,
+            elapsed = ?watcher_start.elapsed(),
+            "Filesystem watcher setup complete"
+        );
 
         // Spawn scan worker for this bucket
         tokio::spawn(worker::run_scan_workers(

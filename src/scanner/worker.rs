@@ -29,25 +29,22 @@ pub async fn run_scan_workers(
     tracing::debug!("Scanner worker started");
 
     loop {
-        tokio::select! {
-            _ = token.cancelled() => {
-                tracing::info!("Scanner worker shutting down");
-                break;
+        // Get next job from scheduler, or wait for new work
+        let job = loop {
+            {
+                let mut sched = scheduler.lock().await;
+                if let Some(job) = sched.next_job() {
+                    break job;
+                }
             }
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                // Poll for work
+            // No pending work — poll with a short sleep, checking for shutdown
+            tokio::select! {
+                _ = token.cancelled() => {
+                    tracing::info!("Scanner worker shutting down");
+                    return;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
-        }
-
-        // Get next job from scheduler
-        let job = {
-            let mut sched = scheduler.lock().await;
-            sched.next_job()
-        };
-
-        let job = match job {
-            Some(j) => j,
-            None => continue,
         };
 
         // Check backpressure
@@ -108,6 +105,15 @@ pub async fn run_scan_workers(
                 }
             }
         }
+
+        // Check for shutdown between jobs
+        if token.is_cancelled() {
+            tracing::info!("Scanner worker shutting down");
+            break;
+        }
+
+        // Yield to let other tasks run between consecutive jobs
+        tokio::task::yield_now().await;
     }
 
     tracing::debug!("Scanner worker exited");
@@ -344,22 +350,26 @@ async fn execute_scan_job(
 
 /// Log the number of files and bytes remaining for L2 and L3 scans.
 async fn log_scan_remaining(metadata: &MetadataStore, target_level: ScanLevel) {
-    if target_level.as_i32() >= ScanLevel::Content.as_i32() {
-        // When target is Content, show L3 remaining (scan_level < 3 covers both L2 and L3 work)
-        if let Ok((files, bytes)) = metadata.count_remaining_below_scan_level(3).await {
-            tracing::info!(
-                remaining_files = files,
-                remaining_bytes = levels::format_human_size(bytes as u64),
-                "Scan progress: L3 content-hash"
-            );
-        }
-    } else if target_level.as_i32() >= ScanLevel::Metadata.as_i32() {
+    if target_level.as_i32() >= ScanLevel::Metadata.as_i32() {
         if let Ok((files, bytes)) = metadata.count_remaining_below_scan_level(2).await {
-            tracing::info!(
-                remaining_files = files,
-                remaining_bytes = levels::format_human_size(bytes as u64),
-                "Scan progress: L2 metadata"
-            );
+            if files > 0 {
+                tracing::info!(
+                    remaining_files = files,
+                    remaining_bytes = levels::format_human_size(bytes as u64),
+                    "Scan progress: L2 metadata"
+                );
+            }
+        }
+    }
+    if target_level.as_i32() >= ScanLevel::Content.as_i32() {
+        if let Ok((files, bytes)) = metadata.count_remaining_below_scan_level(3).await {
+            if files > 0 {
+                tracing::info!(
+                    remaining_files = files,
+                    remaining_bytes = levels::format_human_size(bytes as u64),
+                    "Scan progress: L3 content-hash"
+                );
+            }
         }
     }
 }

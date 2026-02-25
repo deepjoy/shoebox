@@ -116,12 +116,14 @@ impl PartialEq for ScanJob {
 
 impl Ord for ScanJob {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Higher priority first (lower numeric value = higher priority)
+        // Higher priority first (lower numeric value = higher priority).
+        // BinaryHeap is a max-heap, so "Greater" is popped first.
         other
             .priority
             .cmp(&self.priority)
-            // Then older jobs first (earlier created_at)
-            .then_with(|| self.created_at.cmp(&other.created_at))
+            // Then older jobs first (earlier created_at).
+            // Reversed comparison so earlier timestamps are "Greater" in the max-heap.
+            .then_with(|| other.created_at.cmp(&self.created_at))
     }
 }
 

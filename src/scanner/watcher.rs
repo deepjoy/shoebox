@@ -29,6 +29,11 @@ pub struct FilesystemWatcher {
 
 impl FilesystemWatcher {
     /// Start watching `root` recursively, sending debounced events to `tx`.
+    ///
+    /// The underlying `notify` watcher performs a blocking recursive directory
+    /// traversal to register OS-level watches (inotify on Linux). Use
+    /// [`spawn`] instead when calling from async context to avoid blocking
+    /// the tokio runtime.
     pub fn new(root: PathBuf, tx: mpsc::Sender<WatchEvent>) -> Result<Self, notify::Error> {
         let mut debouncer = new_debouncer(
             Duration::from_millis(200),
@@ -46,6 +51,14 @@ impl FilesystemWatcher {
         Ok(Self {
             _debouncer: debouncer,
         })
+    }
+
+    /// Async version of [`new`](Self::new) that runs the blocking watcher
+    /// setup on a dedicated thread via `spawn_blocking`.
+    pub async fn spawn(root: PathBuf, tx: mpsc::Sender<WatchEvent>) -> Result<Self, notify::Error> {
+        tokio::task::spawn_blocking(move || Self::new(root, tx))
+            .await
+            .expect("watcher spawn_blocking panicked")
     }
 
     fn handle_event(event: &DebouncedEvent, tx: &mpsc::Sender<WatchEvent>) {

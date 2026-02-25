@@ -458,10 +458,11 @@ impl ShoeboxBuilder {
                 ));
             }
 
-            // Start filesystem watcher
+            // Start filesystem watcher (uses spawn_blocking to avoid blocking the runtime
+            // during recursive inotify watch setup on large directory trees)
             let watcher = {
                 let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(1000);
-                match FilesystemWatcher::new(state.root.clone(), watch_tx) {
+                match FilesystemWatcher::spawn(state.root.clone(), watch_tx).await {
                     Ok(w) => {
                         tracing::debug!(bucket = %state.name, "Filesystem watcher started");
                         // Spawn watch processor
@@ -974,7 +975,8 @@ mod tests {
         assert!(keys.contains(&"pre-existing.txt"));
         assert!(keys.contains(&"api-uploaded.txt"));
 
-        // Scanner-discovered file has scan_level 1, API-uploaded has scan_level 3
+        // Scanner-discovered file starts at scan_level 1 and may be promoted
+        // by the background worker; API-uploaded files always start at level 3.
         let pre = objects
             .iter()
             .find(|o| o.key == "pre-existing.txt")
@@ -983,7 +985,7 @@ mod tests {
             .iter()
             .find(|o| o.key == "api-uploaded.txt")
             .unwrap();
-        assert_eq!(pre.scan_level, 1);
+        assert!(pre.scan_level >= 1);
         assert_eq!(api.scan_level, 3);
     }
 
