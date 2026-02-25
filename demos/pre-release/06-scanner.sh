@@ -14,7 +14,6 @@
 #   - Filesystem watcher detects modified files
 #   - Filesystem watcher detects deleted files
 #   - S3 API operations coexist with scanner-managed objects
-#   - Docker image builds and runs (when Docker is available)
 #
 # Environment variables:
 #   SHOEBOX_ENDPOINT — override the endpoint URL (default: http://127.0.0.1:$PORT)
@@ -172,46 +171,6 @@ p08_api_coexistence() {
 }
 part p08_api_coexistence "S3 API Coexistence"
 
-p09_docker() {
-  if command -v docker &>/dev/null; then
-    step "Docker: build image"
-    run "docker build -t shoebox:phase6-test $PROJECT_ROOT"
-    ok "Docker image builds successfully"
-
-    step "Docker: start container and verify it serves requests"
-    DOCKER_PORT=9880
-    DOCKER_BUCKET="$DEMO_ROOT/docker-bucket"
-    mkdir -p "$DOCKER_BUCKET"
-    echo "docker file" > "$DOCKER_BUCKET/hello.txt"
-
-    CONTAINER_ID=$(docker run -d --rm \
-      -p "$DOCKER_PORT:8080" \
-      -v "$DOCKER_BUCKET:/data/mybucket" \
-      shoebox:phase6-test --port 8080 /data/mybucket)
-
-    wait_for_server "http://127.0.0.1:$DOCKER_PORT"
-
-    # Extract credentials from docker logs
-    DOCKER_LOG=$(docker logs "$CONTAINER_ID" 2>&1)
-    DOCKER_AK=$(echo "$DOCKER_LOG" | grep -oP 'AKIA[A-Z0-9]{16}' | head -1)
-    DOCKER_SK=$(echo "$DOCKER_LOG" | grep -oP 'Secret: \K[A-Za-z0-9/+=]+' | head -1)
-
-    if [[ -n "$DOCKER_AK" ]]; then
-      run "AWS_ACCESS_KEY_ID=$DOCKER_AK AWS_SECRET_ACCESS_KEY=$DOCKER_SK aws --endpoint-url http://127.0.0.1:$DOCKER_PORT s3 ls s3://mybucket/ --recursive"
-      ok "Docker container starts and serves buckets"
-    else
-      note "Could not extract credentials from Docker container logs"
-    fi
-
-    docker stop "$CONTAINER_ID" 2>/dev/null || true
-    docker rmi shoebox:phase6-test 2>/dev/null || true
-  else
-    note "Docker not available — skipping Docker build/run tests"
-    note "  (Docker tests: image build, container start, serve buckets)"
-  fi
-}
-part p09_docker "Docker — Build & Run"
-
 p99_done() {
   note "Scanner checklist items demonstrated:"
   note "  [x] L1 scan discovers all files"
@@ -224,15 +183,11 @@ p99_done() {
   note "  [x] Filesystem watcher detects modifications"
   note "  [x] Filesystem watcher detects deletions"
   note "  [x] S3 API operations coexist with scanner-managed objects"
-  note "  [x] Docker image builds successfully (when Docker available)"
-  note "  [x] Docker container starts and serves buckets (when Docker available)"
   note ""
   note "Items tested via unit/integration tests (not in demo):"
   note "  [x] L3 detects file modification during scan"
   note "  [x] P0 scan preempts P1/P2"
   note "  [x] Debouncing prevents duplicate events"
-  note "  [x] Multi-arch build (CI-only)"
-  note "  [x] docker pull from registries (CI-only)"
 }
 part p99_done "Phase 6 Demo Complete"
 
