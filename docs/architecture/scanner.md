@@ -323,5 +323,4 @@ All tasks respect the shared `CancellationToken` for graceful shutdown.
 | [backpressure.rs](../../src/scanner/backpressure.rs) | API-vs-scanner resource control |
 | [watcher.rs](../../src/scanner/watcher.rs) | notify-based filesystem watcher |
 | [scope.rs](../../src/scanner/scope.rs) | Scan scope types (Bucket, Subtree, Files) |
-| [checkpoint.rs](../../src/scanner/checkpoint.rs) | Pause/resume progress tracking |
 | [platform.rs](../../src/scanner/platform.rs) | Cross-platform inode/device extraction |
