@@ -480,9 +480,16 @@ impl ShoeboxBuilder {
 
             // Start filesystem watcher (uses spawn_blocking to avoid blocking the runtime
             // during recursive inotify watch setup on large directory trees)
+            let watch_capacity = global_config
+                .as_ref()
+                .and_then(|gc| gc.watch_channel_capacity)
+                .unwrap_or(1000);
             let watcher = {
-                let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(1000);
-                match FilesystemWatcher::spawn(state.root.clone(), watch_tx).await {
+                let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(watch_capacity);
+                let watch_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                match FilesystemWatcher::spawn(state.root.clone(), watch_tx, watch_drops.clone())
+                    .await
+                {
                     Ok(w) => {
                         tracing::debug!(bucket = %state.name, "Filesystem watcher started");
                         // Spawn watch processor
@@ -491,6 +498,7 @@ impl ShoeboxBuilder {
                             state.root.clone(),
                             watch_rx,
                             scheduler.clone(),
+                            watch_drops,
                             shutdown_token.clone(),
                         ));
                         Some(w)
@@ -1053,6 +1061,7 @@ mod tests {
                 description: Some("global cred".into()),
                 permissions: Some(vec!["read".into()]),
             }],
+            ..Default::default()
         };
 
         // Build using global_config — no explicit .bucket() calls
@@ -1080,6 +1089,7 @@ mod tests {
             host: Some("10.0.0.1".into()),
             port: Some(4444),
             credentials: vec![],
+            ..Default::default()
         };
 
         let shoebox = Shoebox::builder()

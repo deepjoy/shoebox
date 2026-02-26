@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -160,17 +161,37 @@ pub async fn run_watch_processor(
     root: PathBuf,
     mut rx: tokio::sync::mpsc::Receiver<crate::scanner::watcher::WatchEvent>,
     scheduler: Arc<Mutex<ScanScheduler>>,
+    drop_counter: Arc<AtomicU64>,
     token: CancellationToken,
 ) {
     use crate::scanner::watcher::WatchEvent;
 
     tracing::debug!("Watch processor started");
 
+    let mut drop_check = tokio::time::interval(Duration::from_secs(10));
+    drop_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             _ = token.cancelled() => {
                 tracing::info!("Watch processor shutting down");
                 break;
+            }
+            _ = drop_check.tick() => {
+                let dropped = drop_counter.swap(0, Ordering::Relaxed);
+                if dropped > 0 {
+                    tracing::warn!(
+                        dropped_events = dropped,
+                        "Watch channel overflow — scheduling full reconcile to catch missed files"
+                    );
+                    let job = ScanJob::new(
+                        Priority::Reconcile,
+                        ScanScope::Bucket,
+                        ScanLevel::Content,
+                    );
+                    let mut sched = scheduler.lock().await;
+                    sched.schedule(job);
+                }
             }
             event = rx.recv() => {
                 let event = match event {

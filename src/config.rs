@@ -26,6 +26,14 @@ pub struct GlobalConfig {
     /// Bucket paths (alternative to CLI positional args).
     #[serde(default)]
     pub buckets: Vec<PathBuf>,
+
+    /// Capacity of the filesystem watch event channel (default: 1000).
+    ///
+    /// Increase this for high-churn environments where bulk file operations
+    /// (e.g., archive extraction, rsync) generate bursts of events faster
+    /// than the watch processor can consume them.
+    #[serde(default)]
+    pub watch_channel_capacity: Option<usize>,
 }
 
 /// Load a global configuration file.

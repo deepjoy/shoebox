@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use notify::RecursiveMode;
@@ -34,13 +36,17 @@ impl FilesystemWatcher {
     /// traversal to register OS-level watches (inotify on Linux). Use
     /// [`spawn`] instead when calling from async context to avoid blocking
     /// the tokio runtime.
-    pub fn new(root: PathBuf, tx: mpsc::Sender<WatchEvent>) -> Result<Self, notify::Error> {
+    pub fn new(
+        root: PathBuf,
+        tx: mpsc::Sender<WatchEvent>,
+        drop_counter: Arc<AtomicU64>,
+    ) -> Result<Self, notify::Error> {
         let mut debouncer = new_debouncer(
             Duration::from_millis(200),
             move |result: DebounceEventResult| {
                 if let Ok(events) = result {
                     for event in events {
-                        Self::handle_event(&event, &tx);
+                        Self::handle_event(&event, &tx, &drop_counter);
                     }
                 }
             },
@@ -55,27 +61,41 @@ impl FilesystemWatcher {
 
     /// Async version of [`new`](Self::new) that runs the blocking watcher
     /// setup on a dedicated thread via `spawn_blocking`.
-    pub async fn spawn(root: PathBuf, tx: mpsc::Sender<WatchEvent>) -> Result<Self, notify::Error> {
-        tokio::task::spawn_blocking(move || Self::new(root, tx))
+    pub async fn spawn(
+        root: PathBuf,
+        tx: mpsc::Sender<WatchEvent>,
+        drop_counter: Arc<AtomicU64>,
+    ) -> Result<Self, notify::Error> {
+        tokio::task::spawn_blocking(move || Self::new(root, tx, drop_counter))
             .await
             .expect("watcher spawn_blocking panicked")
     }
 
-    fn handle_event(event: &DebouncedEvent, tx: &mpsc::Sender<WatchEvent>) {
+    fn handle_event(
+        event: &DebouncedEvent,
+        tx: &mpsc::Sender<WatchEvent>,
+        drop_counter: &AtomicU64,
+    ) {
         // Filter out .shoebox directory
         if is_shoebox_path(&event.path) {
             return;
         }
 
-        if event.path.exists() {
+        let watch_event = if event.path.exists() {
             // Only send events for files, not directories
             if event.path.is_file() || event.path.is_symlink() {
-                tx.blocking_send(WatchEvent::Changed(event.path.clone()))
-                    .ok();
+                Some(WatchEvent::Changed(event.path.clone()))
+            } else {
+                None
             }
         } else {
-            tx.blocking_send(WatchEvent::Deleted(event.path.clone()))
-                .ok();
+            Some(WatchEvent::Deleted(event.path.clone()))
+        };
+
+        if let Some(evt) = watch_event {
+            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(evt) {
+                drop_counter.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
