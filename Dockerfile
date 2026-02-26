@@ -1,27 +1,29 @@
 # Stage 1: Build
 FROM rust:slim AS builder
 
+ARG TARGETARCH
+
 WORKDIR /build
 
 # Install build dependencies for SQLite (required by sqlx)
 RUN apt-get update && apt-get install -y pkg-config libsqlite3-dev && rm -rf /var/lib/apt/lists/*
 
-# Cache dependency build: copy manifests first, create dummy src, build deps
 COPY Cargo.toml Cargo.lock ./
 COPY migrations ./migrations
-RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
-RUN cargo build --release && rm -rf src
-
-# Build the real binary
 COPY src ./src
-RUN touch src/main.rs src/lib.rs && cargo build --release
+
+# Cache mounts: cargo registry is arch-independent, target dir is per-arch
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target,id=cargo-target-${TARGETARCH} \
+    cargo build --release && cp target/release/shoebox /usr/local/bin/shoebox
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y libsqlite3-0 ca-certificates && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/shoebox /usr/local/bin/shoebox
+COPY --from=builder /usr/local/bin/shoebox /usr/local/bin/shoebox
 
 # Default data directory
 RUN mkdir -p /data
