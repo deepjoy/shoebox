@@ -68,6 +68,7 @@ graph LR
 ### L3 — Content hash (`scan_l3`)
 
 - Receives a pre-fetched list of keys and a **concurrency** level from the worker (see [Batch limits](#batch-limits-and-continuation)).
+- **Symlinks are skipped**: `hash_one_file()` checks `symlink_metadata()` first — symlinks don't have independently hashable content in the S3 model. Skipped symlinks are promoted to `scan_level = 3` so they aren't re-queued.
 - Hashes files **concurrently** using `futures::stream::buffer_unordered(concurrency)`. Each file is processed by `hash_one_file()`, which:
   - Streams file contents through dual hashers in a single pass:
     - **MD5** → stored as the S3 `ETag` (quoted hex).
@@ -210,15 +211,26 @@ The watcher uses `notify` with `notify-debouncer-mini` (200ms debounce window) t
 graph LR
     FS["Filesystem<br>inotify/FSEvents/ReadDirectoryChanges"] -->|raw events| DEBOUNCE[Debouncer<br>200ms window]
     DEBOUNCE -->|DebouncedEvent| HANDLER[handle_event]
-    HANDLER -->|filter .shoebox<br>files only| CHAN[mpsc channel<br>capacity: 1000]
+    HANDLER -->|"filter .shoebox<br>files only<br>try_send()"| CHAN["mpsc channel<br>capacity: configurable<br>(default 1000)"]
+    HANDLER -->|"channel full"| DROPS["AtomicU64<br>drop counter"]
     CHAN --> WATCHPROC[Watch Processor]
+    DROPS -.->|"checked every 10s"| WATCHPROC
 
     WATCHPROC -->|Changed| CHECK{File actually<br>changed?}
     CHECK -->|mtime or size differ| SCHEDULE[Schedule Reconcile<br>scan to L3]
     CHECK -->|same mtime + size| IGNORE[Ignore<br>spurious event]
 
     WATCHPROC -->|Deleted| DELETE[delete_object<br>from DB]
+    WATCHPROC -->|"drops > 0"| RECONCILE[Schedule full-bucket<br>Reconcile scan]
 ```
+
+### Channel overflow recovery
+
+The watcher callback uses `try_send()` (non-blocking) instead of `blocking_send()` to avoid stalling the OS notification thread, which could cause inotify/FSEvents queue overflow at the kernel level. When the channel is full, the event is dropped and a shared `AtomicU64` counter is incremented.
+
+The watch processor checks this counter every 10 seconds. When drops are detected, it logs a warning with the count and schedules a full-bucket `Reconcile` scan at `Content` level to catch any files that were missed.
+
+The channel capacity defaults to 1000 events but can be increased for high-churn environments via `watch_channel_capacity` in the global config file.
 
 ### Spurious event filtering
 

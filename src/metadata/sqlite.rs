@@ -970,6 +970,33 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Promote scan_level for symlinks that don't need content hashing.
+    pub async fn promote_scan_level_batch(
+        &self,
+        keys: &[String],
+        target_level: i32,
+    ) -> Result<(), S3Error> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        let now = time::OffsetDateTime::now_utc();
+        for key in keys {
+            sqlx::query(
+                "UPDATE objects SET scan_level = ?, last_modified = ? \
+                 WHERE key = ? AND scan_level < ?",
+            )
+            .bind(target_level)
+            .bind(now)
+            .bind(key.as_str())
+            .bind(target_level)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Update L3 content hashes for multiple objects in a single transaction.
     pub async fn update_objects_hashes_batch(
         &self,

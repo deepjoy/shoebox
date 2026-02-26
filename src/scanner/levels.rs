@@ -316,6 +316,10 @@ enum L3FileResult {
         content_hash: String,
         size: u64,
     },
+    /// File was a symlink — promote to scan_level 3 without hashing.
+    Symlink {
+        key: String,
+    },
     Skipped,
 }
 
@@ -325,6 +329,22 @@ enum L3FileResult {
 /// file is missing, unreadable, a directory, or was modified during the scan.
 async fn hash_one_file(root: &Path, key: &str, index: usize, total: usize) -> L3FileResult {
     let path = root.join(key);
+
+    // Skip symlinks — they don't have independently hashable content in the
+    // S3 model.  Promote them to scan_level 3 so they aren't re-queued.
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(m) if m.file_type().is_symlink() => {
+            tracing::debug!("L3 scan: skipping symlink {key}");
+            return L3FileResult::Symlink {
+                key: key.to_string(),
+            };
+        }
+        Err(e) => {
+            tracing::warn!("L3 scan: cannot stat {key}: {e}");
+            return L3FileResult::Skipped;
+        }
+        Ok(_) => {} // regular file — continue to hashing
+    }
 
     // Record mtime before reading
     let pre_meta = match tokio::fs::metadata(&path).await {
@@ -452,6 +472,7 @@ pub async fn scan_l3(
 
     // Batch-write results to the database
     let mut batch: Vec<(String, String, String, i32)> = Vec::with_capacity(BATCH_SIZE);
+    let mut symlink_keys: Vec<String> = Vec::new();
     for result in results {
         match result {
             L3FileResult::Hashed {
@@ -468,6 +489,10 @@ pub async fn scan_l3(
                     batch.clear();
                 }
             }
+            L3FileResult::Symlink { key } => {
+                report.skipped += 1;
+                symlink_keys.push(key);
+            }
             L3FileResult::Skipped => {
                 report.skipped += 1;
             }
@@ -477,6 +502,15 @@ pub async fn scan_l3(
     // Flush remaining batch
     if !batch.is_empty() {
         metadata.update_objects_hashes_batch(&batch).await?;
+    }
+
+    // Promote symlinks to scan_level 3 so they aren't re-queued
+    if !symlink_keys.is_empty() {
+        tracing::debug!(
+            count = symlink_keys.len(),
+            "promoting symlinks to scan_level 3"
+        );
+        metadata.promote_scan_level_batch(&symlink_keys, 3).await?;
     }
 
     if total > 1 {
@@ -672,5 +706,55 @@ mod tests {
         // Verify MD5 of "hello world"
         let expected_md5 = format!("\"{}\"", hex::encode(Md5::digest(b"hello world")));
         assert_eq!(obj.etag.unwrap(), expected_md5);
+    }
+
+    #[tokio::test]
+    async fn test_l3_skips_symlinks_and_promotes() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket_root).unwrap();
+        std::fs::write(bucket_root.join("target.txt"), "real content").unwrap();
+
+        // Create a symlink and a broken symlink
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                bucket_root.join("target.txt"),
+                bucket_root.join("link.txt"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                bucket_root.join("nonexistent"),
+                bucket_root.join("broken.txt"),
+            )
+            .unwrap();
+        }
+
+        let store = make_store(&tmp).await;
+        scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+
+        // All three should be discovered
+        let keys: Vec<String> = vec!["broken.txt".into(), "link.txt".into(), "target.txt".into()];
+        scan_l2(&store, &bucket_root, &keys).await.unwrap();
+
+        // L3 should hash only target.txt, skip the symlinks
+        let report = scan_l3(&store, &bucket_root, &keys, 1).await.unwrap();
+        assert_eq!(report.hashed, 1); // only target.txt
+        assert_eq!(report.skipped, 2); // link.txt + broken.txt
+
+        // Symlinks should be promoted to scan_level 3
+        let link = store.get_object("link.txt").await.unwrap().unwrap();
+        assert_eq!(link.scan_level, 3);
+        assert!(link.etag.is_none()); // no hash for symlinks
+
+        let broken = store.get_object("broken.txt").await.unwrap().unwrap();
+        assert_eq!(broken.scan_level, 3);
+
+        // Regular file should have hashes
+        let target = store.get_object("target.txt").await.unwrap().unwrap();
+        assert_eq!(target.scan_level, 3);
+        assert!(target.etag.is_some());
     }
 }
