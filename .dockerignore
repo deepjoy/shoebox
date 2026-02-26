@@ -7,7 +7,12 @@ debug
 .claude
 .shoebox
 docs
+demos
 *.md
 *.pdb
 **/*.rs.bk
 **/mutants.out*
+.gitignore
+.dockerignore
+release-plz.toml
+LICENSE
