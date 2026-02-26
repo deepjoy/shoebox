@@ -1,12 +1,9 @@
 name: Docker
 
 on:
-  pull_request:
-    branches: [main]
-  # TODO: restore before merge
-  # push:
-  #   tags: ['v*']
-  # workflow_dispatch:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
 
 env:
   REGISTRY_GHCR: ghcr.io
@@ -59,7 +56,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: false  # TODO: restore to true before merge
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
