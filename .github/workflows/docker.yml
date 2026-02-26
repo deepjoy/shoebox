@@ -7,7 +7,8 @@ on:
 
 env:
   REGISTRY_GHCR: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME_GHCR: ${{ github.repository }}
+  IMAGE_NAME_DOCKERHUB: deeppjoymajumdar/shoebox
 
 jobs:
   docker:
@@ -43,8 +44,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ env.IMAGE_NAME }}
-            ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}
+            ${{ env.IMAGE_NAME_DOCKERHUB }}
+            ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME_GHCR }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
