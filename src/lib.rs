@@ -317,7 +317,17 @@ impl Shoebox {
 
         let app_state = self.to_app_state();
         let router = create_router(app_state);
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                format!(
+                    "Port {} is already in use. Is another Shoebox instance running?\n\
+                     Try a different port with .port(<PORT>)",
+                    self.port
+                )
+            } else {
+                format!("Failed to bind to {}: {}", addr, e)
+            }
+        })?;
         tracing::info!("Serving on http://{addr}");
 
         axum::serve(listener, router)
@@ -427,7 +437,17 @@ impl ShoeboxBuilder {
         let mut buckets = HashMap::new();
 
         for path in &paths {
-            let state = resolve_bucket(path, self.data_dir.as_deref()).await?;
+            let state = resolve_bucket(path, self.data_dir.as_deref())
+                .await
+                .map_err(|e| match e.downcast_ref::<std::io::Error>() {
+                    Some(io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied => {
+                        format!(
+                            "{}: permission denied; use --data-dir to store state elsewhere",
+                            path.display()
+                        )
+                    }
+                    _ => e.to_string(),
+                })?;
             let db_path = state.shoebox_dir.join(METADATA_DB);
             let metadata = MetadataStore::new(&db_path).await?;
             let storage = FilesystemStorage::new(state.root.clone());
@@ -458,10 +478,18 @@ impl ShoeboxBuilder {
                 ));
             }
 
-            // Start filesystem watcher
+            // Start filesystem watcher (uses spawn_blocking to avoid blocking the runtime
+            // during recursive inotify watch setup on large directory trees)
+            let watch_capacity = global_config
+                .as_ref()
+                .and_then(|gc| gc.watch_channel_capacity)
+                .unwrap_or(1000);
             let watcher = {
-                let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(1000);
-                match FilesystemWatcher::new(state.root.clone(), watch_tx) {
+                let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(watch_capacity);
+                let watch_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                match FilesystemWatcher::spawn(state.root.clone(), watch_tx, watch_drops.clone())
+                    .await
+                {
                     Ok(w) => {
                         tracing::debug!(bucket = %state.name, "Filesystem watcher started");
                         // Spawn watch processor
@@ -470,6 +498,7 @@ impl ShoeboxBuilder {
                             state.root.clone(),
                             watch_rx,
                             scheduler.clone(),
+                            watch_drops,
                             shutdown_token.clone(),
                         ));
                         Some(w)
@@ -974,7 +1003,8 @@ mod tests {
         assert!(keys.contains(&"pre-existing.txt"));
         assert!(keys.contains(&"api-uploaded.txt"));
 
-        // Scanner-discovered file has scan_level 1, API-uploaded has scan_level 3
+        // Scanner-discovered file starts at scan_level 1 and may be promoted
+        // by the background worker; API-uploaded files always start at level 3.
         let pre = objects
             .iter()
             .find(|o| o.key == "pre-existing.txt")
@@ -983,7 +1013,7 @@ mod tests {
             .iter()
             .find(|o| o.key == "api-uploaded.txt")
             .unwrap();
-        assert_eq!(pre.scan_level, 1);
+        assert!(pre.scan_level >= 1);
         assert_eq!(api.scan_level, 3);
     }
 
@@ -1008,9 +1038,11 @@ mod tests {
         // Add a new file
         std::fs::write(bucket_dir.join("b.txt"), "b").unwrap();
 
-        // Re-scan should find the new file
+        // Re-scan should see 2 total files. The new file may have been
+        // discovered by the background filesystem watcher before scan_l1
+        // runs, so we check the total rather than asserting discovered == 1.
         let report = shoebox.scan_l1("scantest").await.unwrap();
-        assert_eq!(report.discovered, 1);
+        assert_eq!(report.discovered + report.unchanged, 2);
     }
 
     #[tokio::test]
@@ -1029,6 +1061,7 @@ mod tests {
                 description: Some("global cred".into()),
                 permissions: Some(vec!["read".into()]),
             }],
+            ..Default::default()
         };
 
         // Build using global_config — no explicit .bucket() calls
@@ -1056,6 +1089,7 @@ mod tests {
             host: Some("10.0.0.1".into()),
             port: Some(4444),
             credentials: vec![],
+            ..Default::default()
         };
 
         let shoebox = Shoebox::builder()

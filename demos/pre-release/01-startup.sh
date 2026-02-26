@@ -27,14 +27,7 @@ touch "$DEMO_ROOT/Photos/vacation.jpg" "$DEMO_ROOT/Photos/portrait.png"
 touch "$DEMO_ROOT/Videos/clip-2024.mp4"
 touch "$DEMO_ROOT/Documents/notes.md" "$DEMO_ROOT/Documents/report.pdf"
 
-SHOEBOX="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/target/release/shoebox"
-
-# Verify binary exists
-if [[ ! -x "$SHOEBOX" ]]; then
-  echo "Error: shoebox binary not found at $SHOEBOX"
-  echo "Run 'cargo build --release' first."
-  exit 1
-fi
+require_shoebox
 
 # Track the current port so each run_shoebox instance uses a unique port.
 NEXT_PORT=9870
@@ -66,7 +59,7 @@ run_shoebox() {
   local pid=$!
 
   # Wait for server to be ready (or exit quickly for non-server commands)
-  for _ in $(seq 1 30); do
+  for _i in $(seq 1 30); do
     if ! kill -0 "$pid" 2>/dev/null; then break; fi
     if curl -s -o /dev/null "$listen_url/" 2>/dev/null; then break; fi
     sleep 0.1
@@ -84,68 +77,57 @@ run_shoebox() {
   sleep "$DELAY"
 }
 
-# ============================================================================
-# Part 1 — Single bucket
-# ============================================================================
+# --- Parts ------------------------------------------------------------------
 
-banner "Shoebox — lightweight S3-compatible storage"
+p01_single_bucket() {
+  note "Point shoebox at any directory to serve it as an S3 bucket."
+  note "Credentials are generated automatically on first run."
 
-note "Point shoebox at any directory to serve it as an S3 bucket."
-note "Credentials are generated automatically on first run."
-sleep "$DELAY"
+  step "Serving a single directory (first run)"
+  note "On first run, credentials are generated and displayed automatically."
+  run_shoebox "SHOEBOX_LOG=off $SHOEBOX '$DEMO_ROOT/Photos'"
+}
+part p01_single_bucket "Shoebox — lightweight S3-compatible storage"
 
-step "Serving a single directory (first run)"
-note "On first run, credentials are generated and displayed automatically."
-run_shoebox "SHOEBOX_LOG=off $SHOEBOX '$DEMO_ROOT/Photos'"
+p02_subsequent_runs() {
+  note "On subsequent runs, secrets are hidden by default."
+  note "Pass --show-secrets to reveal them again."
 
-# ============================================================================
-# Part 2 — Subsequent run hides secrets
-# ============================================================================
+  step "Re-running the same directory"
+  run_shoebox "SHOEBOX_LOG=off $SHOEBOX '$DEMO_ROOT/Photos'"
 
-banner "Subsequent runs"
+  step "With --show-secrets"
+  run_shoebox "SHOEBOX_LOG=off $SHOEBOX --show-secrets '$DEMO_ROOT/Photos'"
+}
+part p02_subsequent_runs "Subsequent runs"
 
-note "On subsequent runs, secrets are hidden by default."
-note "Pass --show-secrets to reveal them again."
-sleep "$DELAY"
+p03_multiple_buckets() {
+  note "Pass several paths to serve them all from one instance."
 
-step "Re-running the same directory"
-run_shoebox "SHOEBOX_LOG=off $SHOEBOX '$DEMO_ROOT/Photos'"
+  step "Serving three directories"
+  run_shoebox "SHOEBOX_LOG=off $SHOEBOX '$DEMO_ROOT/Photos' '$DEMO_ROOT/Videos' '$DEMO_ROOT/Documents'"
+}
+part p03_multiple_buckets "Multiple directories at once"
 
-step "With --show-secrets"
-run_shoebox "SHOEBOX_LOG=off $SHOEBOX --show-secrets '$DEMO_ROOT/Photos'"
+p04_custom_host_port() {
+  note "Use --host and --port (or env vars) to change the listen address."
 
-# ============================================================================
-# Part 3 — Multiple buckets
-# ============================================================================
+  step "Custom host and port"
+  run_shoebox "SHOEBOX_LOG=off $SHOEBOX --host 127.0.0.1 --port 9999 '$DEMO_ROOT/Photos'"
+}
+part p04_custom_host_port "Custom Host & Port"
 
-banner "Multiple directories at once"
+p99_done() {
+  note "Each directory now has a .shoebox/config.toml with its credentials."
+  step "Peeking at generated config"
+  run "cat '$DEMO_ROOT/Photos/.shoebox/config.toml'"
 
-note "Pass several paths to serve them all from one instance."
-sleep "$DELAY"
+  echo ""
+  ok "That's shoebox — zero-config, no-copy, S3-compatible local storage."
+  echo ""
+}
+part p99_done "Done!"
 
-step "Serving three directories"
-run_shoebox "SHOEBOX_LOG=off $SHOEBOX '$DEMO_ROOT/Photos' '$DEMO_ROOT/Videos' '$DEMO_ROOT/Documents'"
+# --- Run --------------------------------------------------------------------
 
-# ============================================================================
-# Part 4 — Custom host and port
-# ============================================================================
-
-step "Custom host and port"
-note "Use --host and --port (or env vars) to change the listen address."
-sleep "$DELAY"
-
-run_shoebox "SHOEBOX_LOG=off $SHOEBOX --host 127.0.0.1 --port 9999 '$DEMO_ROOT/Photos'"
-
-# ============================================================================
-# Done
-# ============================================================================
-
-banner "Done!"
-note "Each directory now has a .shoebox/config.toml with its credentials."
-step "Peeking at generated config"
-run "cat '$DEMO_ROOT/Photos/.shoebox/config.toml'"
-
-echo ""
-ok "That's shoebox — zero-config, no-copy, S3-compatible local storage."
-echo ""
-sleep "$END_DELAY"
+run_demo

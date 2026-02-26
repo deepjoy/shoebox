@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use crate::error::S3Error;
 use crate::metadata::MetadataStore;
 use crate::scanner::backpressure::ScannerResources;
 use crate::scanner::levels;
-use crate::scanner::scheduler::{Priority, ScanJob, ScanLevel, ScanScheduler};
+use crate::scanner::scheduler::{Priority, ScanJob, ScanLevel, ScanScheduler, MAX_RETRIES};
 use crate::scanner::scope::ScanScope;
 
 /// Run the scan worker loop — polls the scheduler for jobs and executes them.
@@ -29,25 +30,22 @@ pub async fn run_scan_workers(
     tracing::debug!("Scanner worker started");
 
     loop {
-        tokio::select! {
-            _ = token.cancelled() => {
-                tracing::info!("Scanner worker shutting down");
-                break;
+        // Get next job from scheduler, or wait for new work
+        let job = loop {
+            {
+                let mut sched = scheduler.lock().await;
+                if let Some(job) = sched.next_job() {
+                    break job;
+                }
             }
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                // Poll for work
+            // No pending work — poll with a short sleep, checking for shutdown
+            tokio::select! {
+                _ = token.cancelled() => {
+                    tracing::info!("Scanner worker shutting down");
+                    return;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
-        }
-
-        // Get next job from scheduler
-        let job = {
-            let mut sched = scheduler.lock().await;
-            sched.next_job()
-        };
-
-        let job = match job {
-            Some(j) => j,
-            None => continue,
         };
 
         // Check backpressure
@@ -69,32 +67,89 @@ pub async fn run_scan_workers(
             "Executing scan job"
         );
 
-        let result = execute_scan_job(&metadata, &root, &job.scope, job.target_level).await;
+        let result = execute_scan_job(
+            &metadata,
+            &root,
+            &job.scope,
+            job.target_level,
+            job.is_continuation(),
+            job.l2_cursor.as_deref(),
+            job.l3_cursor.as_deref(),
+            job.l3_bytes_per_sec,
+        )
+        .await;
 
         {
             let mut sched = scheduler.lock().await;
             match result {
-                Ok(has_remaining) => {
+                Ok((has_remaining, l2_cursor, l3_cursor, l3_bytes_per_sec)) => {
                     sched.complete(job.id);
                     if has_remaining {
                         tracing::debug!(
                             priority = ?job.priority,
                             target_level = ?job.target_level,
+                            l2_cursor = ?l2_cursor,
+                            l3_cursor = ?l3_cursor,
+                            l3_bytes_per_sec = ?l3_bytes_per_sec,
                             "Batch limit reached, scheduling continuation job"
                         );
-                        sched.schedule(ScanJob::new(
+                        sched.schedule(ScanJob::new_continuation(
                             job.priority,
                             job.scope.clone(),
                             job.target_level,
+                            l2_cursor,
+                            l3_cursor,
+                            l3_bytes_per_sec,
                         ));
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(job_id = %job.id, error = %e, "Scan job failed");
-                    sched.fail(job.id);
+                    let error_msg = e.to_string();
+                    if e.is_retryable() && job.retry_count < MAX_RETRIES {
+                        let mut retry_job = job.clone();
+                        retry_job.retry_count += 1;
+                        retry_job.last_error = Some(error_msg.clone());
+                        retry_job.status = crate::scanner::scheduler::JobStatus::Pending;
+                        let attempt = retry_job.retry_count;
+                        sched.fail(job.id); // Remove from active set
+                        let backoff = Duration::from_secs(1 << (attempt - 1)); // 1s, 2s, 4s
+                        tracing::warn!(
+                            job_id = %retry_job.id,
+                            error = %error_msg,
+                            attempt = attempt,
+                            max_retries = MAX_RETRIES,
+                            backoff_secs = backoff.as_secs(),
+                            "Scan job failed (transient), retrying after backoff"
+                        );
+                        drop(sched); // Release lock during backoff sleep
+                        tokio::time::sleep(backoff).await;
+                        let mut sched = scheduler.lock().await;
+                        sched.schedule(retry_job);
+                    } else {
+                        let mut failed_job = job.clone();
+                        failed_job.status = crate::scanner::scheduler::JobStatus::Failed;
+                        failed_job.last_error = Some(error_msg.clone());
+                        sched.fail(job.id); // Remove from active set
+                        sched.record_failure(failed_job);
+                        tracing::error!(
+                            job_id = %job.id,
+                            error = %error_msg,
+                            retry_count = job.retry_count,
+                            "Scan job failed permanently"
+                        );
+                    }
                 }
             }
         }
+
+        // Check for shutdown between jobs
+        if token.is_cancelled() {
+            tracing::info!("Scanner worker shutting down");
+            break;
+        }
+
+        // Yield to let other tasks run between consecutive jobs
+        tokio::task::yield_now().await;
     }
 
     tracing::debug!("Scanner worker exited");
@@ -106,17 +161,37 @@ pub async fn run_watch_processor(
     root: PathBuf,
     mut rx: tokio::sync::mpsc::Receiver<crate::scanner::watcher::WatchEvent>,
     scheduler: Arc<Mutex<ScanScheduler>>,
+    drop_counter: Arc<AtomicU64>,
     token: CancellationToken,
 ) {
     use crate::scanner::watcher::WatchEvent;
 
     tracing::debug!("Watch processor started");
 
+    let mut drop_check = tokio::time::interval(Duration::from_secs(10));
+    drop_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             _ = token.cancelled() => {
                 tracing::info!("Watch processor shutting down");
                 break;
+            }
+            _ = drop_check.tick() => {
+                let dropped = drop_counter.swap(0, Ordering::Relaxed);
+                if dropped > 0 {
+                    tracing::warn!(
+                        dropped_events = dropped,
+                        "Watch channel overflow — scheduling full reconcile to catch missed files"
+                    );
+                    let job = ScanJob::new(
+                        Priority::Reconcile,
+                        ScanScope::Bucket,
+                        ScanLevel::Content,
+                    );
+                    let mut sched = scheduler.lock().await;
+                    sched.schedule(job);
+                }
             }
             event = rx.recv() => {
                 let event = match event {
@@ -243,34 +318,66 @@ async fn handle_file_changed(
 }
 
 const L2_BATCH_LIMIT: i64 = 10_000;
-const L3_BATCH_LIMIT: i64 = 1_000;
+
+/// Maximum L3 hashing concurrency (file count processed in parallel).
+const L3_MAX_CONCURRENCY: usize = 32;
+
+/// Seed byte budget for the first L3 batch (50 MB). Small enough to finish
+/// quickly and calibrate throughput.
+const L3_SEED_BYTES: i64 = 50 * 1024 * 1024;
+
+/// Target wall-clock time per L3 batch (2 minutes).
+const L3_TARGET_SECS: f64 = 120.0;
+
+/// Upper bound on L3 byte budget to avoid scheduling enormous batches on very
+/// fast storage.
+const L3_MAX_BUDGET: i64 = 50 * 1024 * 1024 * 1024;
 
 /// Execute a single scan job — runs L1, then optionally L2 and L3 up to target level.
 ///
-/// Returns `true` if there are remaining keys that need processing (i.e. the
-/// batch limit was reached and a continuation job should be scheduled).
+/// Returns `(has_remaining, l2_cursor, l3_cursor, l3_bytes_per_sec)`. When
+/// `has_remaining` is true the caller should schedule a continuation job
+/// carrying the cursors and throughput estimate so the next batch can skip
+/// directly to unprocessed work via keyset pagination and size its byte budget
+/// appropriately.
+///
+/// L2 and L3 use independent cursors so that each level advances through the
+/// keyspace at its own pace. Without this, L3 would inherit L2's cursor and
+/// skip files that L2 just promoted to level 2 but that still need L3 hashing.
+#[allow(clippy::too_many_arguments)]
 async fn execute_scan_job(
     metadata: &MetadataStore,
     root: &Path,
     scope: &ScanScope,
     target_level: ScanLevel,
-) -> Result<bool, S3Error> {
-    // L1 discovery is always needed for non-Files scopes
-    match scope {
-        ScanScope::Files(_) => {}
-        _ => {
-            levels::scan_l1(metadata, root, scope).await?;
+    is_continuation: bool,
+    l2_cursor: Option<&str>,
+    l3_cursor: Option<&str>,
+    l3_bytes_per_sec: Option<f64>,
+) -> Result<(bool, Option<String>, Option<String>, Option<f64>), S3Error> {
+    // L1 discovery is always needed for non-Files scopes.
+    // Only run on the first batch — subsequent continuation jobs skip L1
+    // since discovery is already complete.
+    if !is_continuation {
+        match scope {
+            ScanScope::Files(_) => {}
+            _ => {
+                levels::scan_l1(metadata, root, scope).await?;
+            }
         }
     }
 
     let mut has_remaining = false;
+    let mut new_l2_cursor: Option<String> = l2_cursor.map(|s| s.to_string());
+    let mut new_l3_cursor: Option<String> = l3_cursor.map(|s| s.to_string());
+    let mut new_l3_bytes_per_sec: Option<f64> = l3_bytes_per_sec;
 
     if target_level.as_i32() >= ScanLevel::Metadata.as_i32() {
         let keys = match scope {
             ScanScope::Files(keys) => keys.clone(),
             _ => {
                 let keys = metadata
-                    .list_keys_below_scan_level(2, L2_BATCH_LIMIT)
+                    .list_keys_below_scan_level(2, L2_BATCH_LIMIT, l2_cursor)
                     .await?;
                 if keys.len() as i64 >= L2_BATCH_LIMIT {
                     has_remaining = true;
@@ -278,28 +385,140 @@ async fn execute_scan_job(
                 keys
             }
         };
+        if let Some(k) = keys.last() {
+            new_l2_cursor = Some(k.clone());
+        }
         if !keys.is_empty() {
             levels::scan_l2(metadata, root, &keys).await?;
         }
     }
 
     if target_level.as_i32() >= ScanLevel::Content.as_i32() {
-        let keys = match scope {
-            ScanScope::Files(keys) => keys.clone(),
+        let (keys, concurrency) = match scope {
+            ScanScope::Files(keys) => {
+                let c = keys.len().clamp(1, L3_MAX_CONCURRENCY);
+                (keys.clone(), c)
+            }
             _ => {
-                let keys = metadata
-                    .list_keys_below_scan_level(3, L3_BATCH_LIMIT)
+                // Compute byte budget from previous throughput or use seed
+                let byte_budget = match l3_bytes_per_sec {
+                    Some(rate) => ((rate * L3_TARGET_SECS) as i64).min(L3_MAX_BUDGET),
+                    None => L3_SEED_BYTES,
+                };
+
+                tracing::info!(
+                    byte_budget = levels::format_human_size(byte_budget as u64),
+                    throughput = l3_bytes_per_sec.map(|r| levels::format_human_size(r as u64)),
+                    "L3 batch byte budget"
+                );
+
+                let (selected, exhausted, selected_bytes) = metadata
+                    .list_keys_by_byte_budget(3, byte_budget, l3_cursor)
                     .await?;
-                if keys.len() as i64 >= L3_BATCH_LIMIT {
+                if !exhausted {
                     has_remaining = true;
                 }
-                keys
+
+                // Compute concurrency from average file size of *actually selected*
+                // files, not the byte budget. When remaining data is smaller than
+                // the budget the two diverge significantly.
+                let avg_size = selected_bytes as usize / selected.len().max(1);
+                let c = match avg_size {
+                    0..=524_288 => 32,          // ≤ 500 KB
+                    524_289..=1_048_576 => 16,  // 500 KB – 1 MB
+                    1_048_577..=8_388_608 => 8, // 1 MB – 8 MB
+                    _ => 1,                     // > 8 MB
+                }
+                .min(L3_MAX_CONCURRENCY);
+
+                (selected, c)
             }
         };
+        if let Some(k) = keys.last() {
+            new_l3_cursor = Some(k.clone());
+        }
         if !keys.is_empty() {
-            levels::scan_l3(metadata, root, &keys).await?;
+            let batch_files = keys.len();
+            let l3_start = std::time::Instant::now();
+            let report = levels::scan_l3(metadata, root, &keys, concurrency).await?;
+            let elapsed = l3_start.elapsed().as_secs_f64();
+
+            // Use total files attempted (hashed + skipped) to account for
+            // wall-clock time spent on files that were skipped (not found,
+            // modified during scan, etc.). The byte estimate for skipped files
+            // comes from the DB sizes we selected, so we use the full batch
+            // count to compute throughput.
+            let total_attempted = report.hashed + report.skipped;
+            if elapsed > 0.0 && total_attempted > 0 {
+                // Estimate total bytes attempted: scale report.bytes by the
+                // ratio of total files to successfully hashed files.
+                let estimated_bytes = if report.hashed > 0 {
+                    (report.bytes as f64) * (total_attempted as f64 / report.hashed as f64)
+                } else {
+                    // All files skipped — use a minimal estimate so we don't
+                    // divide by zero. The next batch will recalibrate.
+                    report.bytes as f64
+                };
+                let measured_rate = estimated_bytes / elapsed;
+                // Use EWMA to smooth throughput estimates across batches.
+                // The first batch sets the baseline; subsequent batches
+                // blend 30% new measurement with 70% previous estimate to
+                // dampen oscillations from cache effects, file size skew,
+                // and other I/O variability.
+                const EWMA_ALPHA: f64 = 0.3;
+                new_l3_bytes_per_sec = Some(match l3_bytes_per_sec {
+                    Some(prev) => EWMA_ALPHA * measured_rate + (1.0 - EWMA_ALPHA) * prev,
+                    None => measured_rate,
+                });
+                tracing::info!(
+                    files = batch_files,
+                    hashed = report.hashed,
+                    skipped = report.skipped,
+                    bytes = levels::format_human_size(report.bytes),
+                    elapsed_secs = format_args!("{:.1}", elapsed),
+                    throughput = levels::format_human_size(measured_rate as u64),
+                    smoothed = levels::format_human_size(new_l3_bytes_per_sec.unwrap() as u64),
+                    "L3 batch throughput"
+                );
+            }
         }
     }
 
-    Ok(has_remaining)
+    // Log remaining work for non-Files scopes when there's more to do
+    if has_remaining && !matches!(scope, ScanScope::Files(_)) {
+        log_scan_remaining(metadata, target_level).await;
+    }
+
+    Ok((
+        has_remaining,
+        new_l2_cursor,
+        new_l3_cursor,
+        new_l3_bytes_per_sec,
+    ))
+}
+
+/// Log the number of files and bytes remaining for L2 and L3 scans.
+async fn log_scan_remaining(metadata: &MetadataStore, target_level: ScanLevel) {
+    if target_level.as_i32() >= ScanLevel::Metadata.as_i32() {
+        if let Ok((files, bytes)) = metadata.count_remaining_below_scan_level(2).await {
+            if files > 0 {
+                tracing::info!(
+                    remaining_files = files,
+                    remaining_bytes = levels::format_human_size(bytes as u64),
+                    "Scan progress: L2 metadata"
+                );
+            }
+        }
+    }
+    if target_level.as_i32() >= ScanLevel::Content.as_i32() {
+        if let Ok((files, bytes)) = metadata.count_remaining_below_scan_level(3).await {
+            if files > 0 {
+                tracing::info!(
+                    remaining_files = files,
+                    remaining_bytes = levels::format_human_size(bytes as u64),
+                    "Scan progress: L3 content-hash"
+                );
+            }
+        }
+    }
 }

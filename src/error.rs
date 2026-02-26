@@ -107,6 +107,15 @@ impl S3Error {
         }
     }
 
+    /// Whether this error is transient and the operation should be retried.
+    ///
+    /// Only `InternalError` is retryable — it covers SQLite lock timeouts,
+    /// transient I/O errors, and other temporary failures. `AccessDenied`,
+    /// `NoSuchKey`, and other variants represent permanent conditions.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::InternalError)
+    }
+
     /// Human-readable error message.
     pub fn message(&self) -> String {
         self.to_string()

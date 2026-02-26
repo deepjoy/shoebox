@@ -71,3 +71,81 @@ note() {
 ok() {
   echo -e "  ${AVOCADO}✓ $1${RESET}"
 }
+
+# --- Part registry ------------------------------------------------------------
+
+PARTS=()
+
+part() {
+  PARTS+=("$1|$2")
+}
+
+run_demo() {
+  for entry in "${PARTS[@]}"; do
+    local fn="${entry%%|*}"
+    local title="${entry#*|}"
+    banner "$title"
+    "$fn"
+    sleep "$DELAY"
+  done
+  sleep "$END_DELAY"
+}
+
+# --- Setup helpers ---------------------------------------------------------
+
+# Resolve the project root and shoebox binary path.
+# Uses BASH_SOURCE[1] to find the calling script's location.
+require_shoebox() {
+  PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[1]}")/../.." && pwd)"
+  SHOEBOX="$PROJECT_ROOT/target/release/shoebox"
+  if [[ ! -x "$SHOEBOX" ]]; then
+    echo "Error: shoebox binary not found at $SHOEBOX"
+    echo "Run 'cargo build --release' first."
+    exit 1
+  fi
+}
+
+# Poll until the server responds to HTTP requests (up to 3 seconds).
+# Usage: wait_for_server http://127.0.0.1:9876
+wait_for_server() {
+  local endpoint="$1"
+  for _i in $(seq 1 30); do
+    if curl -s -o /dev/null "$endpoint/" 2>/dev/null; then return 0; fi
+    sleep 0.1
+  done
+  echo "Error: server did not become ready at $endpoint"
+  exit 1
+}
+
+# Extract access_key_id and secret_access_key from a bucket's config.toml.
+# Sets ACCESS_KEY and SECRET_KEY in the caller's scope.
+# Usage: extract_credentials "$BUCKET_DIR"
+extract_credentials() {
+  local config="$1/.shoebox/config.toml"
+  ACCESS_KEY=$(grep access_key_id "$config" | head -1 | cut -d'"' -f2)
+  SECRET_KEY=$(grep secret_access_key "$config" | head -1 | cut -d'"' -f2)
+}
+
+# Export standard AWS environment variables for the AWS CLI.
+# Usage: setup_aws_env "$ACCESS_KEY" "$SECRET_KEY" "$ENDPOINT"
+setup_aws_env() {
+  export AWS_ACCESS_KEY_ID="$1"
+  export AWS_SECRET_ACCESS_KEY="$2"
+  export AWS_DEFAULT_REGION=us-east-1
+  export AWS_ENDPOINT_URL="$3"
+}
+
+# Signed curl request using curl's built-in AWS SigV4 signing.
+# Reads AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL from env.
+# Usage: signed_curl GET "/bucket/key?query" [-o /dev/null -w '%{http_code}']
+signed_curl() {
+  local method="$1"; shift
+  local path="$1"; shift
+
+  curl -s "$@" \
+    -X "$method" \
+    --aws-sigv4 "aws:amz:us-east-1:s3" \
+    --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+    -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+    "${AWS_ENDPOINT_URL}${path}"
+}

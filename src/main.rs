@@ -213,8 +213,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut loaded_buckets = HashMap::new();
     for bucket in &buckets {
+        let bucket_start = std::time::Instant::now();
+
         let db_path = bucket.shoebox_dir.join(METADATA_DB);
         let metadata = MetadataStore::new(&db_path).await?;
+        tracing::info!(
+            bucket = %bucket.name,
+            elapsed = ?bucket_start.elapsed(),
+            "Metadata store ready"
+        );
+
         let storage = FilesystemStorage::new(bucket.root.clone());
         let parts_dir = bucket.shoebox_dir.join("parts");
         tokio::fs::create_dir_all(&parts_dir).await?;
@@ -231,10 +239,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
         }
 
-        // Start filesystem watcher
+        // Start filesystem watcher (uses spawn_blocking to avoid blocking the runtime
+        // during recursive inotify watch setup on large directory trees)
+        let watcher_start = std::time::Instant::now();
+        let watch_capacity = global_config
+            .as_ref()
+            .and_then(|gc| gc.watch_channel_capacity)
+            .unwrap_or(1000);
         let watcher = {
-            let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(1000);
-            match FilesystemWatcher::new(bucket.root.clone(), watch_tx) {
+            let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(watch_capacity);
+            let watch_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            match FilesystemWatcher::spawn(bucket.root.clone(), watch_tx, watch_drops.clone()).await
+            {
                 Ok(w) => {
                     tracing::debug!(bucket = %bucket.name, "Filesystem watcher started");
                     tokio::spawn(worker::run_watch_processor(
@@ -242,6 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         bucket.root.clone(),
                         watch_rx,
                         scheduler.clone(),
+                        watch_drops,
                         shutdown_token.clone(),
                     ));
                     Some(w)
@@ -256,6 +273,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         };
+        tracing::info!(
+            bucket = %bucket.name,
+            elapsed = ?watcher_start.elapsed(),
+            "Filesystem watcher setup complete"
+        );
 
         // Spawn scan worker for this bucket
         tokio::spawn(worker::run_scan_workers(
@@ -391,7 +413,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    let listener = tokio::net::TcpListener::bind(&listen_addr)
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                format!(
+                    "Port {} is already in use. Is another Shoebox instance running?\n\
+                 Try a different port with --port <PORT>",
+                    config.port
+                )
+            } else {
+                format!("Failed to bind to {}: {}", listen_addr, e)
+            }
+        })?;
     tracing::info!("Listening on {}", listen_addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_token.cancelled_owned())

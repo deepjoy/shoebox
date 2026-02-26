@@ -50,6 +50,11 @@ fn is_shoebox_dir(path: &Path) -> bool {
 
 /// L1: Fast directory walk — discovers files on disk and inserts new records.
 ///
+/// Uses a SQLite temp table to collect all discovered disk keys during the walk,
+/// then merges against the `objects` table in two SQL statements (INSERT new,
+/// DELETE stale). This keeps memory usage O(1) regardless of file count — all
+/// working set pressure is handled by SQLite's page cache.
+///
 /// This is a free function per the library-first design principle. Both HTTP
 /// handlers and `Shoebox` library methods can call it directly.
 pub async fn scan_l1(
@@ -57,19 +62,18 @@ pub async fn scan_l1(
     root: &Path,
     scope: &ScanScope,
 ) -> Result<L1Report, S3Error> {
-    let mut report = L1Report::default();
     let scan_start = std::time::Instant::now();
 
-    // Load all known keys up front — one query instead of per-file lookups
-    let db_keys: std::collections::HashSet<String> =
-        metadata.get_all_keys().await?.into_iter().collect();
-    tracing::info!(db_keys = db_keys.len(), "L1 loaded existing keys");
+    // Acquire a dedicated connection and create a temp table for disk keys.
+    // The connection must be reused for all temp table operations.
+    let mut conn = metadata.l1_scan_begin().await?;
+    tracing::info!("L1 scan started, temp table created");
 
-    // Collect all keys currently on disk within scope
-    let mut disk_keys = std::collections::HashSet::new();
+    // Walk the filesystem and batch-insert every discovered file into the temp table
     let mut batch: Vec<ObjectRecord> = Vec::with_capacity(BATCH_SIZE);
     let mut batch_start = std::time::Instant::now();
     let mut last_progress = std::time::Instant::now();
+    let mut files_walked: u64 = 0;
 
     let mut walker = WalkDir::new(root);
     walker = walker.filter(|entry| async move {
@@ -117,39 +121,30 @@ pub async fn scan_l1(
                 continue;
             }
         };
-        let is_dir = file_type.is_dir();
         let is_symlink = file_type.is_symlink();
 
-        // Skip directories from object tracking — S3 doesn't list directories as objects
-        if is_dir {
+        // Only catalog regular files and symlinks — skip directories, named pipes,
+        // sockets, and device nodes which could block or consume unbounded memory.
+        if !(file_type.is_file() || is_symlink) {
             continue;
         }
 
-        let parent = key
-            .rsplit_once('/')
-            .map(|(p, _)| p.to_string())
-            .unwrap_or_default();
-
-        disk_keys.insert(key.clone());
+        files_walked += 1;
 
         // Log progress every 5 seconds
         if last_progress.elapsed() >= std::time::Duration::from_secs(5) {
-            let total = report.discovered + report.unchanged;
             tracing::info!(
-                files = total,
-                discovered = report.discovered,
-                unchanged = report.unchanged,
+                files = files_walked,
                 elapsed = ?scan_start.elapsed(),
                 "L1 scan in progress"
             );
             last_progress = std::time::Instant::now();
         }
 
-        // Check if already in DB (in-memory lookup)
-        if db_keys.contains(&key) {
-            report.unchanged += 1;
-            continue;
-        }
+        let parent = key
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
 
         // Read symlink target if applicable
         let symlink_target = if is_symlink {
@@ -187,12 +182,11 @@ pub async fn scan_l1(
         };
 
         batch.push(obj);
-        report.discovered += 1;
 
         if batch.len() >= BATCH_SIZE
             || (!batch.is_empty() && batch_start.elapsed() >= BATCH_TIMEOUT)
         {
-            metadata.insert_objects_batch(&batch).await?;
+            MetadataStore::l1_scan_insert_batch(&mut conn, &batch).await?;
             batch.clear();
             batch_start = std::time::Instant::now();
         }
@@ -200,26 +194,34 @@ pub async fn scan_l1(
 
     // Flush remaining batch
     if !batch.is_empty() {
-        metadata.insert_objects_batch(&batch).await?;
+        MetadataStore::l1_scan_insert_batch(&mut conn, &batch).await?;
     }
 
-    // Find deleted files: objects in DB but not on disk
-    if matches!(scope, ScanScope::Bucket) {
-        tracing::info!(
-            disk_files = disk_keys.len(),
-            elapsed = ?scan_start.elapsed(),
-            "L1 walk complete, checking for deleted files"
-        );
-        let to_delete: Vec<String> = db_keys
-            .into_iter()
-            .filter(|k| !disk_keys.contains(k))
-            .collect();
-        for chunk in to_delete.chunks(BATCH_SIZE) {
-            report.deleted += metadata.delete_objects(chunk).await?;
-        }
-    }
+    tracing::info!(
+        files = files_walked,
+        elapsed = ?scan_start.elapsed(),
+        "L1 walk complete, merging into catalog"
+    );
 
-    Ok(report)
+    // Merge: insert new objects and delete stale ones in two SQL statements
+    let delete_stale = matches!(scope, ScanScope::Bucket);
+    let (discovered, deleted) = MetadataStore::l1_scan_finish(&mut conn, delete_stale).await?;
+
+    let unchanged = files_walked.saturating_sub(discovered);
+
+    tracing::info!(
+        discovered = discovered,
+        unchanged = unchanged,
+        deleted = deleted,
+        elapsed = ?scan_start.elapsed(),
+        "L1 scan complete"
+    );
+
+    Ok(L1Report {
+        discovered,
+        deleted,
+        unchanged,
+    })
 }
 
 /// L2: stat() each file for metadata (size, mtime, ctime, inode, device_id).
@@ -231,7 +233,11 @@ pub async fn scan_l2(
     let mut report = L2Report::default();
     let total = keys.len();
 
-    tracing::info!(files = total, "L2 metadata scan starting");
+    if total > 1 {
+        tracing::info!(files = total, "L2 metadata scan starting");
+    } else {
+        tracing::debug!(files = total, "L2 metadata scan starting");
+    }
 
     let mut batch: Vec<(String, ObjectMetadataUpdate)> = Vec::with_capacity(BATCH_SIZE);
     let mut batch_start = std::time::Instant::now();
@@ -264,7 +270,7 @@ pub async fn scan_l2(
         batch.push((key.clone(), update));
         report.updated += 1;
 
-        tracing::info!(
+        tracing::debug!(
             key = %key,
             size = size,
             progress = format_args!("[{}/{}]", i + 1, total),
@@ -285,118 +291,211 @@ pub async fn scan_l2(
         metadata.update_objects_metadata_batch(&batch).await?;
     }
 
-    tracing::info!(
-        updated = report.updated,
-        errors = report.errors,
-        "L2 metadata scan complete"
-    );
+    if total > 1 {
+        tracing::info!(
+            updated = report.updated,
+            errors = report.errors,
+            "L2 metadata scan complete"
+        );
+    } else {
+        tracing::debug!(
+            updated = report.updated,
+            errors = report.errors,
+            "L2 metadata scan complete"
+        );
+    }
 
     Ok(report)
 }
 
-/// L3: Read file and compute hashes (MD5 for ETag, SHA-256 for content_hash).
+/// Result of hashing a single file.
+enum L3FileResult {
+    Hashed {
+        key: String,
+        etag: String,
+        content_hash: String,
+        size: u64,
+    },
+    /// File was a symlink — promote to scan_level 3 without hashing.
+    Symlink {
+        key: String,
+    },
+    Skipped,
+}
+
+/// Hash a single file, computing MD5 (ETag) and SHA-256 (content_hash).
+///
+/// Returns `L3FileResult::Hashed` on success or `L3FileResult::Skipped` if the
+/// file is missing, unreadable, a directory, or was modified during the scan.
+async fn hash_one_file(root: &Path, key: &str, index: usize, total: usize) -> L3FileResult {
+    let path = root.join(key);
+
+    // Skip symlinks — they don't have independently hashable content in the
+    // S3 model.  Promote them to scan_level 3 so they aren't re-queued.
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(m) if m.file_type().is_symlink() => {
+            tracing::debug!("L3 scan: skipping symlink {key}");
+            return L3FileResult::Symlink {
+                key: key.to_string(),
+            };
+        }
+        Err(e) => {
+            tracing::warn!("L3 scan: cannot stat {key}: {e}");
+            return L3FileResult::Skipped;
+        }
+        Ok(_) => {} // regular file — continue to hashing
+    }
+
+    // Record mtime before reading
+    let pre_meta = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!("L3 scan: skipping dangling symlink {key}");
+            return L3FileResult::Skipped;
+        }
+        Err(e) => {
+            tracing::warn!("L3 scan: cannot access {key}: {e}");
+            return L3FileResult::Skipped;
+        }
+    };
+
+    // Skip directories (e.g. symlinks whose target is a directory)
+    if pre_meta.is_dir() {
+        return L3FileResult::Skipped;
+    }
+
+    let mtime_before = pre_meta.modified().ok();
+
+    // Stream through MD5 and SHA-256
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("L3 scan: cannot open {key}: {e}");
+            return L3FileResult::Skipped;
+        }
+    };
+    let mut reader = tokio::io::BufReader::new(file);
+
+    let mut md5_hasher = Md5::new();
+    let mut sha256_hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut size = 0u64;
+    let mut read_error = false;
+
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("L3 scan: read error for {key}: {e}");
+                read_error = true;
+                break;
+            }
+        };
+        md5_hasher.update(&buf[..n]);
+        sha256_hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+
+    if read_error {
+        return L3FileResult::Skipped;
+    }
+
+    // Verify mtime unchanged (file wasn't modified during scan)
+    let mtime_after = tokio::fs::metadata(&path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok());
+
+    if mtime_before != mtime_after {
+        tracing::debug!(
+            key = %key,
+            progress = format_args!("[{}/{}]", index + 1, total),
+            "L3 skipped (modified during scan)"
+        );
+        return L3FileResult::Skipped;
+    }
+
+    let etag = format!("\"{}\"", hex::encode(md5_hasher.finalize()));
+    let content_hash = format!("sha256:{}", hex::encode(sha256_hasher.finalize()));
+
+    tracing::debug!(
+        key = %key,
+        size = format_human_size(size),
+        progress = format_args!("[{}/{}]", index + 1, total),
+        "L3 hash complete"
+    );
+
+    L3FileResult::Hashed {
+        key: key.to_string(),
+        etag,
+        content_hash,
+        size,
+    }
+}
+
+/// L3: Read files and compute hashes (MD5 for ETag, SHA-256 for content_hash).
+///
+/// Files are hashed concurrently using `buffer_unordered(concurrency)`.
+/// Use higher concurrency for small files (syscall-bound) and lower for large
+/// files (I/O-bound).
 pub async fn scan_l3(
     metadata: &MetadataStore,
     root: &Path,
     keys: &[String],
+    concurrency: usize,
 ) -> Result<L3Report, S3Error> {
     let mut report = L3Report::default();
     let total = keys.len();
 
-    tracing::info!(files = total, "L3 content-hash scan starting");
+    if total > 1 {
+        tracing::info!(files = total, concurrency, "L3 content-hash scan starting");
+    } else {
+        tracing::debug!(files = total, concurrency, "L3 content-hash scan starting");
+    }
 
+    // Hash files concurrently — clone keys up-front so the futures are 'static
+    let root = root.to_owned();
+    let tasks: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let root = root.clone();
+            let key = key.clone();
+            async move { hash_one_file(&root, &key, i, total).await }
+        })
+        .collect();
+    let results: Vec<L3FileResult> = futures::stream::iter(tasks)
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
+    // Batch-write results to the database
     let mut batch: Vec<(String, String, String, i32)> = Vec::with_capacity(BATCH_SIZE);
-    let mut batch_start = std::time::Instant::now();
-
-    for (i, key) in keys.iter().enumerate() {
-        let path = root.join(key);
-
-        // Record mtime before reading
-        let pre_meta = match tokio::fs::metadata(&path).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("L3 scan: cannot access {key}: {e}");
-                report.skipped += 1;
-                continue;
-            }
-        };
-
-        // Skip directories (e.g. symlinks whose target is a directory)
-        if pre_meta.is_dir() {
-            report.skipped += 1;
-            continue;
-        }
-
-        let mtime_before = pre_meta.modified().ok();
-
-        // Stream through MD5 and SHA-256
-        let file = match tokio::fs::File::open(&path).await {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!("L3 scan: cannot open {key}: {e}");
-                report.skipped += 1;
-                continue;
-            }
-        };
-        let mut reader = tokio::io::BufReader::new(file);
-
-        let mut md5_hasher = Md5::new();
-        let mut sha256_hasher = Sha256::new();
-        let mut buf = [0u8; 64 * 1024];
-        let mut size = 0u64;
-
-        loop {
-            let n = match reader.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!("L3 scan: read error for {key}: {e}");
-                    report.skipped += 1;
-                    break;
+    let mut symlink_keys: Vec<String> = Vec::new();
+    for result in results {
+        match result {
+            L3FileResult::Hashed {
+                key,
+                etag,
+                content_hash,
+                size,
+            } => {
+                report.hashed += 1;
+                report.bytes += size;
+                batch.push((key, etag, content_hash, 3));
+                if batch.len() >= BATCH_SIZE {
+                    metadata.update_objects_hashes_batch(&batch).await?;
+                    batch.clear();
                 }
-            };
-            md5_hasher.update(&buf[..n]);
-            sha256_hasher.update(&buf[..n]);
-            size += n as u64;
-        }
-
-        // Verify mtime unchanged (file wasn't modified during scan)
-        let mtime_after = tokio::fs::metadata(&path)
-            .await
-            .ok()
-            .and_then(|m| m.modified().ok());
-
-        if mtime_before != mtime_after {
-            tracing::info!(
-                key = %key,
-                progress = format_args!("[{}/{}]", i + 1, total),
-                "L3 skipped (modified during scan)"
-            );
-            report.skipped += 1;
-            continue;
-        }
-
-        let etag = format!("\"{}\"", hex::encode(md5_hasher.finalize()));
-        let content_hash = format!("sha256:{}", hex::encode(sha256_hasher.finalize()));
-
-        report.hashed += 1;
-        report.bytes += size;
-
-        batch.push((key.clone(), etag, content_hash, 3));
-
-        tracing::info!(
-            key = %key,
-            size = format_human_size(size),
-            progress = format_args!("[{}/{}]", i + 1, total),
-            "L3 hash complete"
-        );
-
-        if batch.len() >= BATCH_SIZE
-            || (!batch.is_empty() && batch_start.elapsed() >= BATCH_TIMEOUT)
-        {
-            metadata.update_objects_hashes_batch(&batch).await?;
-            batch.clear();
-            batch_start = std::time::Instant::now();
+            }
+            L3FileResult::Symlink { key } => {
+                report.skipped += 1;
+                symlink_keys.push(key);
+            }
+            L3FileResult::Skipped => {
+                report.skipped += 1;
+            }
         }
     }
 
@@ -405,18 +504,36 @@ pub async fn scan_l3(
         metadata.update_objects_hashes_batch(&batch).await?;
     }
 
-    tracing::info!(
-        hashed = report.hashed,
-        bytes = report.bytes,
-        skipped = report.skipped,
-        "L3 content-hash scan complete"
-    );
+    // Promote symlinks to scan_level 3 so they aren't re-queued
+    if !symlink_keys.is_empty() {
+        tracing::debug!(
+            count = symlink_keys.len(),
+            "promoting symlinks to scan_level 3"
+        );
+        metadata.promote_scan_level_batch(&symlink_keys, 3).await?;
+    }
+
+    if total > 1 {
+        tracing::info!(
+            hashed = report.hashed,
+            bytes = format_human_size(report.bytes),
+            skipped = report.skipped,
+            "L3 content-hash scan complete"
+        );
+    } else {
+        tracing::debug!(
+            hashed = report.hashed,
+            bytes = format_human_size(report.bytes),
+            skipped = report.skipped,
+            "L3 content-hash scan complete"
+        );
+    }
 
     Ok(report)
 }
 
 /// Format bytes as a human-readable size string.
-fn format_human_size(bytes: u64) -> String {
+pub fn format_human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;
@@ -575,7 +692,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = scan_l3(&store, &bucket_root, &["file.txt".to_string()])
+        let report = scan_l3(&store, &bucket_root, &["file.txt".to_string()], 1)
             .await
             .unwrap();
         assert_eq!(report.hashed, 1);
@@ -589,5 +706,55 @@ mod tests {
         // Verify MD5 of "hello world"
         let expected_md5 = format!("\"{}\"", hex::encode(Md5::digest(b"hello world")));
         assert_eq!(obj.etag.unwrap(), expected_md5);
+    }
+
+    #[tokio::test]
+    async fn test_l3_skips_symlinks_and_promotes() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket_root).unwrap();
+        std::fs::write(bucket_root.join("target.txt"), "real content").unwrap();
+
+        // Create a symlink and a broken symlink
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                bucket_root.join("target.txt"),
+                bucket_root.join("link.txt"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                bucket_root.join("nonexistent"),
+                bucket_root.join("broken.txt"),
+            )
+            .unwrap();
+        }
+
+        let store = make_store(&tmp).await;
+        scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+
+        // All three should be discovered
+        let keys: Vec<String> = vec!["broken.txt".into(), "link.txt".into(), "target.txt".into()];
+        scan_l2(&store, &bucket_root, &keys).await.unwrap();
+
+        // L3 should hash only target.txt, skip the symlinks
+        let report = scan_l3(&store, &bucket_root, &keys, 1).await.unwrap();
+        assert_eq!(report.hashed, 1); // only target.txt
+        assert_eq!(report.skipped, 2); // link.txt + broken.txt
+
+        // Symlinks should be promoted to scan_level 3
+        let link = store.get_object("link.txt").await.unwrap().unwrap();
+        assert_eq!(link.scan_level, 3);
+        assert!(link.etag.is_none()); // no hash for symlinks
+
+        let broken = store.get_object("broken.txt").await.unwrap().unwrap();
+        assert_eq!(broken.scan_level, 3);
+
+        // Regular file should have hashes
+        let target = store.get_object("target.txt").await.unwrap().unwrap();
+        assert_eq!(target.scan_level, 3);
+        assert!(target.etag.is_some());
     }
 }

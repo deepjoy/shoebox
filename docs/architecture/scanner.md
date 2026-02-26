@@ -44,13 +44,15 @@ graph LR
 
 ### L1 — Discovery (`scan_l1`)
 
+- Acquires a dedicated SQLite connection and creates a temp table (`l1_disk`) to collect discovered files.
 - Walks the bucket root using `async_walkdir`, skipping the `.shoebox` metadata directory.
-- Loads all known keys from the DB into memory upfront for O(1) lookups.
 - For each file on disk within the `ScanScope`:
-  - Skips if already in the database (unchanged).
-  - Otherwise creates an `ObjectRecord` with UUID, key, parent directory, size, content type, and `scan_level = 1`.
-- Batches inserts (1000 rows or 500ms flush timeout).
-- For bucket-wide scans, detects **deleted files** — keys in the DB but no longer on disk — and removes them.
+  - Creates an `ObjectRecord` with UUID, key, parent directory, size, content type.
+  - Batch-inserts into the temp table (1000 rows or 500ms flush timeout).
+- After the walk completes, merges the temp table into `objects` with two SQL statements:
+  - **INSERT** new objects that exist on disk but not in the catalog (`scan_level = 1`).
+  - **DELETE** stale objects that are in the catalog but no longer on disk (bucket-wide scans only).
+- Memory usage is O(1) regardless of file count — all working-set pressure is handled by SQLite's page cache rather than an in-memory `HashSet`.
 - Idempotent: running L1 twice with no filesystem changes produces zero new discoveries.
 
 ### L2 — Metadata (`scan_l2`)
@@ -65,12 +67,15 @@ graph LR
 
 ### L3 — Content hash (`scan_l3`)
 
-- Receives a pre-fetched list of keys from the worker (see [Batch limits](#batch-limits-and-continuation)).
-- Streams file contents through dual hashers in a single pass:
-  - **MD5** → stored as the S3 `ETag` (quoted hex).
-  - **SHA-256** → stored as `content_hash` (`sha256:<hex>`).
-- Uses 64 KB read buffer for streaming I/O.
-- **Integrity check**: records `mtime` before and after reading. If the file was modified during the scan, the result is discarded and the file is skipped.
+- Receives a pre-fetched list of keys and a **concurrency** level from the worker (see [Batch limits](#batch-limits-and-continuation)).
+- **Symlinks are skipped**: `hash_one_file()` checks `symlink_metadata()` first — symlinks don't have independently hashable content in the S3 model. Skipped symlinks are promoted to `scan_level = 3` so they aren't re-queued.
+- Hashes files **concurrently** using `futures::stream::buffer_unordered(concurrency)`. Each file is processed by `hash_one_file()`, which:
+  - Streams file contents through dual hashers in a single pass:
+    - **MD5** → stored as the S3 `ETag` (quoted hex).
+    - **SHA-256** → stored as `content_hash` (`sha256:<hex>`).
+  - Uses 64 KB read buffer for streaming I/O.
+  - **Integrity check**: records `mtime` before and after reading. If the file was modified during the scan, the result is discarded and the file is skipped.
+- After all files in the batch are hashed, results are written to the database in chunks of `BATCH_SIZE`.
 - Sets `scan_level = 3`.
 
 ## Scheduler
@@ -106,23 +111,52 @@ When a `Realtime` (P0) job is scheduled, all currently active non-Realtime jobs 
 
 ## Batch limits and continuation
 
-To prevent memory pressure and allow interleaving with higher-priority work, the worker caps the number of keys processed per job:
+To prevent memory pressure and allow interleaving with higher-priority work, the worker caps work per job:
 
-| Level | Batch limit | Constant |
-|-------|-------------|----------|
-| L2 — Metadata | 10,000 keys | `L2_BATCH_LIMIT` |
-| L3 — Content | 1,000 keys | `L3_BATCH_LIMIT` |
+| Level | Batching strategy |
+|-------|-------------------|
+| L2 — Metadata | Fixed count: 10,000 keys (`L2_BATCH_LIMIT`) |
+| L3 — Content | **Adaptive byte budget** targeting ~2 minutes per batch |
 
-The worker queries `list_keys_below_scan_level(level, limit)` to fetch the next batch. When the returned key count reaches the limit, `execute_scan_job` returns `has_remaining = true` and the worker schedules a **continuation job** with the same priority, scope, and target level. This repeats until all keys are processed.
+### L2 batching
+
+L2 uses `list_keys_below_scan_level(level, limit, after_key)` to fetch the next batch by key count.
+
+### L3 adaptive byte budget
+
+L3 batches are sized by **total bytes** rather than file count, so each batch takes roughly the same wall-clock time regardless of whether it contains many small files or a few large ones.
+
+1. **Seed batch**: The first L3 batch uses a 50 MB byte budget (`L3_SEED_BYTES`) to calibrate throughput.
+2. **Measure**: After each batch, the worker computes `bytes_per_sec` from elapsed time and total bytes attempted (including skipped files).
+3. **Smooth**: The throughput estimate is updated using an exponential weighted moving average (EWMA, α=0.3). The first batch sets the baseline directly; subsequent batches blend 30% new measurement with 70% previous estimate to dampen oscillations from cache effects, file size skew, and other I/O variability.
+4. **Adapt**: The next batch's byte budget is set to `smoothed_bytes_per_sec × 120s` (2-minute target), capped at 50 GB (`L3_MAX_BUDGET`).
+5. **Carry forward**: The smoothed throughput estimate (`l3_bytes_per_sec`) is passed to continuation jobs so it persists across batches.
+
+The worker queries `list_keys_by_byte_budget(level, byte_budget, after_key)` which fetches keys with their sizes and accumulates until the budget is exceeded (with a 10,000-row safety cap).
+
+### L3 concurrency
+
+L3 hashing concurrency is determined by average file size in the batch. Smaller files are syscall-bound and benefit from parallelism; larger files are I/O-bound and run sequentially.
+
+| Avg file size | Concurrency |
+|---------------|-------------|
+| ≤ 500 KB | 32 |
+| 500 KB – 1 MB | 16 |
+| 1 – 8 MB | 8 |
+| > 8 MB | 1 |
+
+### Continuation jobs
+
+L2 and L3 use **independent cursors** (`l2_cursor` and `l3_cursor`) so each level advances through the keyspace at its own pace. When either level has remaining work, `execute_scan_job` returns `has_remaining=true` and the worker schedules a **continuation job** carrying both cursors and the L3 throughput estimate, so the next query uses keyset pagination (`WHERE key > ?`) to skip directly to unprocessed work.
 
 ```mermaid
 graph LR
-    JOB1["Job (L3, 1000 keys)"] -->|has_remaining=true| JOB2["Continuation job<br>(same priority/scope)"]
-    JOB2 -->|has_remaining=true| JOB3["Continuation job"]
+    JOB1["Job (L2: 10k, L3: 50MB seed)"] -->|cursors + throughput| JOB2["Continuation (budget: rate×2min)"]
+    JOB2 -->|cursors + throughput| JOB3["Continuation (budget: rate×2min)"]
     JOB3 -->|has_remaining=false| DONE[All keys processed]
 ```
 
-Between continuation jobs the scheduler can interleave higher-priority work (e.g. a `Realtime` API-triggered scan), and backpressure checks run normally. `Files` scopes bypass batch limits since the caller already provides a bounded key list.
+Between continuation jobs the scheduler can interleave higher-priority work (e.g. a `Realtime` API-triggered scan), and backpressure checks run normally. `Files` scopes bypass batch limits since the caller already provides a bounded key list. L1 discovery only runs on the first batch (when the job is not a continuation) — continuation jobs skip L1 since the filesystem walk is already complete.
 
 ## Scan scope
 
@@ -177,15 +211,26 @@ The watcher uses `notify` with `notify-debouncer-mini` (200ms debounce window) t
 graph LR
     FS["Filesystem<br>inotify/FSEvents/ReadDirectoryChanges"] -->|raw events| DEBOUNCE[Debouncer<br>200ms window]
     DEBOUNCE -->|DebouncedEvent| HANDLER[handle_event]
-    HANDLER -->|filter .shoebox<br>files only| CHAN[mpsc channel<br>capacity: 1000]
+    HANDLER -->|"filter .shoebox<br>files only<br>try_send()"| CHAN["mpsc channel<br>capacity: configurable<br>(default 1000)"]
+    HANDLER -->|"channel full"| DROPS["AtomicU64<br>drop counter"]
     CHAN --> WATCHPROC[Watch Processor]
+    DROPS -.->|"checked every 10s"| WATCHPROC
 
     WATCHPROC -->|Changed| CHECK{File actually<br>changed?}
     CHECK -->|mtime or size differ| SCHEDULE[Schedule Reconcile<br>scan to L3]
     CHECK -->|same mtime + size| IGNORE[Ignore<br>spurious event]
 
     WATCHPROC -->|Deleted| DELETE[delete_object<br>from DB]
+    WATCHPROC -->|"drops > 0"| RECONCILE[Schedule full-bucket<br>Reconcile scan]
 ```
+
+### Channel overflow recovery
+
+The watcher callback uses `try_send()` (non-blocking) instead of `blocking_send()` to avoid stalling the OS notification thread, which could cause inotify/FSEvents queue overflow at the kernel level. When the channel is full, the event is dropped and a shared `AtomicU64` counter is incremented.
+
+The watch processor checks this counter every 10 seconds. When drops are detected, it logs a warning with the count and schedules a full-bucket `Reconcile` scan at `Content` level to catch any files that were missed.
+
+The channel capacity defaults to 1000 events but can be increased for high-churn environments via `watch_channel_capacity` in the global config file.
 
 ### Spurious event filtering
 
@@ -195,12 +240,13 @@ For changed files, the processor calls `reset_scan_level(key, 1)` to mark the ob
 
 ## Checkpointing
 
-`ScanCheckpoint` tracks progress within a scan job for pause/resume support. It records:
+`ScanJob` tracks progress via independent keyset pagination cursors and throughput state:
 
-- `last_processed_key` — the key of the last successfully processed file.
-- `files_completed` / `files_total` — for progress reporting.
+- `l2_cursor` — the last key processed by L2 metadata scans.
+- `l3_cursor` — the last key processed by L3 content-hash scans.
+- `l3_bytes_per_sec` — measured L3 throughput used to size the next batch's byte budget.
 
-When a job is preempted or the server shuts down, the checkpoint allows resumption from the last processed key rather than restarting from scratch.
+When a batch completes with remaining work, the continuation job carries all three values so each level resumes from its own position and L3 batches stay calibrated.
 
 ## Database schema
 
@@ -246,7 +292,7 @@ sequenceDiagram
     S-->>W: Reconcile/Bucket/Content job
 
     W->>W: execute_scan_job()
-    Note over W: L1 → L2 (≤10K) → L3 (≤1K)
+    Note over W: L1 → L2 (≤10K) → L3 (byte budget)
 
     alt has_remaining = true
         W->>S: schedule continuation job
@@ -277,5 +323,4 @@ All tasks respect the shared `CancellationToken` for graceful shutdown.
 | [backpressure.rs](../../src/scanner/backpressure.rs) | API-vs-scanner resource control |
 | [watcher.rs](../../src/scanner/watcher.rs) | notify-based filesystem watcher |
 | [scope.rs](../../src/scanner/scope.rs) | Scan scope types (Bucket, Subtree, Files) |
-| [checkpoint.rs](../../src/scanner/checkpoint.rs) | Pause/resume progress tracking |
 | [platform.rs](../../src/scanner/platform.rs) | Cross-platform inode/device extraction |
