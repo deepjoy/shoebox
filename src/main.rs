@@ -1,25 +1,12 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use shoebox::api::routes::create_router;
 use shoebox::auth::presigned;
-use shoebox::auth::provider::CredentialProvider;
 use shoebox::config::{
-    generate_access_key_id, generate_secret_access_key, load_global_config,
-    load_or_create_bucket_config, resolve_all_buckets, save_bucket_config, Credential,
-    ServerConfig, METADATA_DB,
+    generate_access_key_id, generate_secret_access_key, load_or_create_bucket_config,
+    save_bucket_config, Credential,
 };
-use shoebox::metadata::MetadataStore;
-use shoebox::scanner::{
-    self, watcher::FilesystemWatcher, worker, Priority, ScanJob, ScanLevel, ScanScheduler,
-    ScanScope,
-};
-use shoebox::services::{AppState, LoadedBucket};
-use shoebox::storage::FilesystemStorage;
-use tokio::sync::Mutex;
-use tokio_util::sync::CancellationToken;
+use shoebox::error::ShoeboxError;
 
 /// Top-level CLI -- subcommands OR serve mode, never both.
 #[derive(Parser)]
@@ -167,143 +154,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Serve mode
     let serve = cli.serve;
 
-    // Load global config if specified
-    let global_config = if let Some(ref config_path) = serve.config {
-        Some(load_global_config(config_path).await?)
-    } else {
-        None
-    };
+    // Build Shoebox via the library API
+    let mut builder = shoebox::Shoebox::builder()
+        .host(&serve.host)
+        .port(serve.port);
 
-    // Merge paths from global config if no CLI paths given
-    let mut paths = serve.paths.clone();
-    if paths.is_empty() {
-        if let Some(ref gc) = global_config {
-            paths = gc.buckets.clone();
-        }
-    }
-    if paths.is_empty() {
-        eprintln!(
-            "Error: No bucket paths specified. Provide paths as arguments or in a config file."
-        );
-        std::process::exit(1);
+    if let Some(ref data_dir) = serve.data_dir {
+        builder = builder.data_dir(data_dir);
     }
 
-    // Apply global config overrides
-    let host = global_config
-        .as_ref()
-        .and_then(|gc| gc.host.clone())
-        .unwrap_or(serve.host);
-    let port = global_config
-        .as_ref()
-        .and_then(|gc| gc.port)
-        .unwrap_or(serve.port);
+    if let Some(ref config_path) = serve.config {
+        builder = builder.config_file(config_path);
+    }
 
-    let config = ServerConfig {
-        paths,
-        host: host.clone(),
-        port,
-        show_secrets: serve.show_secrets,
-        data_dir: serve.data_dir.clone(),
-    };
+    for path in &serve.paths {
+        builder = builder.bucket(path);
+    }
 
-    let buckets = resolve_all_buckets(&config).await?;
+    let shoebox = builder.build().await.map_err(cli_error_message)?;
 
-    let shutdown_token = CancellationToken::new();
-    let scanner_resources = Arc::new(scanner::backpressure::ScannerResources::new(100));
-
-    let mut loaded_buckets = HashMap::new();
-    for bucket in &buckets {
-        let bucket_start = std::time::Instant::now();
-
-        let db_path = bucket.shoebox_dir.join(METADATA_DB);
-        let metadata = MetadataStore::new(&db_path).await?;
-        tracing::info!(
-            bucket = %bucket.name,
-            elapsed = ?bucket_start.elapsed(),
-            "Metadata store ready"
-        );
-
-        let storage = FilesystemStorage::new(bucket.root.clone());
-        let parts_dir = bucket.shoebox_dir.join("parts");
-        tokio::fs::create_dir_all(&parts_dir).await?;
-
-        let scheduler = Arc::new(Mutex::new(ScanScheduler::new()));
-
-        // Schedule background L1+L2+L3 scan (L1 runs first inside execute_scan_job)
-        {
-            let mut sched = scheduler.lock().await;
-            sched.schedule(ScanJob::new(
-                Priority::Reconcile,
-                ScanScope::Bucket,
-                ScanLevel::Content,
-            ));
-        }
-
-        // Start filesystem watcher (uses spawn_blocking to avoid blocking the runtime
-        // during recursive inotify watch setup on large directory trees)
-        let watcher_start = std::time::Instant::now();
-        let watch_capacity = global_config
-            .as_ref()
-            .and_then(|gc| gc.watch_channel_capacity)
-            .unwrap_or(1000);
-        let watcher = {
-            let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(watch_capacity);
-            let watch_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
-            match FilesystemWatcher::spawn(bucket.root.clone(), watch_tx, watch_drops.clone()).await
-            {
-                Ok(w) => {
-                    tracing::debug!(bucket = %bucket.name, "Filesystem watcher started");
-                    tokio::spawn(worker::run_watch_processor(
-                        metadata.clone(),
-                        bucket.root.clone(),
-                        watch_rx,
-                        scheduler.clone(),
-                        watch_drops,
-                        shutdown_token.clone(),
-                    ));
-                    Some(w)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        bucket = %bucket.name,
-                        error = %e,
-                        "Failed to start filesystem watcher"
-                    );
-                    None
-                }
-            }
-        };
-        tracing::info!(
-            bucket = %bucket.name,
-            elapsed = ?watcher_start.elapsed(),
-            "Filesystem watcher setup complete"
-        );
-
-        // Spawn scan worker for this bucket
-        tokio::spawn(worker::run_scan_workers(
-            metadata.clone(),
-            bucket.root.clone(),
-            scheduler.clone(),
-            scanner_resources.clone(),
-            shutdown_token.clone(),
-        ));
-
-        loaded_buckets.insert(
-            bucket.name.clone(),
-            LoadedBucket {
-                name: bucket.name.clone(),
-                config: bucket.config.clone(),
-                storage,
-                metadata,
-                parts_dir,
-                watcher,
-                scheduler,
-            },
-        );
-
-        // Print bucket info
-        let show = config.show_secrets || bucket.freshly_created;
-        println!("  {} -> {}", bucket.name, bucket.root.display());
+    // Print startup banner
+    let buckets = shoebox.loaded_buckets();
+    let mut names: Vec<&String> = buckets.keys().collect();
+    names.sort();
+    for name in &names {
+        let bucket = &buckets[*name];
+        println!("  {} -> {}", bucket.name, bucket.storage.root().display());
+        let show = serve.show_secrets || bucket.freshly_created;
         if bucket.freshly_created {
             println!("    (new) Credentials generated:");
         } else {
@@ -319,124 +196,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
-    // Build credential provider from all bucket configs + global config
-    let all_bucket_creds: Vec<(String, BucketConfigRef)> = buckets
-        .iter()
-        .map(|b| (b.name.clone(), BucketConfigRef(&b.config)))
-        .collect();
-
-    let mut provider = CredentialProvider::from_buckets(
-        &all_bucket_creds
-            .iter()
-            .map(|(n, c)| (n.clone(), c.0))
-            .collect::<Vec<_>>(),
-    );
-
-    // Add global credentials (bucket_name = None, applies to all buckets)
-    if let Some(ref gc) = global_config {
-        provider.add_global_credentials(&gc.credentials);
-    }
-
-    let _bucket_names: Vec<String> = loaded_buckets.keys().cloned().collect();
-
-    let listen_addr = format!("{}:{}", config.host, config.port);
+    let listen_addr = format!("{}:{}", shoebox.host(), shoebox.port());
     println!(
         "Serving {} bucket{} on http://{}",
-        loaded_buckets.len(),
-        if loaded_buckets.len() == 1 { "" } else { "s" },
+        buckets.len(),
+        if buckets.len() == 1 { "" } else { "s" },
         listen_addr,
     );
-    if let Some(ref data_dir) = config.data_dir {
+    if let Some(ref data_dir) = serve.data_dir {
         println!("Credentials saved to {}/*/config.toml", data_dir.display());
     } else {
         println!("Credentials saved to .shoebox/config.toml");
     }
-    if !config.show_secrets {
+    if !serve.show_secrets {
         println!("Use --show-secrets to display secret access keys");
     }
     println!();
 
-    // Build credential provider from all bucket configs + global config
-    let all_bucket_creds: Vec<(String, BucketConfigRef)> = buckets
-        .iter()
-        .map(|b| (b.name.clone(), BucketConfigRef(&b.config)))
-        .collect();
-
-    let mut provider = CredentialProvider::from_buckets(
-        &all_bucket_creds
-            .iter()
-            .map(|(n, c)| (n.clone(), c.0))
-            .collect::<Vec<_>>(),
-    );
-
-    // Add global credentials (bucket_name = None, applies to all buckets)
-    if let Some(ref gc) = global_config {
-        for cred in &gc.credentials {
-            let permissions = cred
-                .permissions
-                .as_ref()
-                .map(|perms| {
-                    perms
-                        .iter()
-                        .filter_map(|s| shoebox::auth::provider::Permission::parse(s))
-                        .collect()
-                })
-                .unwrap_or_else(|| vec![shoebox::auth::provider::Permission::Admin]);
-
-            provider.insert(shoebox::auth::provider::ResolvedCredential {
-                access_key_id: cred.access_key_id.clone(),
-                secret_access_key: cred.secret_access_key.clone(),
-                permissions,
-                bucket_name: None, // global credential
-                description: cred.description.clone(),
-            });
-        }
-    }
-
-    let bucket_names: Vec<String> = loaded_buckets.keys().cloned().collect();
-
-    let state = AppState {
-        buckets: Arc::new(loaded_buckets),
-        credential_provider: Arc::new(tokio::sync::RwLock::new(provider)),
-        bucket_names: Arc::new(bucket_names),
-    };
-
-    let app = create_router(state);
-
-    // Wire SIGINT/SIGTERM to cancel the shutdown token
-    tokio::spawn({
-        let token = shutdown_token.clone();
-        async move {
-            tokio::signal::ctrl_c().await.ok();
-            tracing::info!("Shutdown signal received, draining requests...");
-            token.cancel();
-        }
-    });
-
-    let listener = tokio::net::TcpListener::bind(&listen_addr)
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AddrInUse {
-                format!(
-                    "Port {} is already in use. Is another Shoebox instance running?\n\
-                 Try a different port with --port <PORT>",
-                    config.port
-                )
-            } else {
-                format!("Failed to bind to {}: {}", listen_addr, e)
-            }
-        })?;
-    tracing::info!("Listening on {}", listen_addr);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_token.cancelled_owned())
-        .await?;
-
-    tracing::info!("Shutdown complete");
+    shoebox.run().await.map_err(cli_error_message)?;
     Ok(())
 }
 
-/// Wrapper to satisfy lifetime requirements for CredentialProvider::from_buckets.
-struct BucketConfigRef<'a>(&'a shoebox::config::BucketConfig);
+/// Translate library-level [`ShoeboxError`] variants into CLI-friendly messages.
+fn cli_error_message(e: ShoeboxError) -> Box<dyn std::error::Error> {
+    match e {
+        ShoeboxError::PortInUse { port } => format!(
+            "Port {port} is already in use. Is another Shoebox instance running?\n\
+             Try a different port with --port <PORT>"
+        )
+        .into(),
+        ShoeboxError::PermissionDenied { path } => format!(
+            "{}: permission denied; use --data-dir to store state elsewhere",
+            path.display()
+        )
+        .into(),
+        other => other.into(),
+    }
+}
 
 async fn handle_command(command: Commands) -> Result<(), Box<dyn std::error::Error>> {
     match command {
