@@ -21,6 +21,8 @@ pub struct BucketStatus {
     active_jobs: JobList,
     #[serde(rename = "PendingJobs")]
     pending_jobs: JobList,
+    #[serde(rename = "FailedJobs")]
+    failed_jobs: JobList,
 }
 
 #[derive(Serialize)]
@@ -50,6 +52,11 @@ pub struct JobEntry {
     l2_cursor: Option<String>,
     #[serde(rename = "L3Cursor")]
     l3_cursor: Option<String>,
+    #[serde(rename = "RetryCount")]
+    retry_count: u32,
+    #[serde(rename = "LastError")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
 impl From<&ScanJob> for JobEntry {
@@ -64,6 +71,8 @@ impl From<&ScanJob> for JobEntry {
             created_at: job.created_at.format(&Rfc3339).unwrap_or_default(),
             l2_cursor: job.l2_cursor.clone(),
             l3_cursor: job.l3_cursor.clone(),
+            retry_count: job.retry_count,
+            last_error: job.last_error.clone(),
         }
     }
 }
@@ -89,6 +98,9 @@ pub async fn scan_status(State(state): State<AppState>) -> XmlResponse<ScanStatu
                     .iter()
                     .map(|j| JobEntry::from(*j))
                     .collect(),
+            },
+            failed_jobs: JobList {
+                jobs: scheduler.failed_jobs().iter().map(JobEntry::from).collect(),
             },
         });
     }

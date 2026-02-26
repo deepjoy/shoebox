@@ -9,7 +9,7 @@ use crate::error::S3Error;
 use crate::metadata::MetadataStore;
 use crate::scanner::backpressure::ScannerResources;
 use crate::scanner::levels;
-use crate::scanner::scheduler::{Priority, ScanJob, ScanLevel, ScanScheduler};
+use crate::scanner::scheduler::{Priority, ScanJob, ScanLevel, ScanScheduler, MAX_RETRIES};
 use crate::scanner::scope::ScanScope;
 
 /// Run the scan worker loop — polls the scheduler for jobs and executes them.
@@ -103,8 +103,40 @@ pub async fn run_scan_workers(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(job_id = %job.id, error = %e, "Scan job failed");
-                    sched.fail(job.id);
+                    let error_msg = e.to_string();
+                    if e.is_retryable() && job.retry_count < MAX_RETRIES {
+                        let mut retry_job = job.clone();
+                        retry_job.retry_count += 1;
+                        retry_job.last_error = Some(error_msg.clone());
+                        retry_job.status = crate::scanner::scheduler::JobStatus::Pending;
+                        let attempt = retry_job.retry_count;
+                        sched.fail(job.id); // Remove from active set
+                        let backoff = Duration::from_secs(1 << (attempt - 1)); // 1s, 2s, 4s
+                        tracing::warn!(
+                            job_id = %retry_job.id,
+                            error = %error_msg,
+                            attempt = attempt,
+                            max_retries = MAX_RETRIES,
+                            backoff_secs = backoff.as_secs(),
+                            "Scan job failed (transient), retrying after backoff"
+                        );
+                        drop(sched); // Release lock during backoff sleep
+                        tokio::time::sleep(backoff).await;
+                        let mut sched = scheduler.lock().await;
+                        sched.schedule(retry_job);
+                    } else {
+                        let mut failed_job = job.clone();
+                        failed_job.status = crate::scanner::scheduler::JobStatus::Failed;
+                        failed_job.last_error = Some(error_msg.clone());
+                        sched.fail(job.id); // Remove from active set
+                        sched.record_failure(failed_job);
+                        tracing::error!(
+                            job_id = %job.id,
+                            error = %error_msg,
+                            retry_count = job.retry_count,
+                            "Scan job failed permanently"
+                        );
+                    }
                 }
             }
         }

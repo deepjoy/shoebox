@@ -55,6 +55,10 @@ impl JobStatus {
     }
 }
 
+/// Maximum number of retry attempts for transient errors before a job is
+/// permanently marked as failed.
+pub const MAX_RETRIES: u32 = 3;
+
 /// A single scan job in the priority queue.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanJob {
@@ -72,6 +76,10 @@ pub struct ScanJob {
     /// Used to compute the byte budget for the next L3 batch so each batch
     /// targets ~2 minutes of wall-clock time.
     pub l3_bytes_per_sec: Option<f64>,
+    /// Number of times this job has been retried after a transient error.
+    pub retry_count: u32,
+    /// Human-readable description of the last error, if any.
+    pub last_error: Option<String>,
 }
 
 impl ScanJob {
@@ -86,6 +94,8 @@ impl ScanJob {
             l2_cursor: None,
             l3_cursor: None,
             l3_bytes_per_sec: None,
+            retry_count: 0,
+            last_error: None,
         }
     }
 
@@ -144,6 +154,9 @@ impl PartialOrd for ScanJob {
 pub struct ScanScheduler {
     jobs: BinaryHeap<ScanJob>,
     active: HashMap<Uuid, ScanJob>,
+    /// Jobs that exhausted all retry attempts. Kept for operator visibility
+    /// via the scan status API.
+    failed: Vec<ScanJob>,
 }
 
 impl Default for ScanScheduler {
@@ -157,6 +170,7 @@ impl ScanScheduler {
         Self {
             jobs: BinaryHeap::new(),
             active: HashMap::new(),
+            failed: Vec::new(),
         }
     }
 
@@ -208,6 +222,16 @@ impl ScanScheduler {
     /// Return a snapshot of all pending jobs in the queue.
     pub fn pending_jobs(&self) -> Vec<&ScanJob> {
         self.jobs.iter().collect()
+    }
+
+    /// Record a permanently failed job for operator visibility.
+    pub fn record_failure(&mut self, job: ScanJob) {
+        self.failed.push(job);
+    }
+
+    /// Return a snapshot of all permanently failed jobs.
+    pub fn failed_jobs(&self) -> &[ScanJob] {
+        &self.failed
     }
 
     /// Preempt lower priority jobs by moving them back to pending.
@@ -285,5 +309,33 @@ mod tests {
         assert_eq!(scheduler.active.len(), 0);
         // Queue should have both: realtime + preempted background
         assert_eq!(scheduler.jobs.len(), 2);
+    }
+
+    #[test]
+    fn test_record_failure_tracks_failed_jobs() {
+        let mut scheduler = ScanScheduler::new();
+        assert!(scheduler.failed_jobs().is_empty());
+
+        let mut job = ScanJob::new(Priority::Reconcile, ScanScope::Bucket, ScanLevel::Content);
+        job.status = JobStatus::Failed;
+        job.retry_count = MAX_RETRIES;
+        job.last_error = Some("Database error: database is locked".into());
+
+        scheduler.record_failure(job.clone());
+
+        assert_eq!(scheduler.failed_jobs().len(), 1);
+        assert_eq!(scheduler.failed_jobs()[0].id, job.id);
+        assert_eq!(scheduler.failed_jobs()[0].retry_count, MAX_RETRIES);
+        assert_eq!(
+            scheduler.failed_jobs()[0].last_error.as_deref(),
+            Some("Database error: database is locked")
+        );
+    }
+
+    #[test]
+    fn test_new_job_has_zero_retry_count() {
+        let job = ScanJob::new(Priority::Reconcile, ScanScope::Bucket, ScanLevel::Content);
+        assert_eq!(job.retry_count, 0);
+        assert!(job.last_error.is_none());
     }
 }
