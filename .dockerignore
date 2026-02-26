@@ -1,0 +1,13 @@
+target
+debug
+.git
+.github
+.devcontainer
+.vscode
+.claude
+.shoebox
+docs
+*.md
+*.pdb
+**/*.rs.bk
+**/mutants.out*
