@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y pkg-config libsqlite3-dev && rm -rf /va
 
 # Cache dependency build: copy manifests first, create dummy src, build deps
 COPY Cargo.toml Cargo.lock ./
+COPY migrations ./migrations
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
 RUN cargo build --release && rm -rf src
 
