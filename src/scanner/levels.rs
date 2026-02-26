@@ -121,11 +121,11 @@ pub async fn scan_l1(
                 continue;
             }
         };
-        let is_dir = file_type.is_dir();
         let is_symlink = file_type.is_symlink();
 
-        // Skip directories from object tracking — S3 doesn't list directories as objects
-        if is_dir {
+        // Only catalog regular files and symlinks — skip directories, named pipes,
+        // sockets, and device nodes which could block or consume unbounded memory.
+        if !(file_type.is_file() || is_symlink) {
             continue;
         }
 
