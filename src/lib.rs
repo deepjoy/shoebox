@@ -21,7 +21,7 @@ use crate::api::routes::create_router;
 use crate::auth::presigned;
 use crate::auth::provider::CredentialProvider;
 use crate::config::{load_global_config, resolve_bucket, GlobalConfig, METADATA_DB};
-use crate::error::S3Error;
+use crate::error::{S3Error, ShoeboxError};
 use crate::metadata::sqlite::{ListEntry, ObjectRecord, Tag};
 use crate::metadata::MetadataStore;
 
@@ -61,7 +61,7 @@ impl Shoebox {
     }
 
     /// Quick start: serve a single directory.
-    pub async fn serve(path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn serve(path: impl AsRef<Path>) -> Result<(), ShoeboxError> {
         Self::builder().bucket(path).build().await?.run().await
     }
 
@@ -302,7 +302,7 @@ impl Shoebox {
     }
 
     /// Run the built-in HTTP server with graceful shutdown.
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(self) -> Result<(), ShoeboxError> {
         let addr = format!("{}:{}", self.host, self.port);
 
         // Wire SIGINT/SIGTERM to cancel the shared shutdown token
@@ -319,20 +319,20 @@ impl Shoebox {
         let router = create_router(app_state);
         let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::AddrInUse {
-                format!(
-                    "Port {} is already in use. Is another Shoebox instance running?\n\
-                     Try a different port with .port(<PORT>)",
-                    self.port
-                )
+                ShoeboxError::PortInUse { port: self.port }
             } else {
-                format!("Failed to bind to {}: {}", addr, e)
+                ShoeboxError::BindFailed {
+                    addr: addr.clone(),
+                    source: e,
+                }
             }
         })?;
         tracing::info!("Serving on http://{addr}");
 
         axum::serve(listener, router)
             .with_graceful_shutdown(self.shutdown_token.cancelled_owned())
-            .await?;
+            .await
+            .map_err(|e| ShoeboxError::Other(e.into()))?;
 
         // After server stops, close all SQLite pools to flush WAL
         for bucket in self.buckets.values() {
@@ -340,6 +340,21 @@ impl Shoebox {
         }
         tracing::info!("Shutdown complete");
         Ok(())
+    }
+
+    /// Access loaded buckets for inspection (e.g., startup banner).
+    pub fn loaded_buckets(&self) -> &HashMap<String, LoadedBucket> {
+        &self.buckets
+    }
+
+    /// The host this instance is configured to listen on.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The port this instance is configured to listen on.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     fn get_bucket(&self, name: &str) -> Result<&LoadedBucket, S3Error> {
@@ -404,11 +419,15 @@ impl ShoeboxBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<Shoebox, Box<dyn std::error::Error>> {
+    pub async fn build(self) -> Result<Shoebox, ShoeboxError> {
         // Resolve global config: explicit object takes priority over file
         let global_config = match (self.global_config, self.config_file) {
             (Some(gc), _) => Some(gc),
-            (None, Some(path)) => Some(load_global_config(&path).await?),
+            (None, Some(path)) => Some(
+                load_global_config(&path)
+                    .await
+                    .map_err(|e| ShoeboxError::Other(e.into()))?,
+            ),
             (None, None) => None,
         };
 
@@ -441,21 +460,24 @@ impl ShoeboxBuilder {
                 .await
                 .map_err(|e| match e.downcast_ref::<std::io::Error>() {
                     Some(io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied => {
-                        format!(
-                            "{}: permission denied; use --data-dir to store state elsewhere",
-                            path.display()
-                        )
+                        ShoeboxError::PermissionDenied { path: path.clone() }
                     }
-                    _ => e.to_string(),
+                    _ => ShoeboxError::Other(e),
                 })?;
             let db_path = state.shoebox_dir.join(METADATA_DB);
-            let metadata = MetadataStore::new(&db_path).await?;
+            let metadata = MetadataStore::new(&db_path)
+                .await
+                .map_err(|e| ShoeboxError::Other(e.into()))?;
             let storage = FilesystemStorage::new(state.root.clone());
             let parts_dir = state.shoebox_dir.join("parts");
-            tokio::fs::create_dir_all(&parts_dir).await?;
+            tokio::fs::create_dir_all(&parts_dir)
+                .await
+                .map_err(|e| ShoeboxError::Other(e.into()))?;
 
             // Phase 6: Blocking L1 scan — discover files before serving
-            let l1_report = levels::scan_l1(&metadata, &state.root, &ScanScope::Bucket).await?;
+            let l1_report = levels::scan_l1(&metadata, &state.root, &ScanScope::Bucket)
+                .await
+                .map_err(|e| ShoeboxError::Other(e.into()))?;
             if l1_report.discovered > 0 || l1_report.deleted > 0 {
                 tracing::info!(
                     bucket = %state.name,
@@ -533,6 +555,7 @@ impl ShoeboxBuilder {
                     parts_dir,
                     watcher,
                     scheduler,
+                    freshly_created: state.freshly_created,
                 },
             );
         }

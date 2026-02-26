@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
@@ -231,6 +233,32 @@ impl From<sqlx::Error> for S3Error {
         tracing::error!("Database error: {err}");
         Self::InternalError
     }
+}
+
+/// Errors from Shoebox startup and lifecycle (builder + server).
+///
+/// These are distinct from [`S3Error`] (which covers request-level S3 API
+/// errors) and represent problems during instance construction or serving.
+#[derive(Debug, thiserror::Error)]
+pub enum ShoeboxError {
+    /// The requested port is already bound by another process.
+    #[error("port {port} is already in use")]
+    PortInUse { port: u16 },
+
+    /// Failed to bind the listener to the requested address.
+    #[error("failed to bind to {addr}: {source}")]
+    BindFailed {
+        addr: String,
+        source: std::io::Error,
+    },
+
+    /// Permission denied when initializing bucket state directory.
+    #[error("{path}: permission denied")]
+    PermissionDenied { path: PathBuf },
+
+    /// Any other startup/lifecycle error.
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error>),
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -27,6 +27,8 @@ pub struct LoadedBucket {
     pub watcher: Option<FilesystemWatcher>,
     /// Scanner job scheduler for background L2/L3 scans.
     pub scheduler: Arc<Mutex<ScanScheduler>>,
+    /// True when this bucket's config was generated for the first time during build.
+    pub freshly_created: bool,
 }
 
 /// Shared application state passed to all handlers.
