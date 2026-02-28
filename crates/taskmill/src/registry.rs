@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::scheduler::ProgressReporter;
-use crate::task::{TaskError, TaskRecord, TaskResult};
+use crate::task::{TaskError, TaskRecord, TaskResult, TypedTask};
 
 /// Execution context passed to a [`TaskExecutor`].
 ///
@@ -20,6 +20,16 @@ pub struct TaskContext {
     pub token: CancellationToken,
     /// Report progress back to the scheduler (0.0–1.0).
     pub progress: ProgressReporter,
+}
+
+impl TaskContext {
+    /// Deserialize the payload as a [`TypedTask`].
+    ///
+    /// Convenience wrapper around [`TaskRecord::deserialize_payload`] that
+    /// mirrors the typed submission API.
+    pub fn deserialize_typed<T: TypedTask>(&self) -> Result<Option<T>, serde_json::Error> {
+        self.record.deserialize_payload()
+    }
 }
 
 /// Executes tasks of a registered type.

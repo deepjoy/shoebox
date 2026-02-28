@@ -17,6 +17,8 @@ use crate::task::{
 pub enum StoreError {
     #[error("payload exceeds maximum size of {MAX_PAYLOAD_BYTES} bytes")]
     PayloadTooLarge,
+    #[error("serialization error: {0}")]
+    Serialization(String),
     #[error("database error: {0}")]
     Database(String),
 }
@@ -24,6 +26,12 @@ pub enum StoreError {
 impl From<sqlx::Error> for StoreError {
     fn from(e: sqlx::Error) -> Self {
         StoreError::Database(e.to_string())
+    }
+}
+
+impl From<serde_json::Error> for StoreError {
+    fn from(e: serde_json::Error) -> Self {
+        StoreError::Serialization(e.to_string())
     }
 }
 

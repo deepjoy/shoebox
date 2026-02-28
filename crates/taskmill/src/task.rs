@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -200,6 +201,64 @@ impl TaskSubmission {
     }
 }
 
+/// A strongly-typed task that bundles serialization, task type name, and default
+/// IO estimates.
+///
+/// Implementing this trait collapses the 6 fields of [`TaskSubmission`] into a
+/// derive-friendly pattern. Use [`Scheduler::submit_typed`] to submit and
+/// [`TaskContext::deserialize_typed`] on the executor side.
+///
+/// # Example
+///
+/// ```ignore
+/// use serde::{Serialize, Deserialize};
+/// use taskmill::{TypedTask, Priority};
+///
+/// #[derive(Serialize, Deserialize)]
+/// struct Thumbnail { path: String, size: u32 }
+///
+/// impl TypedTask for Thumbnail {
+///     const TASK_TYPE: &'static str = "thumbnail";
+///     fn expected_read_bytes(&self) -> i64 { 4096 }
+///     fn expected_write_bytes(&self) -> i64 { 1024 }
+/// }
+/// ```
+pub trait TypedTask: Serialize + DeserializeOwned + Send + 'static {
+    /// Unique name used to register and look up the executor.
+    const TASK_TYPE: &'static str;
+
+    /// Estimated bytes this task will read. Default: 0.
+    fn expected_read_bytes(&self) -> i64 {
+        0
+    }
+
+    /// Estimated bytes this task will write. Default: 0.
+    fn expected_write_bytes(&self) -> i64 {
+        0
+    }
+
+    /// Scheduling priority. Default: [`Priority::NORMAL`].
+    fn priority(&self) -> Priority {
+        Priority::NORMAL
+    }
+}
+
+impl TaskSubmission {
+    /// Create a submission from a [`TypedTask`], serializing the payload and
+    /// pulling task type, priority, and IO estimates from the trait.
+    pub fn from_typed<T: TypedTask>(task: &T) -> Result<Self, serde_json::Error> {
+        let payload = serde_json::to_vec(task)?;
+        Ok(Self {
+            task_type: T::TASK_TYPE.to_string(),
+            key: None,
+            priority: task.priority(),
+            payload: Some(payload),
+            expected_read_bytes: task.expected_read_bytes(),
+            expected_write_bytes: task.expected_write_bytes(),
+        })
+    }
+}
+
 /// Aggregate statistics for a task type from history.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TypeStats {
@@ -208,4 +267,81 @@ pub struct TypeStats {
     pub avg_read_bytes: f64,
     pub avg_write_bytes: f64,
     pub failure_rate: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct Thumbnail {
+        path: String,
+        size: u32,
+    }
+
+    impl TypedTask for Thumbnail {
+        const TASK_TYPE: &'static str = "thumbnail";
+
+        fn expected_read_bytes(&self) -> i64 {
+            4096
+        }
+
+        fn expected_write_bytes(&self) -> i64 {
+            1024
+        }
+    }
+
+    #[test]
+    fn typed_task_to_submission() {
+        let task = Thumbnail {
+            path: "/photos/a.jpg".into(),
+            size: 256,
+        };
+        let sub = TaskSubmission::from_typed(&task).unwrap();
+
+        assert_eq!(sub.task_type, "thumbnail");
+        assert_eq!(sub.priority, Priority::NORMAL);
+        assert_eq!(sub.expected_read_bytes, 4096);
+        assert_eq!(sub.expected_write_bytes, 1024);
+        assert!(sub.key.is_none());
+
+        // Payload round-trips correctly.
+        let recovered: Thumbnail = serde_json::from_slice(sub.payload.as_ref().unwrap()).unwrap();
+        assert_eq!(recovered, task);
+    }
+
+    #[test]
+    fn typed_task_custom_priority() {
+        #[derive(Serialize, Deserialize)]
+        struct Urgent {
+            id: u64,
+        }
+
+        impl TypedTask for Urgent {
+            const TASK_TYPE: &'static str = "urgent";
+
+            fn priority(&self) -> Priority {
+                Priority::HIGH
+            }
+        }
+
+        let sub = TaskSubmission::from_typed(&Urgent { id: 42 }).unwrap();
+        assert_eq!(sub.priority, Priority::HIGH);
+        assert_eq!(sub.task_type, "urgent");
+    }
+
+    #[test]
+    fn typed_task_defaults() {
+        #[derive(Serialize, Deserialize)]
+        struct Minimal;
+
+        impl TypedTask for Minimal {
+            const TASK_TYPE: &'static str = "minimal";
+        }
+
+        let sub = TaskSubmission::from_typed(&Minimal).unwrap();
+        assert_eq!(sub.expected_read_bytes, 0);
+        assert_eq!(sub.expected_write_bytes, 0);
+        assert_eq!(sub.priority, Priority::NORMAL);
+    }
 }

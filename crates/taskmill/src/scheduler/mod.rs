@@ -16,7 +16,7 @@ use crate::registry::{TaskExecutor, TaskTypeRegistry};
 use crate::resource::sampler::{SamplerConfig, SmoothedReader};
 use crate::resource::{ResourceReader, ResourceSampler};
 use crate::store::{StoreConfig, StoreError, TaskStore};
-use crate::task::TaskSubmission;
+use crate::task::{TaskSubmission, TypedTask};
 
 use dispatch::ActiveTaskMap;
 use gate::{DefaultDispatchGate, GateContext};
@@ -240,6 +240,15 @@ impl Scheduler {
         }
 
         Ok(id)
+    }
+
+    /// Submit a [`TypedTask`], handling serialization automatically.
+    ///
+    /// Equivalent to converting the task into a [`TaskSubmission`] via `TryFrom`
+    /// and calling [`submit`](Self::submit).
+    pub async fn submit_typed<T: TypedTask>(&self, task: &T) -> Result<Option<i64>, StoreError> {
+        let sub = TaskSubmission::from_typed(task)?;
+        self.submit(&sub).await
     }
 
     /// Cancel a task by id.
@@ -528,6 +537,13 @@ impl SchedulerBuilder {
             executor as Arc<dyn crate::registry::ErasedExecutor>,
         ));
         self
+    }
+
+    /// Register an executor using the task type name from a [`TypedTask`].
+    ///
+    /// Equivalent to `.executor(T::TASK_TYPE, executor)`.
+    pub fn typed_executor<T: TypedTask, E: TaskExecutor>(self, executor: Arc<E>) -> Self {
+        self.executor(T::TASK_TYPE, executor)
     }
 
     /// Set maximum concurrent tasks. Default: 4.
@@ -949,5 +965,50 @@ mod tests {
         let shared_key = crate::task::generate_dedup_key("test", Some(b"shared"));
         let task = sched2.store().task_by_key(&shared_key).await.unwrap();
         assert!(task.is_some());
+    }
+
+    #[tokio::test]
+    async fn submit_typed_enqueues_task() {
+        use serde::{Deserialize as De, Serialize as Ser};
+
+        #[derive(Ser, De, Debug, PartialEq)]
+        struct Thumb {
+            path: String,
+        }
+
+        impl crate::task::TypedTask for Thumb {
+            const TASK_TYPE: &'static str = "test";
+
+            fn expected_read_bytes(&self) -> i64 {
+                4096
+            }
+
+            fn expected_write_bytes(&self) -> i64 {
+                512
+            }
+        }
+
+        let sched = setup(arc_erased(InstantExecutor)).await;
+
+        let task = Thumb {
+            path: "/a.jpg".into(),
+        };
+        let id = sched.submit_typed(&task).await.unwrap();
+        assert!(id.is_some());
+
+        // Verify the stored record has correct metadata.
+        let record = sched
+            .store()
+            .task_by_id(id.unwrap())
+            .await
+            .unwrap()
+            .expect("task should exist");
+        assert_eq!(record.task_type, "test");
+        assert_eq!(record.expected_read_bytes, 4096);
+        assert_eq!(record.expected_write_bytes, 512);
+
+        // Payload round-trips.
+        let recovered: Thumb = record.deserialize_payload().unwrap().unwrap();
+        assert_eq!(recovered, task);
     }
 }
