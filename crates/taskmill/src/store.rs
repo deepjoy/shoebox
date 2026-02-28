@@ -453,6 +453,16 @@ impl TaskStore {
         Ok(rows.iter().map(row_to_task_record).collect())
     }
 
+    /// Look up an active task by its row id. Returns `None` if no active
+    /// task with that id exists.
+    pub async fn task_by_id(&self, id: i64) -> Result<Option<TaskRecord>, StoreError> {
+        let row = sqlx::query("SELECT * FROM tasks WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.as_ref().map(row_to_task_record))
+    }
+
     /// Look up an active task by its dedup key. Returns `None` if no active
     /// task with that key exists.
     pub async fn task_by_key(&self, key: &str) -> Result<Option<TaskRecord>, StoreError> {
@@ -475,6 +485,15 @@ impl TaskStore {
     }
 
     // ── Query: history ──────────────────────────────────────────────
+
+    /// Look up a history record by its row id.
+    pub async fn history_by_id(&self, id: i64) -> Result<Option<TaskHistoryRecord>, StoreError> {
+        let row = sqlx::query("SELECT * FROM task_history WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.as_ref().map(row_to_history_record))
+    }
 
     /// Recent history entries, newest first.
     pub async fn history(
@@ -1015,6 +1034,51 @@ mod tests {
 
         // Deleting again returns false.
         assert!(!store.delete(task.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn task_by_id_lookup() {
+        let store = test_store().await;
+        let sub = make_submission("by-id", Priority::NORMAL);
+        let id = store.submit(&sub).await.unwrap().unwrap();
+
+        let task = store.task_by_id(id).await.unwrap().unwrap();
+        assert_eq!(task.id, id);
+        assert_eq!(task.key, sub.effective_key());
+
+        // Non-existent id returns None.
+        assert!(store.task_by_id(9999).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn history_by_id_lookup() {
+        let store = test_store().await;
+        let sub = make_submission("hist-id", Priority::NORMAL);
+        store.submit(&sub).await.unwrap();
+        let task = store.pop_next().await.unwrap().unwrap();
+
+        store
+            .complete(
+                task.id,
+                &TaskResult {
+                    actual_read_bytes: 100,
+                    actual_write_bytes: 50,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Fetch from history by key to get the history id.
+        let hist = store.history_by_key(&sub.effective_key()).await.unwrap();
+        assert_eq!(hist.len(), 1);
+        let hist_id = hist[0].id;
+
+        let record = store.history_by_id(hist_id).await.unwrap().unwrap();
+        assert_eq!(record.key, sub.effective_key());
+        assert_eq!(record.actual_read_bytes, Some(100));
+
+        // Non-existent id returns None.
+        assert!(store.history_by_id(9999).await.unwrap().is_none());
     }
 
     #[tokio::test]
