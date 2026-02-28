@@ -12,7 +12,7 @@ taskmill/
     task.rs           — data types: TaskRecord, TaskSubmission, TaskResult, TaskError, etc.
     priority.rs       — Priority newtype (u8, lower = higher priority)
     store.rs          — TaskStore: SQLite persistence, atomic pop, queries, retention
-    registry.rs       — TaskExecutor trait (RPITIT) + ErasedExecutor + TaskTypeRegistry
+    registry.rs       — TaskContext, TaskExecutor trait (RPITIT) + ErasedExecutor + TaskTypeRegistry
     scheduler.rs      — Scheduler: dispatch loop, IO budget, preemption, retries, events,
                         progress reporting, graceful shutdown, builder
     backpressure.rs   — PressureSource trait, ThrottlePolicy, CompositePressure
@@ -32,9 +32,9 @@ flowchart TD
     S["submit()"] --> TS["TaskStore\n(INSERT OR IGNORE)"]
     TS --> |SQLite| DB[(tasks table)]
     DB --> SCH["Scheduler\ndispatch loop"]
-    SCH --> |"tokio::spawn"| E1["Executor 1\n+ ProgressReporter"]
-    SCH --> |"tokio::spawn"| E2["Executor 2\n+ ProgressReporter"]
-    SCH --> |"tokio::spawn"| E3["Executor 3\n+ ProgressReporter"]
+    SCH --> |"tokio::spawn"| E1["Executor 1\n+ TaskContext"]
+    SCH --> |"tokio::spawn"| E2["Executor 2\n+ TaskContext"]
+    SCH --> |"tokio::spawn"| E3["Executor 3\n+ TaskContext"]
     E1 --> CF["complete() / fail()"]
     E2 --> CF
     E3 --> CF
@@ -173,7 +173,7 @@ flowchart TD
     IO -- exhausted --> REQUEUE
     IO -- ok --> REG{"Executor\nregistered?"}
     REG -- no --> FAIL["Fail task immediately"]
-    REG -- yes --> SPAWN["tokio::spawn\nwith CancellationToken\n+ ProgressReporter"]
+    REG -- yes --> SPAWN["tokio::spawn\nwith TaskContext"]
     SPAWN --> EVENT["Emit Dispatched event"]
     EVENT --> CONC
     FAIL --> CONC
@@ -216,9 +216,9 @@ Two sources of progress information:
 
 ### Executor-reported progress
 
-Executors can report progress via `ProgressReporter::report()` or
-`ProgressReporter::report_fraction()`. These are emitted as `SchedulerEvent::Progress`
-events and tracked in the active task map.
+Executors receive a `TaskContext` containing a `ProgressReporter` via `ctx.progress`.
+They can report progress via `ctx.progress.report()` or `ctx.progress.report_fraction()`.
+These are emitted as `SchedulerEvent::Progress` events and tracked in the active task map.
 
 ### Throughput-extrapolated progress
 
@@ -410,7 +410,7 @@ Paused tasks are only resumed when no active tasks with preemption-eligible prio
 remain running, preventing a thrashing loop where tasks are repeatedly resumed and
 re-preempted.
 
-Executors cooperate by checking `token.is_cancelled()` at yield points. If an executor
+Executors cooperate by checking `ctx.token.is_cancelled()` at yield points. If an executor
 ignores cancellation, it continues running but is no longer tracked — its completion or
 failure is still recorded normally.
 
@@ -419,7 +419,8 @@ failure is still recorded normally.
 The `TaskTypeRegistry` maps string names to executor implementations. It uses
 an internal `ErasedExecutor` trait for object-safe dynamic dispatch, while the
 public `TaskExecutor` trait uses RPITIT (`impl Future`) for ergonomic `async fn`
-implementations.
+implementations. Executors receive a `TaskContext` bundling the task record,
+cancellation token, and progress reporter.
 
 ```rust
 let mut registry = TaskTypeRegistry::new();

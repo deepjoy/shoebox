@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backpressure::{CompositePressure, ThrottlePolicy};
 use crate::priority::Priority;
-use crate::registry::{TaskExecutor, TaskTypeRegistry};
+use crate::registry::{TaskContext, TaskExecutor, TaskTypeRegistry};
 use crate::resource::sampler::{SamplerConfig, SmoothedReader};
 use crate::resource::{ResourceReader, ResourceSampler};
 use crate::store::{StoreConfig, StoreError, TaskStore};
@@ -386,12 +386,16 @@ impl Scheduler {
             },
         );
 
-        // Create progress reporter for the executor.
-        let progress = ProgressReporter {
-            task_id: task.id,
-            task_type: task.task_type.clone(),
-            key: task.key.clone(),
-            event_tx: self.inner.event_tx.clone(),
+        // Build the execution context for the executor.
+        let ctx = TaskContext {
+            record: task.clone(),
+            token: child_token.clone(),
+            progress: ProgressReporter {
+                task_id: task.id,
+                task_type: task.task_type.clone(),
+                key: task.key.clone(),
+                event_tx: self.inner.event_tx.clone(),
+            },
         };
 
         // Emit dispatched event.
@@ -431,13 +435,13 @@ impl Scheduler {
 
         tokio::spawn(async move {
             let task_id = task.id;
-            let result = executor.execute_erased(&task, child_token.clone()).await;
+            let result = executor.execute_erased(&ctx).await;
 
             // Remove from active tracking.
             inner_for_task.active.lock().await.remove(&task_id);
 
-            // Drop the progress reporter — executor is done.
-            drop(progress);
+            // Drop the context (and its progress reporter) — executor is done.
+            drop(ctx);
 
             match result {
                 Ok(tr) => {
@@ -938,17 +942,13 @@ impl Default for SchedulerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::TaskExecutor;
+    use crate::registry::{TaskContext, TaskExecutor};
     use crate::task::{TaskError, TaskResult};
 
     struct InstantExecutor;
 
     impl TaskExecutor for InstantExecutor {
-        async fn execute<'a>(
-            &'a self,
-            _record: &'a TaskRecord,
-            _token: CancellationToken,
-        ) -> Result<TaskResult, TaskError> {
+        async fn execute<'a>(&'a self, _ctx: &'a TaskContext) -> Result<TaskResult, TaskError> {
             Ok(TaskResult {
                 actual_read_bytes: 100,
                 actual_write_bytes: 50,
@@ -959,13 +959,9 @@ mod tests {
     struct SlowExecutor;
 
     impl TaskExecutor for SlowExecutor {
-        async fn execute<'a>(
-            &'a self,
-            _record: &'a TaskRecord,
-            token: CancellationToken,
-        ) -> Result<TaskResult, TaskError> {
+        async fn execute<'a>(&'a self, ctx: &'a TaskContext) -> Result<TaskResult, TaskError> {
             tokio::select! {
-                _ = token.cancelled() => {
+                _ = ctx.token.cancelled() => {
                     Err(TaskError {
                         message: "cancelled".into(),
                         retryable: false,
@@ -987,11 +983,7 @@ mod tests {
     struct FailingExecutor;
 
     impl TaskExecutor for FailingExecutor {
-        async fn execute<'a>(
-            &'a self,
-            _record: &'a TaskRecord,
-            _token: CancellationToken,
-        ) -> Result<TaskResult, TaskError> {
+        async fn execute<'a>(&'a self, _ctx: &'a TaskContext) -> Result<TaskResult, TaskError> {
             Err(TaskError {
                 message: "boom".into(),
                 retryable: true,

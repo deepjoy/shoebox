@@ -47,24 +47,26 @@ taskmill = { path = "crates/taskmill" }
 
 ### Implement an executor
 
-Each task type needs a `TaskExecutor` implementation. The executor receives the full
-`TaskRecord` (including an opaque `payload` blob up to 8 KiB) and a `CancellationToken`
-for preemption support.
+Each task type needs a `TaskExecutor` implementation. The executor receives a
+`TaskContext` containing the full `TaskRecord` (including an opaque `payload` blob
+up to 8 KiB), a `CancellationToken` for preemption support, and a `ProgressReporter`
+for reporting progress back to the scheduler.
 
 ```rust
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
-use taskmill::{TaskExecutor, TaskRecord, TaskResult, TaskError};
+use taskmill::{TaskExecutor, TaskContext, TaskResult, TaskError};
 
 struct MyExecutor;
 
 impl TaskExecutor for MyExecutor {
     async fn execute<'a>(
         &'a self,
-        record: &'a TaskRecord,
-        token: CancellationToken,
+        ctx: &'a TaskContext,
     ) -> Result<TaskResult, TaskError> {
-        // Deserialize payload, do work, check token.is_cancelled() periodically.
+        // Deserialize payload from ctx.record, do work,
+        // check ctx.token.is_cancelled() periodically,
+        // and report progress via ctx.progress.
+        ctx.progress.report(0.5, Some("halfway done".into()));
         Ok(TaskResult {
             actual_read_bytes: 4096,
             actual_write_bytes: 1024,
@@ -188,12 +190,16 @@ tokio::spawn(async move {
 
 ## Progress reporting
 
-Executors receive a `ProgressReporter` via the scheduler's event system. Report
-progress from inside the executor:
+Executors receive a `ProgressReporter` via `ctx.progress`. Report progress from
+inside the executor:
 
 ```rust
 // Inside your TaskExecutor::execute() impl:
-// The ProgressReporter is available via the scheduler's event channel.
+ctx.progress.report(0.5, Some("processing images".into()));
+
+// Or use fraction-based reporting:
+ctx.progress.report_fraction(processed, total, None);
+
 // For tasks that don't report progress, the scheduler extrapolates progress
 // based on elapsed time vs. historical average duration for the task type.
 ```
