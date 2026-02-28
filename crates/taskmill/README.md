@@ -128,7 +128,6 @@ For full control, use `Scheduler::new()` directly:
 
 ```rust
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 use taskmill::{
     CompositePressure, Scheduler, SchedulerConfig,
     TaskStore, TaskTypeRegistry, ThrottlePolicy,

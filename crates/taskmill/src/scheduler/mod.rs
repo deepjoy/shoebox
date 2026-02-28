@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+pub(crate) mod dispatch;
+pub(crate) mod gate;
+pub mod progress;
+
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
@@ -9,11 +12,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backpressure::{CompositePressure, ThrottlePolicy};
 use crate::priority::Priority;
-use crate::registry::{TaskContext, TaskExecutor, TaskTypeRegistry};
+use crate::registry::{TaskExecutor, TaskTypeRegistry};
 use crate::resource::sampler::{SamplerConfig, SmoothedReader};
 use crate::resource::{ResourceReader, ResourceSampler};
 use crate::store::{StoreConfig, StoreError, TaskStore};
-use crate::task::{TaskRecord, TaskSubmission};
+use crate::task::TaskSubmission;
+
+use dispatch::ActiveTaskMap;
+use gate::{DefaultDispatchGate, GateContext};
+
+pub use progress::{EstimatedProgress, ProgressReporter};
 
 // ── Events ──────────────────────────────────────────────────────────
 
@@ -68,60 +76,6 @@ pub enum SchedulerEvent {
     },
 }
 
-// ── Progress ────────────────────────────────────────────────────────
-
-/// Handle passed to executors for reporting progress back to the scheduler.
-///
-/// Progress reports are emitted as `SchedulerEvent::Progress` events,
-/// making them available to the UI via the same broadcast channel.
-#[derive(Clone)]
-pub struct ProgressReporter {
-    task_id: i64,
-    task_type: String,
-    key: String,
-    event_tx: tokio::sync::broadcast::Sender<SchedulerEvent>,
-}
-
-impl ProgressReporter {
-    /// Report progress as a percentage (0.0 to 1.0) with an optional message.
-    pub fn report(&self, percent: f32, message: Option<String>) {
-        let _ = self.event_tx.send(SchedulerEvent::Progress {
-            task_id: self.task_id,
-            task_type: self.task_type.clone(),
-            key: self.key.clone(),
-            percent: percent.clamp(0.0, 1.0),
-            message,
-        });
-    }
-
-    /// Report progress as a fraction (completed / total) with an optional message.
-    pub fn report_fraction(&self, completed: u64, total: u64, message: Option<String>) {
-        let percent = if total == 0 {
-            1.0
-        } else {
-            completed as f32 / total as f32
-        };
-        self.report(percent, message);
-    }
-}
-
-// ── Estimated Progress ──────────────────────────────────────────────
-
-/// Estimated progress for a running task, combining executor-reported progress
-/// with throughput-based extrapolation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EstimatedProgress {
-    pub task_id: i64,
-    pub task_type: String,
-    pub key: String,
-    /// Executor-reported progress (0.0 to 1.0), if available.
-    pub reported_percent: Option<f32>,
-    /// Throughput-extrapolated progress (0.0 to 1.0), if history data exists.
-    pub extrapolated_percent: Option<f32>,
-    /// Best available progress estimate.
-    pub percent: f32,
-}
-
 // ── Config ──────────────────────────────────────────────────────────
 
 /// How the scheduler behaves during shutdown.
@@ -165,15 +119,7 @@ impl Default for SchedulerConfig {
     }
 }
 
-/// Handle to a running task for preemption tracking.
-struct ActiveTask {
-    record: TaskRecord,
-    token: CancellationToken,
-    /// Last reported progress from the executor (0.0 to 1.0).
-    reported_progress: Option<f32>,
-    /// When the last progress report was received.
-    reported_at: Option<chrono::DateTime<chrono::Utc>>,
-}
+// ── Scheduler ───────────────────────────────────────────────────────
 
 /// Shared inner state behind `Arc` so `Scheduler` can be `Clone`.
 #[allow(dead_code)]
@@ -186,11 +132,10 @@ struct SchedulerInner {
     throughput_sample_size: i32,
     shutdown_mode: ShutdownMode,
     registry: Arc<TaskTypeRegistry>,
-    pressure: Mutex<CompositePressure>,
-    policy: ThrottlePolicy,
+    gate: Box<dyn gate::DispatchGate>,
     resource_reader: Mutex<Option<Arc<dyn ResourceReader>>>,
     /// In-memory tracking of active tasks and their cancellation tokens.
-    active: Mutex<HashMap<i64, ActiveTask>>,
+    active: ActiveTaskMap,
     /// Broadcast channel for lifecycle events.
     event_tx: tokio::sync::broadcast::Sender<SchedulerEvent>,
     /// Token to cancel the background resource sampler (if started).
@@ -223,6 +168,17 @@ impl Scheduler {
         pressure: CompositePressure,
         policy: ThrottlePolicy,
     ) -> Self {
+        let gate = Box::new(DefaultDispatchGate::new(pressure, policy));
+        Self::with_gate(store, config, registry, gate)
+    }
+
+    /// Create a scheduler with a custom dispatch gate.
+    fn with_gate(
+        store: TaskStore,
+        config: SchedulerConfig,
+        registry: Arc<TaskTypeRegistry>,
+        gate: Box<dyn gate::DispatchGate>,
+    ) -> Self {
         let (event_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             inner: Arc::new(SchedulerInner {
@@ -234,10 +190,9 @@ impl Scheduler {
                 throughput_sample_size: config.throughput_sample_size,
                 shutdown_mode: config.shutdown_mode,
                 registry,
-                pressure: Mutex::new(pressure),
-                policy,
+                gate,
                 resource_reader: Mutex::new(None),
-                active: Mutex::new(HashMap::new()),
+                active: ActiveTaskMap::new(),
                 event_tx,
                 sampler_token: CancellationToken::new(),
             }),
@@ -278,7 +233,10 @@ impl Scheduler {
 
         // Preempt if this is a high-priority task.
         if id.is_some() && sub.priority.value() <= self.inner.preempt_priority.value() {
-            self.preempt_lower_priority(sub.priority).await;
+            self.inner
+                .active
+                .preempt_below(sub.priority, &self.inner.store, &self.inner.event_tx)
+                .await;
         }
 
         Ok(id)
@@ -292,10 +250,8 @@ impl Scheduler {
     /// and cancelled.
     pub async fn cancel(&self, task_id: i64) -> Result<bool, StoreError> {
         // Check if it's an active (running) task first.
-        let mut active = self.inner.active.lock().await;
-        if let Some(at) = active.remove(&task_id) {
+        if let Some(at) = self.inner.active.remove(task_id).await {
             at.token.cancel();
-            // Remove from store (it was running).
             self.inner.store.delete(task_id).await?;
             let _ = self.inner.event_tx.send(SchedulerEvent::Cancelled {
                 task_id,
@@ -304,7 +260,6 @@ impl Scheduler {
             });
             return Ok(true);
         }
-        drop(active);
 
         // Not active — try to delete from the queue (pending/paused).
         let deleted = self.inner.store.delete(task_id).await?;
@@ -317,7 +272,7 @@ impl Scheduler {
     /// (empty queue, concurrency limit, IO budget exhausted, or throttled).
     pub async fn try_dispatch(&self) -> Result<bool, StoreError> {
         // Check concurrency limit.
-        let active_count = self.inner.active.lock().await.len();
+        let active_count = self.inner.active.count().await;
         let max = self.inner.max_concurrency.load(AtomicOrdering::Relaxed);
         if active_count >= max {
             return Ok(false);
@@ -328,33 +283,20 @@ impl Scheduler {
             return Ok(false);
         };
 
-        // Backpressure check: if throttled, requeue the task.
-        let current_pressure = self.inner.pressure.lock().await.pressure();
-        if self
-            .inner
-            .policy
-            .should_throttle(task.priority, current_pressure)
-        {
-            tracing::trace!(
-                priority = task.priority.value(),
-                pressure = current_pressure,
-                "task throttled by backpressure — requeuing"
-            );
-            self.inner.store.requeue(task.id).await?;
-            return Ok(false);
-        }
+        // Build gate context from current state.
+        let reader_guard = self.inner.resource_reader.lock().await;
+        let gate_ctx = GateContext {
+            store: &self.inner.store,
+            resource_reader: reader_guard.as_ref(),
+        };
 
-        // IO budget check: don't saturate disk.
-        if !self.has_io_headroom(&task).await? {
-            tracing::trace!(
-                task_type = task.task_type,
-                expected_read = task.expected_read_bytes,
-                expected_write = task.expected_write_bytes,
-                "task deferred — IO budget exhausted — requeuing"
-            );
+        // Admission check via the dispatch gate.
+        if !self.inner.gate.admit(&task, &gate_ctx).await? {
+            drop(reader_guard);
             self.inner.store.requeue(task.id).await?;
             return Ok(false);
         }
+        drop(reader_guard);
 
         // Look up executor.
         let Some(executor) = self.inner.registry.get(&task.task_type) else {
@@ -377,189 +319,19 @@ impl Scheduler {
         };
         let executor = Arc::clone(executor);
 
-        // Create cancellation token for preemption.
-        let child_token = CancellationToken::new();
-        self.inner.active.lock().await.insert(
-            task.id,
-            ActiveTask {
-                record: task.clone(),
-                token: child_token.clone(),
-                reported_progress: None,
-                reported_at: None,
-            },
-        );
-
-        // Build the execution context for the executor.
-        let ctx = TaskContext {
-            record: task.clone(),
-            token: child_token.clone(),
-            progress: ProgressReporter {
-                task_id: task.id,
-                task_type: task.task_type.clone(),
-                key: task.key.clone(),
-                event_tx: self.inner.event_tx.clone(),
-            },
-        };
-
-        // Emit dispatched event.
-        let _ = self.inner.event_tx.send(SchedulerEvent::Dispatched {
-            task_id: task.id,
-            task_type: task.task_type.clone(),
-            key: task.key.clone(),
-        });
-
-        // Spawn the task.
-        let store = self.inner.store.clone();
-        let inner_for_task = Arc::clone(&self.inner);
-        let max_retries = self.inner.max_retries;
-        let event_tx = self.inner.event_tx.clone();
-
-        // Subscribe to progress events to track reported_progress in the active map.
-        let inner_for_progress = Arc::clone(&self.inner);
-        let mut progress_rx = self.inner.event_tx.subscribe();
-        let progress_task_id = task.id;
-        tokio::spawn(async move {
-            while let Ok(evt) = progress_rx.recv().await {
-                if let SchedulerEvent::Progress {
-                    task_id, percent, ..
-                } = evt
-                {
-                    if task_id == progress_task_id {
-                        if let Some(at) = inner_for_progress.active.lock().await.get_mut(&task_id) {
-                            at.reported_progress = Some(percent);
-                            at.reported_at = Some(chrono::Utc::now());
-                        }
-                        if percent >= 1.0 {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        tokio::spawn(async move {
-            let task_id = task.id;
-            let result = executor.execute_erased(&ctx).await;
-
-            // Remove from active tracking.
-            inner_for_task.active.lock().await.remove(&task_id);
-
-            // Drop the context (and its progress reporter) — executor is done.
-            drop(ctx);
-
-            match result {
-                Ok(tr) => {
-                    if let Err(e) = store.complete(task_id, &tr).await {
-                        tracing::error!(task_id, error = %e, "failed to record task completion");
-                    }
-                    let _ = event_tx.send(SchedulerEvent::Completed {
-                        task_id,
-                        task_type: task.task_type.clone(),
-                        key: task.key.clone(),
-                    });
-                }
-                Err(te) => {
-                    // If cancelled (preempted), the scheduler already paused it.
-                    if child_token.is_cancelled() {
-                        return;
-                    }
-                    let will_retry = te.retryable && task.retry_count < max_retries;
-                    if let Err(e) = store
-                        .fail(
-                            task_id,
-                            &te.message,
-                            te.retryable,
-                            max_retries,
-                            te.actual_read_bytes,
-                            te.actual_write_bytes,
-                        )
-                        .await
-                    {
-                        tracing::error!(task_id, error = %e, "failed to record task failure");
-                    }
-                    let _ = event_tx.send(SchedulerEvent::Failed {
-                        task_id,
-                        task_type: task.task_type.clone(),
-                        key: task.key.clone(),
-                        error: te.message,
-                        will_retry,
-                    });
-                }
-            }
-        });
+        // Spawn the task — this inserts into the active map, builds the
+        // context, emits Dispatched, and wires up completion handling.
+        dispatch::spawn_task(
+            task,
+            executor,
+            self.inner.store.clone(),
+            self.inner.active.clone(),
+            self.inner.event_tx.clone(),
+            self.inner.max_retries,
+        )
+        .await;
 
         Ok(true)
-    }
-
-    /// Check if there is IO headroom for a task given current running IO
-    /// and system capacity.
-    async fn has_io_headroom(&self, task: &TaskRecord) -> Result<bool, StoreError> {
-        let reader = self.inner.resource_reader.lock().await;
-        let Some(ref reader) = *reader else {
-            // No monitor configured — always allow.
-            return Ok(true);
-        };
-
-        let snapshot = reader.latest();
-        // If we have no IO data yet, allow the task.
-        if snapshot.io_read_bytes_per_sec == 0.0 && snapshot.io_write_bytes_per_sec == 0.0 {
-            return Ok(true);
-        }
-
-        let (running_read, running_write) = self.inner.store.running_io_totals().await?;
-
-        // Simple heuristic: if running tasks' expected IO already exceeds
-        // 80% of observed system throughput (per second × 2s budget window),
-        // defer new work.
-        let read_capacity = snapshot.io_read_bytes_per_sec * 2.0;
-        let write_capacity = snapshot.io_write_bytes_per_sec * 2.0;
-
-        let read_ok = read_capacity == 0.0
-            || (running_read + task.expected_read_bytes) as f64 <= read_capacity * 0.8;
-        let write_ok = write_capacity == 0.0
-            || (running_write + task.expected_write_bytes) as f64 <= write_capacity * 0.8;
-
-        Ok(read_ok && write_ok)
-    }
-
-    /// Preempt active tasks with priority lower than the given threshold.
-    async fn preempt_lower_priority(&self, incoming_priority: Priority) {
-        let mut active = self.inner.active.lock().await;
-        let to_preempt: Vec<i64> = active
-            .iter()
-            .filter(|(_, at)| at.record.priority.value() > incoming_priority.value())
-            .map(|(id, _)| *id)
-            .collect();
-
-        for id in to_preempt {
-            if let Some(at) = active.remove(&id) {
-                tracing::info!(
-                    task_id = id,
-                    task_type = at.record.task_type,
-                    "preempting task for higher-priority work"
-                );
-                at.token.cancel();
-                // Pause in the store (best-effort — the spawned task will also
-                // notice cancellation and exit).
-                let _ = self.inner.store.pause(id).await;
-                let _ = self.inner.event_tx.send(SchedulerEvent::Preempted {
-                    task_id: id,
-                    task_type: at.record.task_type.clone(),
-                    key: at.record.key.clone(),
-                });
-            }
-        }
-    }
-
-    /// Check whether any active tasks would preempt the given paused tasks.
-    /// Returns true if there are running tasks with priority at or above the
-    /// preemption threshold that would preempt the given priority.
-    async fn has_active_preemptors(&self, priority: Priority) -> bool {
-        let active = self.inner.active.lock().await;
-        active.values().any(|at| {
-            at.record.priority.value() <= self.inner.preempt_priority.value()
-                && at.record.priority.value() < priority.value()
-        })
     }
 
     /// Run the scheduler loop until the cancellation token is triggered.
@@ -583,7 +355,10 @@ impl Scheduler {
                     // Resume paused tasks only if no active preemptors exist.
                     if let Ok(paused) = self.inner.store.paused_tasks().await {
                         for task in paused {
-                            if !self.has_active_preemptors(task.priority).await {
+                            if !self.inner.active.has_preemptors_for(
+                                task.priority,
+                                self.inner.preempt_priority,
+                            ).await {
                                 let _ = self.inner.store.resume(task.id).await;
                             }
                         }
@@ -612,10 +387,7 @@ impl Scheduler {
 
         match self.inner.shutdown_mode {
             ShutdownMode::Hard => {
-                let mut active = self.inner.active.lock().await;
-                for (_, at) in active.drain() {
-                    at.token.cancel();
-                }
+                self.inner.active.cancel_all().await;
             }
             ShutdownMode::Graceful(timeout) => {
                 tracing::info!(
@@ -623,10 +395,9 @@ impl Scheduler {
                     "graceful shutdown — waiting for running tasks"
                 );
 
-                // Wait for running tasks to complete, polling periodically.
                 let deadline = tokio::time::Instant::now() + timeout;
                 loop {
-                    let count = self.inner.active.lock().await.len();
+                    let count = self.inner.active.count().await;
                     if count == 0 {
                         tracing::info!("all tasks completed during graceful shutdown");
                         break;
@@ -636,10 +407,7 @@ impl Scheduler {
                             remaining = count,
                             "graceful shutdown timeout — cancelling remaining tasks"
                         );
-                        let mut active = self.inner.active.lock().await;
-                        for (_, at) in active.drain() {
-                            at.token.cancel();
-                        }
+                        self.inner.active.cancel_all().await;
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -649,14 +417,8 @@ impl Scheduler {
     }
 
     /// Snapshot of currently active (in-memory) tasks.
-    pub async fn active_tasks(&self) -> Vec<TaskRecord> {
-        self.inner
-            .active
-            .lock()
-            .await
-            .values()
-            .map(|at| at.record.clone())
-            .collect()
+    pub async fn active_tasks(&self) -> Vec<crate::task::TaskRecord> {
+        self.inner.active.records().await
     }
 
     /// Get estimated progress for all running tasks.
@@ -664,62 +426,13 @@ impl Scheduler {
     /// Combines executor-reported progress with throughput-based extrapolation
     /// using historical average duration for each task type.
     pub async fn estimated_progress(&self) -> Vec<EstimatedProgress> {
-        let active = self.inner.active.lock().await;
-        let mut results = Vec::with_capacity(active.len());
-
-        for (_, at) in active.iter() {
-            let reported = at.reported_progress;
-
-            // Extrapolate progress using the mean of historical and observed throughput.
-            // If the executor has reported progress, we anchor on that and extrapolate
-            // forward from the time of the last report rather than from task start.
-            let extrapolated = if let Some(started) = at.record.started_at {
-                let now = chrono::Utc::now();
-                if let Ok(stats) = self.inner.store.history_stats(&at.record.task_type).await {
-                    if stats.avg_duration_ms > 0.0 {
-                        // Historical throughput: fraction of work completed per ms.
-                        let hist_throughput = 1.0 / stats.avg_duration_ms;
-
-                        match (reported, at.reported_at) {
-                            // We have a progress anchor — blend throughputs and
-                            // extrapolate from the last report.
-                            (Some(rp), Some(rat)) => {
-                                let elapsed_to_report =
-                                    (rat - started).num_milliseconds().max(1) as f64;
-                                let current_throughput = rp as f64 / elapsed_to_report;
-                                let blended = (hist_throughput + current_throughput) / 2.0;
-                                let since_report = (now - rat).num_milliseconds().max(0) as f64;
-                                Some((rp as f64 + blended * since_report).min(0.99) as f32)
-                            }
-                            // No report yet — pure time-based extrapolation.
-                            _ => {
-                                let elapsed_ms = (now - started).num_milliseconds() as f64;
-                                Some((elapsed_ms * hist_throughput).min(0.99) as f32)
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            // Best estimate: prefer reported, fall back to extrapolated, then 0.
-            let percent = reported.or(extrapolated).unwrap_or(0.0);
-
-            results.push(EstimatedProgress {
-                task_id: at.record.id,
-                task_type: at.record.task_type.clone(),
-                key: at.record.key.clone(),
-                reported_percent: reported,
-                extrapolated_percent: extrapolated,
-                percent,
-            });
+        let snapshots: Vec<_> = self.inner.active.progress_snapshots().await;
+        let mut results = Vec::with_capacity(snapshots.len());
+        for (record, reported, reported_at) in snapshots {
+            results.push(
+                progress::extrapolate(&record, reported, reported_at, &self.inner.store).await,
+            );
         }
-
         results
     }
 
@@ -847,7 +560,7 @@ impl SchedulerBuilder {
         self
     }
 
-    /// Add a backpressure source.
+    /// Add a backpressure source (used by the default gate).
     pub fn pressure_source(
         mut self,
         source: Box<dyn crate::backpressure::PressureSource + 'static>,
@@ -856,7 +569,7 @@ impl SchedulerBuilder {
         self
     }
 
-    /// Set a custom throttle policy. Default: three-tier.
+    /// Set a custom throttle policy (used by the default gate). Default: three-tier.
     pub fn throttle_policy(mut self, policy: ThrottlePolicy) -> Self {
         self.policy = Some(policy);
         self
@@ -908,22 +621,20 @@ impl SchedulerBuilder {
             if registry.get(&name).is_some() {
                 panic!("task type '{name}' already registered");
             }
-            // Insert directly into the registry's inner map via a helper.
-            // Since we already have Arc<dyn ErasedExecutor>, we use the raw insert.
             registry.register_erased(&name, executor);
         }
 
-        // Build pressure.
+        // Build gate from pressure sources + policy.
         let mut pressure = CompositePressure::new();
         for source in self.pressure_sources {
             pressure.add_source(source);
         }
-
         let policy = self
             .policy
             .unwrap_or_else(ThrottlePolicy::default_three_tier);
+        let gate = Box::new(DefaultDispatchGate::new(pressure, policy));
 
-        let scheduler = Scheduler::new(store, self.config, Arc::new(registry), pressure, policy);
+        let scheduler = Scheduler::with_gate(store, self.config, Arc::new(registry), gate);
 
         // Set up resource monitoring.
         if self.enable_resource_monitoring {

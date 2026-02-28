@@ -13,8 +13,13 @@ taskmill/
     priority.rs       — Priority newtype (u8, lower = higher priority)
     store.rs          — TaskStore: SQLite persistence, atomic pop, queries, retention
     registry.rs       — TaskContext, TaskExecutor trait (RPITIT) + ErasedExecutor + TaskTypeRegistry
-    scheduler.rs      — Scheduler: dispatch loop, IO budget, preemption, retries, events,
-                        progress reporting, graceful shutdown, builder
+    scheduler/
+      mod.rs          — Scheduler struct, run loop, submit, cancel, config, events, builder
+      gate.rs         — DispatchGate trait, DefaultDispatchGate (backpressure + IO budget),
+                        GateContext, has_io_headroom() utility
+      dispatch.rs     — ActiveTask, ActiveTaskMap (preemption, progress tracking),
+                        spawn_task() (context wiring, completion/failure handling)
+      progress.rs     — ProgressReporter, EstimatedProgress, throughput extrapolation
     backpressure.rs   — PressureSource trait, ThrottlePolicy, CompositePressure
     resource/
       mod.rs          — ResourceSampler + ResourceReader traits, ResourceSnapshot, platform_sampler()
@@ -119,6 +124,32 @@ Manual pruning is also available via `prune_history_by_count()` and
 
 ## Scheduler architecture
 
+The scheduler is split into four files for separation of concerns:
+
+| File             | Responsibility                                                       |
+|------------------|----------------------------------------------------------------------|
+| `mod.rs`         | Orchestration: run loop, submit, cancel, config, events, builder     |
+| `gate.rs`        | Admission control: `DispatchGate` trait, backpressure + IO budget    |
+| `dispatch.rs`    | Task lifecycle: `ActiveTaskMap`, `spawn_task()`, preemption          |
+| `progress.rs`    | Progress tracking: `ProgressReporter`, `EstimatedProgress`, extrapolation |
+
+This decomposition means:
+- **Backpressure and IO budget** can be unit-tested without a full scheduler (construct a `DefaultDispatchGate` with mock `CompositePressure` and `ResourceReader`)
+- **Dispatch strategy** is behind a `DispatchGate` trait internally, ready to be made public when the API stabilizes
+- **Preemption logic** is testable via `ActiveTaskMap` independently
+- **Progress extrapolation** is a pure function over `(TaskRecord, TypeStats)` — testable with synthetic data
+
+### Dispatch gate (internal)
+
+The `DispatchGate` trait (in `gate.rs`, currently `pub(crate)`) controls whether a
+popped task should be dispatched or requeued. The `GateContext` provides access to
+the `TaskStore` and `ResourceReader` without the gate owning them. The default
+`DefaultDispatchGate` applies backpressure throttling via `ThrottlePolicy` and
+IO-budget checks via `has_io_headroom()`.
+
+The trait is kept internal for now — the seam exists for testability and future
+extensibility, but the public API isn't committed yet.
+
 ### Clone-friendly design
 
 `Scheduler` wraps all shared state in `Arc<SchedulerInner>` and derives `Clone`.
@@ -166,14 +197,12 @@ flowchart TD
     CONC -- no --> SLEEP["Sleep poll_interval"]
     CONC -- yes --> POP["Atomic pop\nUPDATE → running"]
     POP -- empty --> SLEEP
-    POP -- task --> BP{"ThrottlePolicy\nshould_throttle()?"}
-    BP -- throttled --> REQUEUE["Atomic requeue\n(running → pending)"]
+    POP -- task --> GATE{"DispatchGate::admit()\n(backpressure + IO budget)"}
+    GATE -- rejected --> REQUEUE["Atomic requeue\n(running → pending)"]
     REQUEUE --> SLEEP
-    BP -- ok --> IO{"has_io_headroom()\nIO budget available?"}
-    IO -- exhausted --> REQUEUE
-    IO -- ok --> REG{"Executor\nregistered?"}
+    GATE -- admitted --> REG{"Executor\nregistered?"}
     REG -- no --> FAIL["Fail task immediately"]
-    REG -- yes --> SPAWN["tokio::spawn\nwith TaskContext"]
+    REG -- yes --> SPAWN["spawn_task()\nActiveTaskMap + TaskContext"]
     SPAWN --> EVENT["Emit Dispatched event"]
     EVENT --> CONC
     FAIL --> CONC
@@ -182,14 +211,13 @@ flowchart TD
 
 Key design: the scheduler uses **pop-then-check** instead of peek-then-pop,
 eliminating a race condition where the peeked task could differ from the popped
-task. If a throttle or IO check fails after pop, the task is atomically requeued
-via a single `UPDATE ... SET status = 'pending'` (no intermediate state).
+task. If the `DispatchGate` rejects a task after pop, the task is atomically
+requeued via a single `UPDATE ... SET status = 'pending'` (no intermediate state).
 
-Each gate can independently halt dispatch:
+Each stage can independently halt dispatch:
 
 - **Concurrency**: hard cap via `max_concurrency` (`AtomicUsize`, runtime-adjustable)
-- **Backpressure**: priority-aware throttling from external signals
-- **IO budget**: defers work when running IO estimates approach system throughput
+- **DispatchGate**: pluggable admission control (default: backpressure + IO budget)
 - **Empty queue**: no pending tasks
 
 ## Event system
@@ -468,7 +496,9 @@ handles parsing via `chrono::NaiveDateTime::parse_from_str`.
 
 - `Scheduler` is `Clone` (wraps `Arc<SchedulerInner>`) — safe to share across tasks and Tauri commands
 - `TaskStore` is `Clone` (wraps `SqlitePool`) — safe to share across tasks
-- `SchedulerInner` uses `Mutex<_>` for mutable shared state (active map, pressure, resource reader)
+- `SchedulerInner` uses `Mutex<_>` for mutable shared state (resource reader)
+- `ActiveTaskMap` wraps its inner `HashMap` in `Arc<Mutex<_>>` and is `Clone`
+- `DispatchGate` is `Send + Sync + 'static` — stored as `Box<dyn DispatchGate>` in `SchedulerInner`
 - `max_concurrency` uses `AtomicUsize` for lock-free runtime adjustment
 - `SmoothedReader` uses `RwLock` so readers never block each other
 - `TaskTypeRegistry` is immutable after startup, shared via `Arc`
