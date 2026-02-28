@@ -34,7 +34,7 @@ taskmill/
 
 ```mermaid
 flowchart TD
-    S["submit()"] --> TS["TaskStore\n(INSERT OR IGNORE)"]
+    S["submit() /\nsubmit_batch()"] --> TS["TaskStore\n(INSERT OR IGNORE)"]
     TS --> |SQLite| DB[(tasks table)]
     DB --> SCH["Scheduler\ndispatch loop"]
     SCH --> |"tokio::spawn"| E1["Executor 1\n+ TaskContext"]
@@ -518,6 +518,12 @@ app.manage(scheduler);
 #[tauri::command]
 async fn submit_task(scheduler: tauri::State<'_, Scheduler>) -> Result<Option<i64>, StoreError> {
     scheduler.submit(&submission).await
+}
+
+// Bulk enqueue (e.g., user drops many files) — single transaction.
+#[tauri::command]
+async fn submit_batch(scheduler: tauri::State<'_, Scheduler>, subs: Vec<TaskSubmission>) -> Result<Vec<Option<i64>>, StoreError> {
+    scheduler.submit_batch(&subs).await
 }
 ```
 

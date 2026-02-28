@@ -12,6 +12,7 @@ disk throughput.
 
 - **SQLite persistence** — tasks survive process restarts; tasks left running during a crash are recovered to pending on startup
 - **Key-based deduplication** — `UNIQUE(key)` constraint with `INSERT OR IGNORE` prevents duplicate work
+- **Batch submission** — `submit_batch()` wraps many inserts in a single SQLite transaction for bulk enqueue (e.g., 500 dropped photos)
 - **Priority queue** — 256 levels (0 = highest), popped via `ORDER BY priority ASC, id ASC`
 - **Expected/actual IO tracking** — submit estimated IO; executors report actual bytes on completion
 - **IO-aware scheduling** — compares running task IO estimates against system throughput before dispatching more work
@@ -115,6 +116,13 @@ async fn main() {
         4096,
         1024,
     ).unwrap()).await.unwrap();
+
+    // Submit tasks in bulk (single SQLite transaction).
+    let batch: Vec<_> = paths.iter().map(|p| {
+        TaskSubmission::with_payload("my-task", Priority::NORMAL, p, 4096, 1024).unwrap()
+    }).collect();
+    let ids = scheduler.submit_batch(&batch).await.unwrap();
+    // ids[i] is Some(row_id) if inserted, None if deduplicated.
 
     // Run the scheduler loop (blocks until token is cancelled).
     let token = CancellationToken::new();
@@ -259,6 +267,9 @@ collide — even when using the same explicit key or identical payloads of diffe
 
 Once a task completes or fails (moved to `task_history`), the key is freed and can be
 resubmitted.
+
+`submit_batch()` applies the same deduplication within a single transaction — duplicate
+keys in the batch return `None` without inserting.
 
 ## Typed payloads
 

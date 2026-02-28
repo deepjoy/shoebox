@@ -242,6 +242,36 @@ impl Scheduler {
         Ok(id)
     }
 
+    /// Submit multiple tasks in a single SQLite transaction.
+    ///
+    /// Returns a `Vec` with one entry per input: `Some(id)` if inserted,
+    /// `None` if deduplicated. Preemption is triggered once at the end if
+    /// any inserted task has high enough priority.
+    pub async fn submit_batch(
+        &self,
+        submissions: &[TaskSubmission],
+    ) -> Result<Vec<Option<i64>>, StoreError> {
+        let results = self.inner.store.submit_batch(submissions).await?;
+
+        // Find the highest (lowest numeric value) priority among newly inserted tasks.
+        let best_priority = submissions
+            .iter()
+            .zip(results.iter())
+            .filter_map(|(sub, id)| id.map(|_| sub.priority))
+            .min_by_key(|p| p.value());
+
+        if let Some(priority) = best_priority {
+            if priority.value() <= self.inner.preempt_priority.value() {
+                self.inner
+                    .active
+                    .preempt_below(priority, &self.inner.store, &self.inner.event_tx)
+                    .await;
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Submit a [`TypedTask`], handling serialization automatically.
     ///
     /// Equivalent to converting the task into a [`TaskSubmission`] via `TryFrom`

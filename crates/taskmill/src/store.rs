@@ -194,6 +194,53 @@ impl TaskStore {
         }
     }
 
+    /// Submit multiple tasks in a single transaction. Returns a `Vec` with one
+    /// entry per input: `Some(id)` if inserted, `None` if deduplicated.
+    ///
+    /// This is significantly faster than calling [`submit`](Self::submit) in a
+    /// loop because all inserts share a single SQLite transaction (one
+    /// `BEGIN`/`COMMIT` pair instead of N implicit transactions).
+    pub async fn submit_batch(
+        &self,
+        submissions: &[TaskSubmission],
+    ) -> Result<Vec<Option<i64>>, StoreError> {
+        let mut results = Vec::with_capacity(submissions.len());
+
+        let mut tx = self.pool.begin().await?;
+
+        for sub in submissions {
+            if let Some(ref p) = sub.payload {
+                if p.len() > MAX_PAYLOAD_BYTES {
+                    return Err(StoreError::PayloadTooLarge);
+                }
+            }
+
+            let key = sub.effective_key();
+            let priority = sub.priority.value() as i32;
+            let result = sqlx::query(
+                "INSERT OR IGNORE INTO tasks (task_type, key, priority, payload, expected_read_bytes, expected_write_bytes)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&sub.task_type)
+            .bind(&key)
+            .bind(priority)
+            .bind(&sub.payload)
+            .bind(sub.expected_read_bytes)
+            .bind(sub.expected_write_bytes)
+            .execute(&mut *tx)
+            .await?;
+
+            if result.rows_affected() == 0 {
+                results.push(None);
+            } else {
+                results.push(Some(result.last_insert_rowid()));
+            }
+        }
+
+        tx.commit().await?;
+        Ok(results)
+    }
+
     // ── Pop / lifecycle ─────────────────────────────────────────────
 
     /// Pop the highest-priority pending task and mark it as running.
@@ -1133,5 +1180,66 @@ mod tests {
 
         let hist = store.history(100, 0).await.unwrap();
         assert_eq!(hist.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn submit_batch_inserts_all() {
+        let store = test_store().await;
+        let subs: Vec<_> = (0..5)
+            .map(|i| make_submission(&format!("batch-{i}"), Priority::NORMAL))
+            .collect();
+
+        let results = store.submit_batch(&subs).await.unwrap();
+        assert_eq!(results.len(), 5);
+        assert!(results.iter().all(|r| r.is_some()));
+
+        let count = store.pending_count().await.unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[tokio::test]
+    async fn submit_batch_dedup() {
+        let store = test_store().await;
+        let sub = make_submission("dup", Priority::NORMAL);
+
+        let results = store
+            .submit_batch(&[sub.clone(), sub.clone()])
+            .await
+            .unwrap();
+        assert!(results[0].is_some());
+        assert!(results[1].is_none()); // dedup within same batch
+
+        // Submitting again should also dedup.
+        let results = store.submit_batch(&[sub]).await.unwrap();
+        assert!(results[0].is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_batch_empty() {
+        let store = test_store().await;
+        let results = store.submit_batch(&[]).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn submit_batch_rejects_oversized_payload() {
+        let store = test_store().await;
+        let sub = make_submission("ok", Priority::NORMAL);
+        let big = TaskSubmission {
+            task_type: "test".into(),
+            key: Some("big".into()),
+            priority: Priority::NORMAL,
+            payload: Some(vec![0u8; MAX_PAYLOAD_BYTES + 1]),
+            expected_read_bytes: 0,
+            expected_write_bytes: 0,
+        };
+
+        // The oversized payload should fail the entire batch — no partial inserts.
+        let err = store.submit_batch(&[sub.clone(), big]).await.unwrap_err();
+        assert!(matches!(err, StoreError::PayloadTooLarge));
+
+        // The first task should NOT have been committed (transaction rolled back).
+        let count = store.pending_count().await.unwrap();
+        assert_eq!(count, 0);
     }
 }
