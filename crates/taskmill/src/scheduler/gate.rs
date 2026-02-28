@@ -60,6 +60,18 @@ pub trait DispatchGate: Send + Sync + 'static {
         task: &'a TaskRecord,
         ctx: &'a GateContext<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + 'a>>;
+
+    /// Current aggregate pressure (0.0–1.0). Returns 0.0 by default.
+    fn pressure<'a>(&'a self) -> Pin<Box<dyn Future<Output = f32> + Send + 'a>> {
+        Box::pin(async { 0.0 })
+    }
+
+    /// Per-source pressure breakdown for diagnostics. Empty by default.
+    fn pressure_breakdown<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Vec<(String, f32)>> + Send + 'a>> {
+        Box::pin(async { Vec::new() })
+    }
 }
 
 // ── Default Gate ───────────────────────────────────────────────────
@@ -112,6 +124,24 @@ impl DispatchGate for DefaultDispatchGate {
             }
 
             Ok(true)
+        })
+    }
+
+    fn pressure<'a>(&'a self) -> Pin<Box<dyn Future<Output = f32> + Send + 'a>> {
+        Box::pin(async { self.pressure.lock().await.pressure() })
+    }
+
+    fn pressure_breakdown<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Vec<(String, f32)>> + Send + 'a>> {
+        Box::pin(async {
+            self.pressure
+                .lock()
+                .await
+                .breakdown()
+                .into_iter()
+                .map(|(name, val)| (name.to_owned(), val))
+                .collect()
         })
     }
 }

@@ -221,6 +221,34 @@ for p in &progress {
 }
 ```
 
+## Dashboard snapshot
+
+For UI dashboards, `Scheduler::snapshot()` gathers all scheduler state in a single
+call — running tasks, queue depths, progress estimates, and backpressure — returning
+a serializable `SchedulerSnapshot`:
+
+```rust
+let snap = scheduler.snapshot().await?;
+// snap.running         — Vec<TaskRecord> of currently executing tasks
+// snap.pending_count   — number of tasks waiting to dispatch
+// snap.paused_count    — number of preempted tasks
+// snap.progress        — Vec<EstimatedProgress> for every running task
+// snap.pressure        — aggregate backpressure (0.0–1.0)
+// snap.pressure_breakdown — per-source diagnostics: Vec<(String, f32)>
+// snap.max_concurrency — current concurrency limit
+```
+
+This is designed for Tauri commands that return a single status object to the frontend:
+
+```rust
+#[tauri::command]
+async fn scheduler_status(
+    scheduler: tauri::State<'_, Scheduler>,
+) -> Result<SchedulerSnapshot, StoreError> {
+    scheduler.snapshot().await
+}
+```
+
 ## Graceful shutdown
 
 By default, the scheduler hard-cancels all running tasks on shutdown. For desktop
@@ -429,6 +457,8 @@ All queries are available on `TaskStore` (accessed via `scheduler.store()`):
 | `pending_count()`                   | Count of pending tasks                  |
 | `pending_by_type(task_type)`        | Pending tasks filtered by type          |
 | `paused_tasks()`                    | All paused tasks                        |
+| `paused_count()`                    | Count of paused tasks                   |
+| `task_by_id(id)`                    | Look up an active task by row id        |
 | `task_by_key(key)`                  | Look up an active task by dedup key     |
 | `running_io_totals()`              | Sum of expected read/write for running  |
 | `history(limit, offset)`            | Paginated history, newest first         |

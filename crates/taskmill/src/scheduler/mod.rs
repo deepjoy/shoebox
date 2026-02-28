@@ -23,6 +23,30 @@ use gate::{DefaultDispatchGate, GateContext};
 
 pub use progress::{EstimatedProgress, ProgressReporter};
 
+// ── Snapshot ────────────────────────────────────────────────────────
+
+/// Single-call status snapshot for dashboard UIs.
+///
+/// Captures queue depths, running tasks, progress, and backpressure in
+/// one serializable struct — ideal for returning from a Tauri command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerSnapshot {
+    /// Tasks currently executing.
+    pub running: Vec<crate::task::TaskRecord>,
+    /// Number of tasks waiting to be dispatched.
+    pub pending_count: i64,
+    /// Number of tasks paused (preempted).
+    pub paused_count: i64,
+    /// Progress estimates for every running task.
+    pub progress: Vec<EstimatedProgress>,
+    /// Aggregate backpressure (0.0–1.0).
+    pub pressure: f32,
+    /// Per-source pressure breakdown for diagnostics.
+    pub pressure_breakdown: Vec<(String, f32)>,
+    /// Current maximum concurrency setting.
+    pub max_concurrency: usize,
+}
+
 // ── Events ──────────────────────────────────────────────────────────
 
 /// Events emitted by the scheduler for UI integration and observability.
@@ -473,6 +497,31 @@ impl Scheduler {
             );
         }
         results
+    }
+
+    /// Capture a single status snapshot for dashboard UIs.
+    ///
+    /// Gathers running tasks, queue depths, progress estimates, and
+    /// backpressure in one call — exactly what a Tauri command would
+    /// return to the frontend.
+    pub async fn snapshot(&self) -> Result<SchedulerSnapshot, StoreError> {
+        let running = self.inner.active.records().await;
+        let pending_count = self.inner.store.pending_count().await?;
+        let paused_count = self.inner.store.paused_count().await?;
+        let progress = self.estimated_progress().await;
+        let pressure = self.inner.gate.pressure().await;
+        let pressure_breakdown = self.inner.gate.pressure_breakdown().await;
+        let max_concurrency = self.max_concurrency();
+
+        Ok(SchedulerSnapshot {
+            running,
+            pending_count,
+            paused_count,
+            progress,
+            pressure,
+            pressure_breakdown,
+            max_concurrency,
+        })
     }
 
     /// Update max concurrency at runtime (e.g., from adaptive controller or
@@ -1040,5 +1089,39 @@ mod tests {
         // Payload round-trips.
         let recovered: Thumb = record.deserialize_payload().unwrap().unwrap();
         assert_eq!(recovered, task);
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_dashboard_state() {
+        let sched = setup(arc_erased(SlowExecutor)).await;
+
+        // Submit two tasks.
+        for key in &["snap-a", "snap-b"] {
+            sched
+                .submit(&TaskSubmission {
+                    task_type: "test".into(),
+                    key: Some(key.to_string()),
+                    priority: Priority::NORMAL,
+                    payload: None,
+                    expected_read_bytes: 0,
+                    expected_write_bytes: 0,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Dispatch one so it becomes running.
+        sched.try_dispatch().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let snap = sched.snapshot().await.unwrap();
+
+        assert_eq!(snap.running.len(), 1);
+        assert_eq!(snap.pending_count, 1);
+        assert_eq!(snap.paused_count, 0);
+        assert_eq!(snap.progress.len(), 1);
+        assert_eq!(snap.pressure, 0.0); // no pressure sources
+        assert!(snap.pressure_breakdown.is_empty());
+        assert_eq!(snap.max_concurrency, 4);
     }
 }

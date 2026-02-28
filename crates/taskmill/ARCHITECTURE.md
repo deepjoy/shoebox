@@ -14,7 +14,7 @@ taskmill/
     store.rs          — TaskStore: SQLite persistence, atomic pop, queries, retention
     registry.rs       — TaskContext, TaskExecutor trait (RPITIT) + ErasedExecutor + TaskTypeRegistry
     scheduler/
-      mod.rs          — Scheduler struct, run loop, submit, cancel, config, events, builder
+      mod.rs          — Scheduler struct, SchedulerSnapshot, run loop, submit, cancel, config, events, builder
       gate.rs         — DispatchGate trait, DefaultDispatchGate (backpressure + IO budget),
                         GateContext, has_io_headroom() utility
       dispatch.rs     — ActiveTask, ActiveTaskMap (preemption, progress tracking),
@@ -128,7 +128,7 @@ The scheduler is split into four files for separation of concerns:
 
 | File             | Responsibility                                                       |
 |------------------|----------------------------------------------------------------------|
-| `mod.rs`         | Orchestration: run loop, submit, cancel, config, events, builder     |
+| `mod.rs`         | Orchestration: run loop, submit, cancel, snapshot, config, events, builder |
 | `gate.rs`        | Admission control: `DispatchGate` trait, backpressure + IO budget    |
 | `dispatch.rs`    | Task lifecycle: `ActiveTaskMap`, `spawn_task()`, preemption          |
 | `progress.rs`    | Progress tracking: `ProgressReporter`, `EstimatedProgress`, extrapolation |
@@ -146,6 +146,11 @@ popped task should be dispatched or requeued. The `GateContext` provides access 
 the `TaskStore` and `ResourceReader` without the gate owning them. The default
 `DefaultDispatchGate` applies backpressure throttling via `ThrottlePolicy` and
 IO-budget checks via `has_io_headroom()`.
+
+The trait also exposes `pressure()` and `pressure_breakdown()` methods (with default
+no-op implementations) so the scheduler can read backpressure state without knowing
+the concrete gate type. `DefaultDispatchGate` overrides both, delegating to its
+internal `CompositePressure`. This powers `Scheduler::snapshot()`.
 
 The trait is kept internal for now — the seam exists for testability and future
 extensibility, but the public API isn't committed yet.
@@ -524,6 +529,12 @@ async fn submit_task(scheduler: tauri::State<'_, Scheduler>) -> Result<Option<i6
 #[tauri::command]
 async fn submit_batch(scheduler: tauri::State<'_, Scheduler>, subs: Vec<TaskSubmission>) -> Result<Vec<Option<i64>>, StoreError> {
     scheduler.submit_batch(&subs).await
+}
+
+// Single-call dashboard status — running tasks, queue depths, progress, pressure.
+#[tauri::command]
+async fn scheduler_status(scheduler: tauri::State<'_, Scheduler>) -> Result<SchedulerSnapshot, StoreError> {
+    scheduler.snapshot().await
 }
 ```
 

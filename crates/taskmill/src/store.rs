@@ -498,6 +498,14 @@ impl TaskStore {
         Ok(rows.iter().map(row_to_task_record).collect())
     }
 
+    /// Count of paused tasks.
+    pub async fn paused_count(&self) -> Result<i64, StoreError> {
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tasks WHERE status = 'paused'")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count.0)
+    }
+
     /// Paused tasks.
     pub async fn paused_tasks(&self) -> Result<Vec<TaskRecord>, StoreError> {
         let rows = sqlx::query(
@@ -607,9 +615,9 @@ impl TaskStore {
         let row = sqlx::query(
             "SELECT
                 COUNT(*) as total,
-                COALESCE(AVG(CASE WHEN status = 'completed' THEN duration_ms END), 0) as avg_dur,
-                COALESCE(AVG(CASE WHEN status = 'completed' THEN actual_read_bytes END), 0) as avg_read,
-                COALESCE(AVG(CASE WHEN status = 'completed' THEN actual_write_bytes END), 0) as avg_write,
+                COALESCE(AVG(CASE WHEN status = 'completed' THEN duration_ms END), 0.0) as avg_dur,
+                COALESCE(AVG(CASE WHEN status = 'completed' THEN actual_read_bytes END), 0.0) as avg_read,
+                COALESCE(AVG(CASE WHEN status = 'completed' THEN actual_write_bytes END), 0.0) as avg_write,
                 CAST(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS REAL) / MAX(COUNT(*), 1) as fail_rate
              FROM task_history WHERE task_type = ?",
         )
