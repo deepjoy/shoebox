@@ -171,6 +171,8 @@ struct ActiveTask {
     token: CancellationToken,
     /// Last reported progress from the executor (0.0 to 1.0).
     reported_progress: Option<f32>,
+    /// When the last progress report was received.
+    reported_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Shared inner state behind `Arc` so `Scheduler` can be `Clone`.
@@ -383,6 +385,7 @@ impl Scheduler {
                 record: task.clone(),
                 token: child_token.clone(),
                 reported_progress: None,
+                reported_at: None,
             },
         );
 
@@ -424,6 +427,7 @@ impl Scheduler {
                     if task_id == progress_task_id {
                         if let Some(at) = inner_for_progress.active.lock().await.get_mut(&task_id) {
                             at.reported_progress = Some(percent);
+                            at.reported_at = Some(chrono::Utc::now());
                         }
                         if percent >= 1.0 {
                             break;
@@ -666,12 +670,33 @@ impl Scheduler {
         for (_, at) in active.iter() {
             let reported = at.reported_progress;
 
-            // Extrapolate from elapsed time vs. historical average duration.
+            // Extrapolate progress using the mean of historical and observed throughput.
+            // If the executor has reported progress, we anchor on that and extrapolate
+            // forward from the time of the last report rather than from task start.
             let extrapolated = if let Some(started) = at.record.started_at {
-                let elapsed_ms = (chrono::Utc::now() - started).num_milliseconds() as f64;
+                let now = chrono::Utc::now();
                 if let Ok(stats) = self.inner.store.history_stats(&at.record.task_type).await {
                     if stats.avg_duration_ms > 0.0 {
-                        Some((elapsed_ms / stats.avg_duration_ms).min(0.99) as f32)
+                        // Historical throughput: fraction of work completed per ms.
+                        let hist_throughput = 1.0 / stats.avg_duration_ms;
+
+                        match (reported, at.reported_at) {
+                            // We have a progress anchor — blend throughputs and
+                            // extrapolate from the last report.
+                            (Some(rp), Some(rat)) => {
+                                let elapsed_to_report =
+                                    (rat - started).num_milliseconds().max(1) as f64;
+                                let current_throughput = rp as f64 / elapsed_to_report;
+                                let blended = (hist_throughput + current_throughput) / 2.0;
+                                let since_report = (now - rat).num_milliseconds().max(0) as f64;
+                                Some((rp as f64 + blended * since_report).min(0.99) as f32)
+                            }
+                            // No report yet — pure time-based extrapolation.
+                            _ => {
+                                let elapsed_ms = (now - started).num_milliseconds() as f64;
+                                Some((elapsed_ms * hist_throughput).min(0.99) as f32)
+                            }
+                        }
                     } else {
                         None
                     }
