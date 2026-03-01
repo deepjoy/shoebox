@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -65,6 +67,12 @@ pub struct StoreConfig {
     /// When set, completed/failed tasks are pruned during `complete()` and
     /// `fail()` to keep the history table bounded.
     pub retention_policy: Option<RetentionPolicy>,
+
+    /// How many completions between automatic prune runs.
+    ///
+    /// Pruning runs once every `prune_interval` calls to `complete()` or
+    /// `fail()` instead of on every call. Default: 100.
+    pub prune_interval: u64,
 }
 
 impl Default for StoreConfig {
@@ -72,6 +80,7 @@ impl Default for StoreConfig {
         Self {
             max_connections: 16,
             retention_policy: None,
+            prune_interval: 100,
         }
     }
 }
@@ -81,6 +90,8 @@ impl Default for StoreConfig {
 pub struct TaskStore {
     pool: SqlitePool,
     retention_policy: Option<RetentionPolicy>,
+    prune_interval: u64,
+    completion_count: std::sync::Arc<AtomicU64>,
 }
 
 impl TaskStore {
@@ -105,6 +116,8 @@ impl TaskStore {
         let store = Self {
             pool,
             retention_policy: config.retention_policy,
+            prune_interval: config.prune_interval,
+            completion_count: std::sync::Arc::new(AtomicU64::new(0)),
         };
         store.migrate().await?;
         store.recover_running().await?;
@@ -126,6 +139,8 @@ impl TaskStore {
         let store = Self {
             pool,
             retention_policy: None,
+            prune_interval: 100,
+            completion_count: std::sync::Arc::new(AtomicU64::new(0)),
         };
         store.migrate().await?;
         Ok(store)
@@ -371,8 +386,7 @@ impl TaskStore {
 
         tx.commit().await?;
 
-        // Auto-prune history if retention policy is set.
-        self.auto_prune().await?;
+        self.maybe_prune().await;
 
         Ok(())
     }
@@ -455,8 +469,7 @@ impl TaskStore {
 
         tx.commit().await?;
 
-        // Auto-prune history if retention policy is set.
-        self.auto_prune().await?;
+        self.maybe_prune().await;
 
         Ok(())
     }
@@ -745,6 +758,21 @@ impl TaskStore {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// Increment the completion counter and prune every `prune_interval` completions.
+    /// Errors are logged rather than propagated since the task itself already committed.
+    async fn maybe_prune(&self) {
+        if self.retention_policy.is_none() {
+            return;
+        }
+        let count = self.completion_count.fetch_add(1, Ordering::Relaxed);
+        if count % self.prune_interval != 0 {
+            return;
+        }
+        if let Err(e) = self.auto_prune().await {
+            tracing::warn!("history prune failed: {e}");
+        }
     }
 
     /// Apply the configured retention policy, if any.
