@@ -7,6 +7,9 @@ use crate::resource::ResourceReader;
 use crate::store::{StoreError, TaskStore};
 use crate::task::TaskRecord;
 
+/// Boxed future returned by [`DispatchGate`] methods.
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 // ── Gate Context ───────────────────────────────────────────────────
 
 /// Context provided to a [`DispatchGate`] for admission decisions.
@@ -59,17 +62,15 @@ pub trait DispatchGate: Send + Sync + 'static {
         &'a self,
         task: &'a TaskRecord,
         ctx: &'a GateContext<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + 'a>>;
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
 
     /// Current aggregate pressure (0.0–1.0). Returns 0.0 by default.
-    fn pressure<'a>(&'a self) -> Pin<Box<dyn Future<Output = f32> + Send + 'a>> {
+    fn pressure<'a>(&'a self) -> BoxFuture<'a, f32> {
         Box::pin(async { 0.0 })
     }
 
     /// Per-source pressure breakdown for diagnostics. Empty by default.
-    fn pressure_breakdown<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Vec<(String, f32)>> + Send + 'a>> {
+    fn pressure_breakdown<'a>(&'a self) -> BoxFuture<'a, Vec<(String, f32)>> {
         Box::pin(async { Vec::new() })
     }
 }
@@ -99,7 +100,7 @@ impl DispatchGate for DefaultDispatchGate {
         &'a self,
         task: &'a TaskRecord,
         ctx: &'a GateContext<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + 'a>> {
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
         Box::pin(async move {
             // Backpressure check.
             let current_pressure = self.pressure.lock().await.pressure();
@@ -127,13 +128,11 @@ impl DispatchGate for DefaultDispatchGate {
         })
     }
 
-    fn pressure<'a>(&'a self) -> Pin<Box<dyn Future<Output = f32> + Send + 'a>> {
+    fn pressure<'a>(&'a self) -> BoxFuture<'a, f32> {
         Box::pin(async { self.pressure.lock().await.pressure() })
     }
 
-    fn pressure_breakdown<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Vec<(String, f32)>> + Send + 'a>> {
+    fn pressure_breakdown<'a>(&'a self) -> BoxFuture<'a, Vec<(String, f32)>> {
         Box::pin(async {
             self.pressure
                 .lock()

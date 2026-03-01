@@ -106,7 +106,8 @@ impl TaskStore {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal);
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(std::time::Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(config.max_connections)
@@ -129,7 +130,8 @@ impl TaskStore {
         let opts = SqliteConnectOptions::new()
             .filename(":memory:")
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal);
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(std::time::Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -173,6 +175,21 @@ impl TaskStore {
         &self.pool
     }
 
+    /// Begin an IMMEDIATE transaction for write operations.
+    ///
+    /// Unlike `pool.begin()` which uses `BEGIN DEFERRED`, this acquires the
+    /// write lock upfront. This prevents deadlocks when multiple transactions
+    /// read-then-write concurrently — the busy_timeout is properly honored
+    /// instead of SQLite returning SQLITE_BUSY immediately.
+    ///
+    /// The returned connection auto-rollbacks on drop (sqlx resets pooled
+    /// connections with open transactions).
+    async fn begin_write(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Sqlite>, StoreError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        Ok(conn)
+    }
+
     // ── Submit ──────────────────────────────────────────────────────
 
     /// Submit a new task. Returns `Ok(Some(id))` if inserted, `Ok(None)` if
@@ -189,6 +206,7 @@ impl TaskStore {
 
         let key = sub.effective_key();
         let priority = sub.priority.value() as i32;
+        tracing::debug!(task_type = %sub.task_type, "store.submit: INSERT start");
         let result = sqlx::query(
             "INSERT OR IGNORE INTO tasks (task_type, key, priority, payload, expected_read_bytes, expected_write_bytes)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -201,6 +219,7 @@ impl TaskStore {
         .bind(sub.expected_write_bytes)
         .execute(&self.pool)
         .await?;
+        tracing::debug!(task_type = %sub.task_type, "store.submit: INSERT end");
 
         if result.rows_affected() == 0 {
             Ok(None) // dedup — key already exists
@@ -219,17 +238,21 @@ impl TaskStore {
         &self,
         submissions: &[TaskSubmission],
     ) -> Result<Vec<Option<i64>>, StoreError> {
-        let mut results = Vec::with_capacity(submissions.len());
-
-        let mut tx = self.pool.begin().await?;
-
+        // Pre-validate all payloads before starting the transaction
+        // to avoid partial inserts on validation errors.
         for sub in submissions {
             if let Some(ref p) = sub.payload {
                 if p.len() > MAX_PAYLOAD_BYTES {
                     return Err(StoreError::PayloadTooLarge);
                 }
             }
+        }
 
+        let mut results = Vec::with_capacity(submissions.len());
+
+        let mut conn = self.begin_write().await?;
+
+        for sub in submissions {
             let key = sub.effective_key();
             let priority = sub.priority.value() as i32;
             let result = sqlx::query(
@@ -242,7 +265,7 @@ impl TaskStore {
             .bind(&sub.payload)
             .bind(sub.expected_read_bytes)
             .bind(sub.expected_write_bytes)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
 
             if result.rows_affected() == 0 {
@@ -252,7 +275,7 @@ impl TaskStore {
             }
         }
 
-        tx.commit().await?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
         Ok(results)
     }
 
@@ -277,6 +300,7 @@ impl TaskStore {
     /// Returns `None` if the task is no longer pending (e.g. claimed by another
     /// dispatcher or cancelled).
     pub async fn pop_by_id(&self, id: i64) -> Result<Option<TaskRecord>, StoreError> {
+        tracing::debug!(task_id = id, "store.pop_by_id: UPDATE start");
         let row = sqlx::query(
             "UPDATE tasks SET status = 'running', started_at = datetime('now')
              WHERE id = ? AND status = 'pending'
@@ -285,6 +309,7 @@ impl TaskStore {
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
+        tracing::debug!(task_id = id, "store.pop_by_id: UPDATE end");
 
         Ok(row.as_ref().map(row_to_task_record))
     }
@@ -326,12 +351,13 @@ impl TaskStore {
 
     /// Mark a task as completed and move it to history.
     pub async fn complete(&self, id: i64, result: &TaskResult) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
+        tracing::debug!(task_id = id, "store.complete: BEGIN tx");
+        let mut conn = self.begin_write().await?;
 
         // Fetch the task to move.
         let row = sqlx::query("SELECT * FROM tasks WHERE id = ?")
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await?;
 
         let Some(row) = row else { return Ok(()) };
@@ -346,7 +372,7 @@ impl TaskStore {
                 task.started_at
                     .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
             )
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut *conn)
             .await?
         } else {
             None
@@ -375,16 +401,17 @@ impl TaskStore {
                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
         )
         .bind(duration_ms)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         // Remove from active queue.
         sqlx::query("DELETE FROM tasks WHERE id = ?")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
 
-        tx.commit().await?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        tracing::debug!(task_id = id, "store.complete: COMMIT ok");
 
         self.maybe_prune().await;
 
@@ -402,11 +429,13 @@ impl TaskStore {
         actual_read_bytes: i64,
         actual_write_bytes: i64,
     ) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
+        tracing::debug!(task_id = id, "store.fail: BEGIN tx");
+        let mut conn = self.begin_write().await?;
+        tracing::debug!(task_id = id, "store.fail: BEGIN acquired");
 
         let row = sqlx::query("SELECT * FROM tasks WHERE id = ?")
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await?;
 
         let Some(row) = row else { return Ok(()) };
@@ -421,7 +450,7 @@ impl TaskStore {
             )
             .bind(error)
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
         } else {
             // Permanent failure — move to history.
@@ -433,7 +462,7 @@ impl TaskStore {
                     task.started_at
                         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
                 )
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut *conn)
                 .await?
             } else {
                 None
@@ -458,16 +487,17 @@ impl TaskStore {
             .bind(task.created_at.format("%Y-%m-%d %H:%M:%S").to_string())
             .bind(task.started_at.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()))
             .bind(duration_ms)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
 
             sqlx::query("DELETE FROM tasks WHERE id = ?")
                 .bind(id)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
         }
 
-        tx.commit().await?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        tracing::debug!(task_id = id, "store.fail: COMMIT ok");
 
         self.maybe_prune().await;
 
@@ -824,7 +854,7 @@ fn row_to_task_record(row: &sqlx::sqlite::SqliteRow) -> TaskRecord {
         task_type: row.get("task_type"),
         key: row.get("key"),
         priority: Priority::new(priority_val as u8),
-        status: TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::Pending),
+        status: status_str.parse().unwrap_or(TaskStatus::Pending),
         payload: row.get("payload"),
         expected_read_bytes: row.get("expected_read_bytes"),
         expected_write_bytes: row.get("expected_write_bytes"),
@@ -847,7 +877,7 @@ fn row_to_history_record(row: &sqlx::sqlite::SqliteRow) -> TaskHistoryRecord {
         task_type: row.get("task_type"),
         key: row.get("key"),
         priority: Priority::new(priority_val as u8),
-        status: HistoryStatus::from_str(&status_str).unwrap_or(HistoryStatus::Failed),
+        status: status_str.parse().unwrap_or(HistoryStatus::Failed),
         payload: row.get("payload"),
         expected_read_bytes: row.get("expected_read_bytes"),
         expected_write_bytes: row.get("expected_write_bytes"),

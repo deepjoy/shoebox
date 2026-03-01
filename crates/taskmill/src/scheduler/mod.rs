@@ -845,6 +845,18 @@ impl SchedulerBuilder {
         self
     }
 
+    /// Set shared application state from a pre-existing `Arc`.
+    ///
+    /// Use this instead of [`app_state`](Self::app_state) when you already
+    /// have an `Arc<T>` and need to retain a handle for use outside the
+    /// scheduler (e.g. to populate `OnceLock` fields after build). Avoids
+    /// double-wrapping (`Arc<Arc<T>>`), which would cause
+    /// [`TaskContext::state`] downcasts to fail.
+    pub fn app_state_arc<T: Send + Sync + 'static>(mut self, state: Arc<T>) -> Self {
+        self.app_state = Some(state);
+        self
+    }
+
     /// Build the scheduler. Opens the database and wires all components.
     ///
     /// If resource monitoring is enabled, the sampler background loop is

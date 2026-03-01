@@ -25,13 +25,17 @@ impl TaskStatus {
             Self::Paused => "paused",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for TaskStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "pending" => Some(Self::Pending),
-            "running" => Some(Self::Running),
-            "paused" => Some(Self::Paused),
-            _ => None,
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "paused" => Ok(Self::Paused),
+            other => Err(format!("unknown TaskStatus: {other}")),
         }
     }
 }
@@ -51,12 +55,16 @@ impl HistoryStatus {
             Self::Failed => "failed",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for HistoryStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "completed" => Some(Self::Completed),
-            "failed" => Some(Self::Failed),
-            _ => None,
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            other => Err(format!("unknown HistoryStatus: {other}")),
         }
     }
 }
