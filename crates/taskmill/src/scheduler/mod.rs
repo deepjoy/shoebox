@@ -390,8 +390,8 @@ impl Scheduler {
             return Ok(false);
         }
 
-        // Pop atomically — no peek-then-pop race.
-        let Some(task) = self.inner.store.pop_next().await? else {
+        // Peek at the next candidate without changing its status.
+        let Some(candidate) = self.inner.store.peek_next().await? else {
             return Ok(false);
         };
 
@@ -402,13 +402,19 @@ impl Scheduler {
             resource_reader: reader_guard.as_ref(),
         };
 
-        // Admission check via the dispatch gate.
-        if !self.inner.gate.admit(&task, &gate_ctx).await? {
+        // Admission check while the task is still pending — no running
+        // window if the gate rejects.
+        if !self.inner.gate.admit(&candidate, &gate_ctx).await? {
             drop(reader_guard);
-            self.inner.store.requeue(task.id).await?;
             return Ok(false);
         }
         drop(reader_guard);
+
+        // Atomically claim the task. Returns None if another dispatcher
+        // claimed it (or it was cancelled) between peek and now.
+        let Some(task) = self.inner.store.pop_by_id(candidate.id).await? else {
+            return Ok(false);
+        };
 
         // Look up executor.
         let Some(executor) = self.inner.registry.get(&task.task_type) else {

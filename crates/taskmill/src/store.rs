@@ -243,6 +243,37 @@ impl TaskStore {
 
     // ── Pop / lifecycle ─────────────────────────────────────────────
 
+    /// Peek at the highest-priority pending task without modifying it.
+    /// Returns `None` if the queue is empty.
+    pub async fn peek_next(&self) -> Result<Option<TaskRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT * FROM tasks
+             WHERE status = 'pending'
+             ORDER BY priority ASC, id ASC
+             LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.as_ref().map(row_to_task_record))
+    }
+
+    /// Atomically claim a specific pending task by id, setting it to running.
+    /// Returns `None` if the task is no longer pending (e.g. claimed by another
+    /// dispatcher or cancelled).
+    pub async fn pop_by_id(&self, id: i64) -> Result<Option<TaskRecord>, StoreError> {
+        let row = sqlx::query(
+            "UPDATE tasks SET status = 'running', started_at = datetime('now')
+             WHERE id = ? AND status = 'pending'
+             RETURNING *",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.as_ref().map(row_to_task_record))
+    }
+
     /// Pop the highest-priority pending task and mark it as running.
     /// Returns `None` if the queue is empty.
     pub async fn pop_next(&self) -> Result<Option<TaskRecord>, StoreError> {
@@ -1186,6 +1217,83 @@ mod tests {
         let t = store.task_by_key(&key).await.unwrap().unwrap();
         assert_eq!(t.status, TaskStatus::Pending);
         assert!(t.started_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn peek_next_does_not_modify_status() {
+        let store = test_store().await;
+        let sub = make_submission("peek-me", Priority::NORMAL);
+        let key = sub.effective_key();
+        store.submit(&sub).await.unwrap();
+
+        // Peek should return the task but leave it pending.
+        let peeked = store.peek_next().await.unwrap().unwrap();
+        assert_eq!(peeked.key, key);
+        assert_eq!(peeked.status, TaskStatus::Pending);
+
+        // Verify it's still pending in the store.
+        let t = store.task_by_key(&key).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Pending);
+        assert!(t.started_at.is_none());
+
+        // Peeking again returns the same task.
+        let peeked2 = store.peek_next().await.unwrap().unwrap();
+        assert_eq!(peeked2.id, peeked.id);
+    }
+
+    #[tokio::test]
+    async fn peek_next_empty_queue() {
+        let store = test_store().await;
+        assert!(store.peek_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pop_by_id_claims_pending_task() {
+        let store = test_store().await;
+        let sub = make_submission("claim-me", Priority::NORMAL);
+        let key = sub.effective_key();
+        let id = store.submit(&sub).await.unwrap().unwrap();
+
+        let task = store.pop_by_id(id).await.unwrap().unwrap();
+        assert_eq!(task.key, key);
+        assert_eq!(task.status, TaskStatus::Running);
+        assert!(task.started_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn pop_by_id_returns_none_if_already_running() {
+        let store = test_store().await;
+        let sub = make_submission("already-taken", Priority::NORMAL);
+        store.submit(&sub).await.unwrap();
+
+        // Pop via pop_next first.
+        let task = store.pop_next().await.unwrap().unwrap();
+
+        // pop_by_id on the same task should return None (already running).
+        assert!(store.pop_by_id(task.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pop_by_id_returns_none_for_nonexistent() {
+        let store = test_store().await;
+        assert!(store.pop_by_id(9999).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn peek_then_pop_by_id_workflow() {
+        let store = test_store().await;
+        let sub = make_submission("peek-pop", Priority::NORMAL);
+        let key = sub.effective_key();
+        store.submit(&sub).await.unwrap();
+
+        // Peek, then claim.
+        let peeked = store.peek_next().await.unwrap().unwrap();
+        let claimed = store.pop_by_id(peeked.id).await.unwrap().unwrap();
+        assert_eq!(claimed.key, key);
+        assert_eq!(claimed.status, TaskStatus::Running);
+
+        // Queue should now be empty for peek.
+        assert!(store.peek_next().await.unwrap().is_none());
     }
 
     #[tokio::test]
