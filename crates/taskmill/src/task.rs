@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 
 use crate::priority::Priority;
 
-/// Maximum payload size in bytes (8 KiB).
-pub const MAX_PAYLOAD_BYTES: usize = 8192;
+/// Maximum payload size in bytes (1 MiB).
+pub const MAX_PAYLOAD_BYTES: usize = 1_048_576;
 
 /// Lifecycle state of a task in the active queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
