@@ -249,9 +249,6 @@ pub(crate) async fn spawn_task(
         let task_id = task.id;
         let result = executor.execute_erased(&ctx).await;
 
-        // Remove from active tracking.
-        active.remove(task_id).await;
-
         // Drop the context (and its progress reporter) — executor is done.
         drop(ctx);
 
@@ -260,6 +257,11 @@ pub(crate) async fn spawn_task(
                 if let Err(e) = store.complete(task_id, &tr).await {
                     tracing::error!(task_id, error = %e, "failed to record task completion");
                 }
+                // Remove from active tracking AFTER the store write completes.
+                // This keeps the concurrency slot occupied, preventing the
+                // scheduler from dispatching new tasks that would create
+                // concurrent SQLite write transactions (which cause SQLITE_BUSY).
+                active.remove(task_id).await;
                 let _ = event_tx.send(SchedulerEvent::Completed {
                     task_id,
                     task_type: task.task_type.clone(),
@@ -269,9 +271,18 @@ pub(crate) async fn spawn_task(
             Err(te) => {
                 // If cancelled (preempted), the scheduler already paused it.
                 if token_for_spawn.is_cancelled() {
+                    active.remove(task_id).await;
                     return;
                 }
                 let will_retry = te.retryable && task.retry_count < max_retries;
+                tracing::warn!(
+                    task_id,
+                    task_type = task.task_type,
+                    error = %te.message,
+                    retryable = te.retryable,
+                    will_retry,
+                    "task failed"
+                );
                 if let Err(e) = store
                     .fail(
                         task_id,
@@ -285,6 +296,8 @@ pub(crate) async fn spawn_task(
                 {
                     tracing::error!(task_id, error = %e, "failed to record task failure");
                 }
+                // Remove from active tracking AFTER the store write completes.
+                active.remove(task_id).await;
                 let _ = event_tx.send(SchedulerEvent::Failed {
                     task_id,
                     task_type: task.task_type.clone(),
