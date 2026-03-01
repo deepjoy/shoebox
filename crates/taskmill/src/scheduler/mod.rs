@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -175,6 +175,8 @@ struct SchedulerInner {
     app_state: Option<Arc<dyn Any + Send + Sync>>,
     /// Global pause flag — when `true`, the run loop skips dispatching.
     paused: AtomicBool,
+    /// Wakes the run loop when new work is submitted or the scheduler is resumed.
+    work_notify: Notify,
 }
 
 /// IO-aware priority scheduler.
@@ -233,6 +235,7 @@ impl Scheduler {
                 sampler_token: CancellationToken::new(),
                 app_state,
                 paused: AtomicBool::new(false),
+                work_notify: Notify::new(),
             }),
         }
     }
@@ -269,12 +272,17 @@ impl Scheduler {
     pub async fn submit(&self, sub: &TaskSubmission) -> Result<Option<i64>, StoreError> {
         let id = self.inner.store.submit(sub).await?;
 
-        // Preempt if this is a high-priority task.
-        if id.is_some() && sub.priority.value() <= self.inner.preempt_priority.value() {
-            self.inner
-                .active
-                .preempt_below(sub.priority, &self.inner.store, &self.inner.event_tx)
-                .await;
+        if id.is_some() {
+            // Preempt if this is a high-priority task.
+            if sub.priority.value() <= self.inner.preempt_priority.value() {
+                self.inner
+                    .active
+                    .preempt_below(sub.priority, &self.inner.store, &self.inner.event_tx)
+                    .await;
+            }
+
+            // Wake the scheduler loop so it picks up the new task immediately.
+            self.inner.work_notify.notify_one();
         }
 
         Ok(id)
@@ -298,6 +306,8 @@ impl Scheduler {
             .filter_map(|(sub, id)| id.map(|_| sub.priority))
             .min_by_key(|p| p.value());
 
+        let any_inserted = results.iter().any(|id| id.is_some());
+
         if let Some(priority) = best_priority {
             if priority.value() <= self.inner.preempt_priority.value() {
                 self.inner
@@ -305,6 +315,10 @@ impl Scheduler {
                     .preempt_below(priority, &self.inner.store, &self.inner.event_tx)
                     .await;
             }
+        }
+
+        if any_inserted {
+            self.inner.work_notify.notify_one();
         }
 
         Ok(results)
@@ -455,8 +469,13 @@ impl Scheduler {
 
     /// Run the scheduler loop until the cancellation token is triggered.
     ///
-    /// This is the main entry point. It continuously polls for work,
-    /// dispatches tasks, and adjusts concurrency based on resource monitoring.
+    /// This is the main entry point. The loop wakes on three conditions:
+    /// 1. Cancellation — triggers shutdown.
+    /// 2. Notification — a task was submitted or the scheduler was resumed.
+    /// 3. Poll interval — periodic housekeeping (e.g. resuming paused tasks).
+    ///
+    /// On mobile targets (iOS/Android), the notify-based wake avoids the
+    /// constant 500ms polling that would otherwise prevent the CPU from sleeping.
     pub async fn run(&self, token: CancellationToken) {
         tracing::info!(
             max_concurrency = self.inner.max_concurrency.load(AtomicOrdering::Relaxed),
@@ -470,35 +489,44 @@ impl Scheduler {
                     self.shutdown().await;
                     break;
                 }
+                _ = self.inner.work_notify.notified() => {
+                    self.poll_and_dispatch().await;
+                }
                 _ = tokio::time::sleep(self.inner.poll_interval) => {
-                    // Skip all work while globally paused.
-                    if self.is_paused() {
-                        continue;
-                    }
+                    self.poll_and_dispatch().await;
+                }
+            }
+        }
+    }
 
-                    // Resume paused tasks only if no active preemptors exist.
-                    if let Ok(paused) = self.inner.store.paused_tasks().await {
-                        for task in paused {
-                            if !self.inner.active.has_preemptors_for(
-                                task.priority,
-                                self.inner.preempt_priority,
-                            ).await {
-                                let _ = self.inner.store.resume(task.id).await;
-                            }
-                        }
-                    }
+    /// Resume paused tasks and dispatch pending work.
+    async fn poll_and_dispatch(&self) {
+        if self.is_paused() {
+            return;
+        }
 
-                    // Try to dispatch tasks until we can't.
-                    loop {
-                        match self.try_dispatch().await {
-                            Ok(true) => continue,
-                            Ok(false) => break,
-                            Err(e) => {
-                                tracing::error!(error = %e, "scheduler dispatch error");
-                                break;
-                            }
-                        }
-                    }
+        // Resume paused tasks only if no active preemptors exist.
+        if let Ok(paused) = self.inner.store.paused_tasks().await {
+            for task in paused {
+                if !self
+                    .inner
+                    .active
+                    .has_preemptors_for(task.priority, self.inner.preempt_priority)
+                    .await
+                {
+                    let _ = self.inner.store.resume(task.id).await;
+                }
+            }
+        }
+
+        // Try to dispatch tasks until we can't.
+        loop {
+            match self.try_dispatch().await {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(e) => {
+                    tracing::error!(error = %e, "scheduler dispatch error");
+                    break;
                 }
             }
         }
@@ -627,6 +655,7 @@ impl Scheduler {
     /// picked up automatically.
     pub async fn resume_all(&self) {
         self.inner.paused.store(false, AtomicOrdering::Release);
+        self.inner.work_notify.notify_one();
         let _ = self.inner.event_tx.send(SchedulerEvent::Resumed);
         tracing::info!("scheduler resumed");
     }
