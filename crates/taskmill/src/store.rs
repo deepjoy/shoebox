@@ -5,8 +5,8 @@ use sqlx::{Row, SqlitePool};
 
 use crate::priority::Priority;
 use crate::task::{
-    HistoryStatus, TaskHistoryRecord, TaskRecord, TaskResult, TaskStatus, TaskSubmission,
-    TypeStats, MAX_PAYLOAD_BYTES,
+    HistoryStatus, TaskHistoryRecord, TaskLookup, TaskRecord, TaskResult, TaskStatus,
+    TaskSubmission, TypeStats, MAX_PAYLOAD_BYTES,
 };
 
 /// Serde-friendly error type for Tauri IPC and API boundaries.
@@ -660,6 +660,35 @@ impl TaskStore {
         Ok(row)
     }
 
+    // ── Unified lookup ──────────────────────────────────────────────
+
+    /// Look up a task by its dedup key, checking the active queue first
+    /// and falling back to history.
+    ///
+    /// This is the low-level building block for [`Scheduler::task_lookup`].
+    /// The `key` parameter is the pre-computed SHA-256 dedup key (as
+    /// returned by [`generate_dedup_key`](crate::task::generate_dedup_key)
+    /// or [`TaskSubmission::effective_key`]).
+    pub async fn task_lookup(&self, key: &str) -> Result<TaskLookup, StoreError> {
+        // Check active queue first (pending / running / paused).
+        if let Some(record) = self.task_by_key(key).await? {
+            return Ok(TaskLookup::Active(record));
+        }
+
+        // Fall back to the most recent history entry.
+        let row = sqlx::query(
+            "SELECT * FROM task_history WHERE key = ? ORDER BY completed_at DESC LIMIT 1",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => Ok(TaskLookup::History(row_to_history_record(&r))),
+            None => Ok(TaskLookup::NotFound),
+        }
+    }
+
     // ── Pruning ─────────────────────────────────────────────────────
 
     /// Prune history records older than `max_age_days` days.
@@ -1227,6 +1256,54 @@ mod tests {
         let store = test_store().await;
         let results = store.submit_batch(&[]).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_lookup_active() {
+        let store = test_store().await;
+        let sub = make_submission("lookup-active", Priority::NORMAL);
+        let key = sub.effective_key();
+        store.submit(&sub).await.unwrap();
+
+        let result = store.task_lookup(&key).await.unwrap();
+        assert!(matches!(result, TaskLookup::Active(ref r) if r.status == TaskStatus::Pending));
+
+        // Pop so it's running.
+        store.pop_next().await.unwrap();
+        let result = store.task_lookup(&key).await.unwrap();
+        assert!(matches!(result, TaskLookup::Active(ref r) if r.status == TaskStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn task_lookup_history() {
+        let store = test_store().await;
+        let sub = make_submission("lookup-hist", Priority::NORMAL);
+        let key = sub.effective_key();
+        store.submit(&sub).await.unwrap();
+        let task = store.pop_next().await.unwrap().unwrap();
+        store
+            .complete(
+                task.id,
+                &TaskResult {
+                    actual_read_bytes: 0,
+                    actual_write_bytes: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = store.task_lookup(&key).await.unwrap();
+        assert!(
+            matches!(result, TaskLookup::History(ref r) if r.status == HistoryStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn task_lookup_not_found() {
+        let store = test_store().await;
+        let key = crate::task::generate_dedup_key("nope", Some(b"nope"));
+        let result = store.task_lookup(&key).await.unwrap();
+        assert!(matches!(result, TaskLookup::NotFound));
     }
 
     #[tokio::test]

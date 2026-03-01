@@ -259,6 +259,24 @@ impl TaskSubmission {
     }
 }
 
+/// Unified lookup result for querying a task by its dedup inputs.
+///
+/// Returned by [`TaskStore::task_lookup`] and [`Scheduler::task_lookup`].
+/// Tells the caller whether a task is currently active (pending, running,
+/// or paused) or has finished (completed or failed), without requiring
+/// them to manually compute the dedup key or query two tables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "location", content = "record")]
+pub enum TaskLookup {
+    /// Task is in the active queue (pending, running, or paused).
+    Active(TaskRecord),
+    /// Task has finished and is in the history table.
+    /// Contains the most recent history entry for that key.
+    History(TaskHistoryRecord),
+    /// No task with this key exists in either table.
+    NotFound,
+}
+
 /// Aggregate statistics for a task type from history.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TypeStats {

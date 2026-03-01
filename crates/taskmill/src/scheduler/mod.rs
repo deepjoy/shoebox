@@ -17,7 +17,7 @@ use crate::registry::{TaskExecutor, TaskTypeRegistry};
 use crate::resource::sampler::{SamplerConfig, SmoothedReader};
 use crate::resource::{ResourceReader, ResourceSampler};
 use crate::store::{StoreConfig, StoreError, TaskStore};
-use crate::task::{TaskSubmission, TypedTask};
+use crate::task::{generate_dedup_key, TaskLookup, TaskSubmission, TypedTask};
 
 use dispatch::ActiveTaskMap;
 use gate::{DefaultDispatchGate, GateContext};
@@ -317,6 +317,41 @@ impl Scheduler {
     pub async fn submit_typed<T: TypedTask>(&self, task: &T) -> Result<Option<i64>, StoreError> {
         let sub = TaskSubmission::from_typed(task)?;
         self.submit(&sub).await
+    }
+
+    /// Look up a task by the same inputs used during submission.
+    ///
+    /// Computes the dedup key from `task_type` and `dedup_input` (the
+    /// explicit key string or payload bytes — whichever was used when
+    /// submitting), then checks the active queue and history in one call.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Using an explicit key (same as TaskSubmission.key = Some("my-file.jpg"))
+    /// let result = scheduler.task_lookup("thumbnail", Some(b"my-file.jpg")).await?;
+    ///
+    /// // Using payload-based dedup (same as TaskSubmission.key = None, payload = ...)
+    /// let result = scheduler.task_lookup("ingest", Some(&payload_bytes)).await?;
+    /// ```
+    pub async fn task_lookup(
+        &self,
+        task_type: &str,
+        dedup_input: Option<&[u8]>,
+    ) -> Result<TaskLookup, StoreError> {
+        let key = generate_dedup_key(task_type, dedup_input);
+        self.inner.store.task_lookup(&key).await
+    }
+
+    /// Look up a [`TypedTask`] by value, using its serialized form as the
+    /// dedup input.
+    ///
+    /// This mirrors [`submit_typed`](Self::submit_typed) — pass the same
+    /// struct you would submit and get back its current status.
+    pub async fn lookup_typed<T: TypedTask>(&self, task: &T) -> Result<TaskLookup, StoreError> {
+        let payload = serde_json::to_vec(task)?;
+        let key = generate_dedup_key(T::TASK_TYPE, Some(&payload));
+        self.inner.store.task_lookup(&key).await
     }
 
     /// Cancel a task by id.
@@ -1311,5 +1346,88 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn task_lookup_pending() {
+        let sched = setup(arc_erased(InstantExecutor)).await;
+
+        sched
+            .submit(&TaskSubmission {
+                task_type: "test".into(),
+                key: Some("lookup-1".into()),
+                priority: Priority::NORMAL,
+                payload: None,
+                expected_read_bytes: 0,
+                expected_write_bytes: 0,
+            })
+            .await
+            .unwrap();
+
+        let result = sched.task_lookup("test", Some(b"lookup-1")).await.unwrap();
+        assert!(matches!(
+            result,
+            crate::task::TaskLookup::Active(ref r) if r.status == crate::task::TaskStatus::Pending
+        ));
+    }
+
+    #[tokio::test]
+    async fn task_lookup_completed() {
+        let sched = setup(arc_erased(InstantExecutor)).await;
+
+        sched
+            .submit(&TaskSubmission {
+                task_type: "test".into(),
+                key: Some("lookup-done".into()),
+                priority: Priority::NORMAL,
+                payload: None,
+                expected_read_bytes: 0,
+                expected_write_bytes: 0,
+            })
+            .await
+            .unwrap();
+
+        sched.try_dispatch().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let result = sched
+            .task_lookup("test", Some(b"lookup-done"))
+            .await
+            .unwrap();
+        assert!(matches!(result, crate::task::TaskLookup::History(_)));
+    }
+
+    #[tokio::test]
+    async fn task_lookup_not_found() {
+        let sched = setup(arc_erased(InstantExecutor)).await;
+        let result = sched
+            .task_lookup("test", Some(b"does-not-exist"))
+            .await
+            .unwrap();
+        assert!(matches!(result, crate::task::TaskLookup::NotFound));
+    }
+
+    #[tokio::test]
+    async fn lookup_typed_works() {
+        use serde::{Deserialize as De, Serialize as Ser};
+
+        #[derive(Ser, De, Debug, PartialEq)]
+        struct Thumb {
+            path: String,
+        }
+
+        impl crate::task::TypedTask for Thumb {
+            const TASK_TYPE: &'static str = "test";
+        }
+
+        let sched = setup(arc_erased(InstantExecutor)).await;
+
+        let task = Thumb {
+            path: "/a.jpg".into(),
+        };
+        sched.submit_typed(&task).await.unwrap();
+
+        let result = sched.lookup_typed(&task).await.unwrap();
+        assert!(matches!(result, crate::task::TaskLookup::Active(_)));
     }
 }

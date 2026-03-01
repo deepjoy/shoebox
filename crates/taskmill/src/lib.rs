@@ -41,8 +41,8 @@ pub use scheduler::{
 };
 pub use store::{RetentionPolicy, StoreConfig, StoreError, TaskStore};
 pub use task::{
-    generate_dedup_key, HistoryStatus, TaskError, TaskHistoryRecord, TaskRecord, TaskResult,
-    TaskStatus, TaskSubmission, TypeStats, TypedTask,
+    generate_dedup_key, HistoryStatus, TaskError, TaskHistoryRecord, TaskLookup, TaskRecord,
+    TaskResult, TaskStatus, TaskSubmission, TypeStats, TypedTask,
 };
 
 #[cfg(feature = "sysinfo-monitor")]
