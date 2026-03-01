@@ -25,6 +25,7 @@ disk throughput.
 - **Lifecycle events** — subscribe to `SchedulerEvent` for UI integration (dispatch, complete, fail, preempt, cancel, progress)
 - **Progress reporting** — executors report progress via `ProgressReporter`; throughput-based extrapolation fills gaps
 - **Graceful shutdown** — configurable drain timeout waits for running tasks before force-cancelling
+- **Shared application state** — inject services (HTTP clients, DB pools, caches) via `Scheduler::builder().app_state(my_state)` and access from executors via `ctx.state::<T>()`
 - **Builder pattern** — ergonomic `Scheduler::builder()` hides `Arc<Mutex<...>>` wiring
 - **Clone-friendly scheduler** — `Scheduler` is `Clone` for easy sharing in Tauri state and across async tasks
 - **Serde on all public types** — `Serialize`/`Deserialize` always enabled for Tauri IPC compatibility
@@ -50,8 +51,8 @@ taskmill = { path = "crates/taskmill" }
 
 Each task type needs a `TaskExecutor` implementation. The executor receives a
 `TaskContext` containing the full `TaskRecord` (including an opaque `payload` blob
-up to 8 KiB), a `CancellationToken` for preemption support, and a `ProgressReporter`
-for reporting progress back to the scheduler.
+up to 8 KiB), a `CancellationToken` for preemption support, a `ProgressReporter`
+for reporting progress back to the scheduler, and optional shared application state.
 
 ```rust
 use std::sync::Arc;
@@ -270,6 +271,51 @@ In graceful mode, the scheduler:
 2. Waits for running tasks to complete (up to the timeout)
 3. Force-cancels any remaining tasks after the timeout
 4. Stops the resource sampler background task
+
+## Application state
+
+Executors often need access to shared services — an HTTP client, a database pool,
+a file cache, configuration, etc. Rather than capturing `Arc<T>` in each executor
+struct, register shared state once on the builder and access it from any executor
+via `TaskContext::state()`:
+
+```rust
+struct AppServices {
+    http: reqwest::Client,
+    cache: ImageCache,
+}
+
+let scheduler = Scheduler::builder()
+    .store_path("tasks.db")
+    .executor("thumbnail", Arc::new(ThumbnailExecutor))
+    .app_state(AppServices {
+        http: reqwest::Client::new(),
+        cache: ImageCache::new("/tmp/cache"),
+    })
+    .build()
+    .await?;
+```
+
+In the executor:
+
+```rust
+impl TaskExecutor for ThumbnailExecutor {
+    async fn execute<'a>(
+        &'a self,
+        ctx: &'a TaskContext,
+    ) -> Result<TaskResult, TaskError> {
+        let svc = ctx.state::<AppServices>().expect("app state not set");
+        let bytes = svc.http.get(&url).send().await?.bytes().await?;
+        svc.cache.store(&key, &bytes)?;
+        Ok(TaskResult { actual_read_bytes: bytes.len() as i64, actual_write_bytes: bytes.len() as i64 })
+    }
+}
+```
+
+The state is stored as `Arc<T>` internally and shared (not cloned) across all
+running tasks. This mirrors the state extraction pattern used by Axum, Actix,
+and Tauri. `state::<T>()` returns `None` if no state was registered or if the
+type doesn't match.
 
 ## Task cancellation
 

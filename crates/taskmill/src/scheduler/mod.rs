@@ -2,6 +2,7 @@ pub(crate) mod dispatch;
 pub(crate) mod gate;
 pub mod progress;
 
+use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
@@ -164,6 +165,8 @@ struct SchedulerInner {
     event_tx: tokio::sync::broadcast::Sender<SchedulerEvent>,
     /// Token to cancel the background resource sampler (if started).
     sampler_token: CancellationToken,
+    /// Shared application state passed to every executor via [`TaskContext::state`].
+    app_state: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 /// IO-aware priority scheduler.
@@ -193,7 +196,7 @@ impl Scheduler {
         policy: ThrottlePolicy,
     ) -> Self {
         let gate = Box::new(DefaultDispatchGate::new(pressure, policy));
-        Self::with_gate(store, config, registry, gate)
+        Self::with_gate(store, config, registry, gate, None)
     }
 
     /// Create a scheduler with a custom dispatch gate.
@@ -202,6 +205,7 @@ impl Scheduler {
         config: SchedulerConfig,
         registry: Arc<TaskTypeRegistry>,
         gate: Box<dyn gate::DispatchGate>,
+        app_state: Option<Arc<dyn Any + Send + Sync>>,
     ) -> Self {
         let (event_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
@@ -219,6 +223,7 @@ impl Scheduler {
                 active: ActiveTaskMap::new(),
                 event_tx,
                 sampler_token: CancellationToken::new(),
+                app_state,
             }),
         }
     }
@@ -391,6 +396,7 @@ impl Scheduler {
             self.inner.active.clone(),
             self.inner.event_tx.clone(),
             self.inner.max_retries,
+            self.inner.app_state.clone(),
         )
         .await;
 
@@ -573,6 +579,7 @@ pub struct SchedulerBuilder {
     enable_resource_monitoring: bool,
     custom_sampler: Option<Box<dyn ResourceSampler>>,
     sampler_config: SamplerConfig,
+    app_state: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl SchedulerBuilder {
@@ -588,6 +595,7 @@ impl SchedulerBuilder {
             enable_resource_monitoring: false,
             custom_sampler: None,
             sampler_config: SamplerConfig::default(),
+            app_state: None,
         }
     }
 
@@ -693,6 +701,29 @@ impl SchedulerBuilder {
         self
     }
 
+    /// Set shared application state accessible from every executor via
+    /// [`TaskContext::state`].
+    ///
+    /// The state is stored as `Arc<T>` internally, so it is shared (not
+    /// cloned) across all running tasks. This mirrors how Axum, Actix, and
+    /// Tauri handle shared application state.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// struct AppServices { http: reqwest::Client, db: DatabasePool }
+    ///
+    /// let services = AppServices { /* ... */ };
+    /// Scheduler::builder()
+    ///     .app_state(services)
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn app_state<T: Send + Sync + 'static>(mut self, state: T) -> Self {
+        self.app_state = Some(Arc::new(state));
+        self
+    }
+
     /// Build the scheduler. Opens the database and wires all components.
     ///
     /// If resource monitoring is enabled, the sampler background loop is
@@ -729,7 +760,8 @@ impl SchedulerBuilder {
             .unwrap_or_else(ThrottlePolicy::default_three_tier);
         let gate = Box::new(DefaultDispatchGate::new(pressure, policy));
 
-        let scheduler = Scheduler::with_gate(store, self.config, Arc::new(registry), gate);
+        let scheduler =
+            Scheduler::with_gate(store, self.config, Arc::new(registry), gate, self.app_state);
 
         // Set up resource monitoring.
         if self.enable_resource_monitoring {
@@ -1123,5 +1155,54 @@ mod tests {
         assert_eq!(snap.pressure, 0.0); // no pressure sources
         assert!(snap.pressure_breakdown.is_empty());
         assert_eq!(snap.max_concurrency, 4);
+    }
+
+    #[tokio::test]
+    async fn app_state_accessible_from_executor() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct MyState {
+            flag: Arc<AtomicBool>,
+        }
+
+        struct StateCheckExecutor;
+
+        impl TaskExecutor for StateCheckExecutor {
+            async fn execute<'a>(&'a self, ctx: &'a TaskContext) -> Result<TaskResult, TaskError> {
+                let state = ctx.state::<MyState>().expect("state should be set");
+                state.flag.store(true, Ordering::SeqCst);
+                Ok(TaskResult {
+                    actual_read_bytes: 0,
+                    actual_write_bytes: 0,
+                })
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let sched = Scheduler::builder()
+            .store(TaskStore::open_memory().await.unwrap())
+            .executor("test", Arc::new(StateCheckExecutor))
+            .app_state(MyState { flag: flag.clone() })
+            .build()
+            .await
+            .unwrap();
+
+        sched
+            .submit(&TaskSubmission {
+                task_type: "test".into(),
+                key: Some("state-test".into()),
+                priority: Priority::NORMAL,
+                payload: None,
+                expected_read_bytes: 0,
+                expected_write_bytes: 0,
+            })
+            .await
+            .unwrap();
+
+        sched.try_dispatch().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(flag.load(Ordering::SeqCst));
     }
 }

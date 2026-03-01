@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -9,9 +10,9 @@ use crate::task::{TaskError, TaskRecord, TaskResult, TypedTask};
 
 /// Execution context passed to a [`TaskExecutor`].
 ///
-/// Bundles the task record, cancellation token, and progress reporter into a
-/// single value. This keeps the executor signature stable when new contextual
-/// data is added in the future.
+/// Bundles the task record, cancellation token, progress reporter, and
+/// optional application state into a single value. This keeps the executor
+/// signature stable when new contextual data is added in the future.
 pub struct TaskContext {
     /// The full task record including payload, priority, and IO estimates.
     pub record: TaskRecord,
@@ -20,6 +21,8 @@ pub struct TaskContext {
     pub token: CancellationToken,
     /// Report progress back to the scheduler (0.0–1.0).
     pub progress: ProgressReporter,
+    /// Shared application state set via [`SchedulerBuilder::app_state`].
+    pub(crate) app_state: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl TaskContext {
@@ -29,6 +32,26 @@ impl TaskContext {
     /// mirrors the typed submission API.
     pub fn deserialize_typed<T: TypedTask>(&self) -> Result<Option<T>, serde_json::Error> {
         self.record.deserialize_payload()
+    }
+
+    /// Retrieve shared application state registered via
+    /// [`SchedulerBuilder::app_state`].
+    ///
+    /// Returns `None` if no state was registered or if the type doesn't
+    /// match. This mirrors the state extraction pattern used by Axum and
+    /// Tauri.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// struct MyServices { db: DatabasePool, http: reqwest::Client }
+    ///
+    /// // In the executor:
+    /// let svc = ctx.state::<MyServices>().expect("app state not set");
+    /// svc.db.query("...").await?;
+    /// ```
+    pub fn state<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.app_state.as_ref()?.downcast_ref::<T>()
     }
 }
 

@@ -12,7 +12,7 @@ taskmill/
     task.rs           — data types: TaskRecord, TaskSubmission, TaskResult, TaskError, etc.
     priority.rs       — Priority newtype (u8, lower = higher priority)
     store.rs          — TaskStore: SQLite persistence, atomic pop, queries, retention
-    registry.rs       — TaskContext, TaskExecutor trait (RPITIT) + ErasedExecutor + TaskTypeRegistry
+    registry.rs       — TaskContext (incl. app state accessor), TaskExecutor trait (RPITIT) + ErasedExecutor + TaskTypeRegistry
     scheduler/
       mod.rs          — Scheduler struct, SchedulerSnapshot, run loop, submit, cancel, config, events, builder
       gate.rs         — DispatchGate trait, DefaultDispatchGate (backpressure + IO budget),
@@ -186,6 +186,7 @@ The builder manages:
 - Opening the `TaskStore` with configurable pool size and retention policy
 - Building the `TaskTypeRegistry` from registered executors
 - Assembling `CompositePressure` from provided sources
+- Storing shared application state (via `.app_state(T)`) for injection into executors
 - Spawning the resource sampler background task if enabled
 - Wiring the `SmoothedReader` between sampler and scheduler
 
@@ -453,7 +454,7 @@ The `TaskTypeRegistry` maps string names to executor implementations. It uses
 an internal `ErasedExecutor` trait for object-safe dynamic dispatch, while the
 public `TaskExecutor` trait uses RPITIT (`impl Future`) for ergonomic `async fn`
 implementations. Executors receive a `TaskContext` bundling the task record,
-cancellation token, and progress reporter.
+cancellation token, progress reporter, and optional shared application state.
 
 ```rust
 let mut registry = TaskTypeRegistry::new();
@@ -468,6 +469,36 @@ If no executor is registered, the task is immediately failed with a descriptive 
 The registry is essential for **restart recovery**: after crash recovery resets
 running tasks to pending, the scheduler needs to know which executor handles each
 `task_type` to re-dispatch them.
+
+## Application state
+
+Executors often need shared services (HTTP clients, DB pools, caches). Rather than
+requiring each executor to capture `Arc<T>` dependencies individually, the scheduler
+supports a single typed state slot:
+
+```rust
+Scheduler::builder()
+    .app_state(MyServices { http, db, cache })
+    .build()
+    .await?;
+
+// In the executor:
+let svc = ctx.state::<MyServices>().expect("state not set");
+```
+
+### Implementation
+
+The state flows through three layers:
+
+1. **`SchedulerBuilder::app_state<T>(T)`** — wraps `T` in `Arc<dyn Any + Send + Sync>`,
+   stored in `SchedulerBuilder::app_state`
+2. **`SchedulerInner::app_state`** — the `Option<Arc<dyn Any + Send + Sync>>` lives in
+   the shared inner state, cloned (cheaply, via `Arc`) for each spawned task
+3. **`TaskContext::state::<T>() -> Option<&T>`** — downcasts from `Any` back to `&T`
+
+This mirrors the state extraction pattern used by Axum (`State<T>`), Actix (`Data<T>`),
+and Tauri (`State<T>`). A single type slot keeps the API simple — users bundle multiple
+services into one struct.
 
 ## Retry flow
 
@@ -507,6 +538,7 @@ handles parsing via `chrono::NaiveDateTime::parse_from_str`.
 - `max_concurrency` uses `AtomicUsize` for lock-free runtime adjustment
 - `SmoothedReader` uses `RwLock` so readers never block each other
 - `TaskTypeRegistry` is immutable after startup, shared via `Arc`
+- Application state is stored as `Arc<dyn Any + Send + Sync>` — shared (not cloned) across all spawned tasks
 - Each spawned task gets its own `CancellationToken` for independent cancellation
 - The resource sampler's `CancellationToken` is stored in `SchedulerInner` and cancelled on shutdown
 - SQLite is configured with WAL journal mode for concurrent read/write access

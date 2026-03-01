@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -164,6 +165,7 @@ pub(crate) async fn spawn_task(
     active: ActiveTaskMap,
     event_tx: tokio::sync::broadcast::Sender<SchedulerEvent>,
     max_retries: i32,
+    app_state: Option<Arc<dyn Any + Send + Sync>>,
 ) {
     let child_token = CancellationToken::new();
 
@@ -190,6 +192,7 @@ pub(crate) async fn spawn_task(
             task.key.clone(),
             event_tx.clone(),
         ),
+        app_state,
     };
 
     // Emit dispatched event.
