@@ -150,6 +150,27 @@ impl ActiveTaskMap {
             at.token.cancel();
         }
     }
+
+    /// Pause all active tasks: cancel their tokens and move them to paused
+    /// state in the store. Returns the number of tasks paused.
+    pub async fn pause_all(
+        &self,
+        store: &TaskStore,
+        event_tx: &tokio::sync::broadcast::Sender<SchedulerEvent>,
+    ) -> usize {
+        let mut active = self.inner.lock().await;
+        let count = active.len();
+        for (id, at) in active.drain() {
+            at.token.cancel();
+            let _ = store.pause(id).await;
+            let _ = event_tx.send(SchedulerEvent::Preempted {
+                task_id: id,
+                task_type: at.record.task_type.clone(),
+                key: at.record.key.clone(),
+            });
+        }
+        count
+    }
 }
 
 // ── Spawn ──────────────────────────────────────────────────────────

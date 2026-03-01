@@ -3,7 +3,7 @@ pub(crate) mod gate;
 pub mod progress;
 
 use std::any::Any;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,8 @@ pub struct SchedulerSnapshot {
     pub pressure_breakdown: Vec<(String, f32)>,
     /// Current maximum concurrency setting.
     pub max_concurrency: usize,
+    /// Whether the scheduler is globally paused.
+    pub is_paused: bool,
 }
 
 // ── Events ──────────────────────────────────────────────────────────
@@ -99,6 +101,10 @@ pub enum SchedulerEvent {
         /// Optional human-readable message from the executor.
         message: Option<String>,
     },
+    /// The scheduler was globally paused via [`Scheduler::pause_all`].
+    Paused,
+    /// The scheduler was resumed via [`Scheduler::resume_all`].
+    Resumed,
 }
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -167,6 +173,8 @@ struct SchedulerInner {
     sampler_token: CancellationToken,
     /// Shared application state passed to every executor via [`TaskContext::state`].
     app_state: Option<Arc<dyn Any + Send + Sync>>,
+    /// Global pause flag — when `true`, the run loop skips dispatching.
+    paused: AtomicBool,
 }
 
 /// IO-aware priority scheduler.
@@ -224,6 +232,7 @@ impl Scheduler {
                 event_tx,
                 sampler_token: CancellationToken::new(),
                 app_state,
+                paused: AtomicBool::new(false),
             }),
         }
     }
@@ -421,6 +430,11 @@ impl Scheduler {
                     break;
                 }
                 _ = tokio::time::sleep(self.inner.poll_interval) => {
+                    // Skip all work while globally paused.
+                    if self.is_paused() {
+                        continue;
+                    }
+
                     // Resume paused tasks only if no active preemptors exist.
                     if let Ok(paused) = self.inner.store.paused_tasks().await {
                         for task in paused {
@@ -527,6 +541,7 @@ impl Scheduler {
             pressure,
             pressure_breakdown,
             max_concurrency,
+            is_paused: self.is_paused(),
         })
     }
 
@@ -542,6 +557,42 @@ impl Scheduler {
     /// Read current max concurrency setting.
     pub fn max_concurrency(&self) -> usize {
         self.inner.max_concurrency.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Pause the entire scheduler.
+    ///
+    /// Stops the run loop from dispatching new tasks and pauses all
+    /// currently running tasks (their cancellation tokens are triggered
+    /// and they are moved back to the `paused` state in the store so
+    /// they will be re-dispatched on resume).
+    ///
+    /// Useful when the app is backgrounded, the laptop goes to sleep,
+    /// or the user clicks "pause all" in the UI.
+    pub async fn pause_all(&self) {
+        self.inner.paused.store(true, AtomicOrdering::Release);
+        let count = self
+            .inner
+            .active
+            .pause_all(&self.inner.store, &self.inner.event_tx)
+            .await;
+        let _ = self.inner.event_tx.send(SchedulerEvent::Paused);
+        tracing::info!(paused_tasks = count, "scheduler paused");
+    }
+
+    /// Resume the scheduler after a [`pause_all`](Self::pause_all).
+    ///
+    /// Clears the pause flag so the run loop will resume dispatching on
+    /// its next poll tick. Tasks that were paused in the store will be
+    /// picked up automatically.
+    pub async fn resume_all(&self) {
+        self.inner.paused.store(false, AtomicOrdering::Release);
+        let _ = self.inner.event_tx.send(SchedulerEvent::Resumed);
+        tracing::info!("scheduler resumed");
+    }
+
+    /// Returns `true` if the scheduler is globally paused.
+    pub fn is_paused(&self) -> bool {
+        self.inner.paused.load(AtomicOrdering::Acquire)
     }
 }
 
@@ -1155,6 +1206,62 @@ mod tests {
         assert_eq!(snap.pressure, 0.0); // no pressure sources
         assert!(snap.pressure_breakdown.is_empty());
         assert_eq!(snap.max_concurrency, 4);
+    }
+
+    #[tokio::test]
+    async fn pause_all_stops_dispatching() {
+        let sched = setup(arc_erased(SlowExecutor)).await;
+
+        // Submit two tasks.
+        for key in &["pa-1", "pa-2"] {
+            sched
+                .submit(&TaskSubmission {
+                    task_type: "test".into(),
+                    key: Some(key.to_string()),
+                    priority: Priority::NORMAL,
+                    payload: None,
+                    expected_read_bytes: 0,
+                    expected_write_bytes: 0,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Dispatch one so it's running.
+        sched.try_dispatch().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sched.active_tasks().await.len(), 1);
+
+        // Pause — running task should be cancelled and moved to paused in store.
+        sched.pause_all().await;
+        assert!(sched.is_paused());
+        assert_eq!(sched.active_tasks().await.len(), 0);
+
+        // try_dispatch should still work at the store level (it doesn't check
+        // the pause flag itself — the run loop does), but we can verify that
+        // the snapshot shows is_paused.
+        let snap = sched.snapshot().await.unwrap();
+        assert!(snap.is_paused);
+
+        // Resume — flag should clear.
+        sched.resume_all().await;
+        assert!(!sched.is_paused());
+        let snap = sched.snapshot().await.unwrap();
+        assert!(!snap.is_paused);
+    }
+
+    #[tokio::test]
+    async fn pause_resume_events_emitted() {
+        let sched = setup(arc_erased(InstantExecutor)).await;
+        let mut rx = sched.subscribe();
+
+        sched.pause_all().await;
+        let evt = rx.recv().await.unwrap();
+        assert!(matches!(evt, SchedulerEvent::Paused));
+
+        sched.resume_all().await;
+        let evt = rx.recv().await.unwrap();
+        assert!(matches!(evt, SchedulerEvent::Resumed));
     }
 
     #[tokio::test]

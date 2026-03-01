@@ -198,7 +198,9 @@ The `Scheduler::run()` loop executes on each `poll_interval` (default 500ms):
 
 ```mermaid
 flowchart TD
-    START["poll_interval tick"] --> RESUME["Resume paused tasks\n(only if no active preemptors)"]
+    START["poll_interval tick"] --> PAUSED{"is_paused?"}
+    PAUSED -- yes --> SLEEP
+    PAUSED -- no --> RESUME["Resume paused tasks\n(only if no active preemptors)"]
     RESUME --> CONC{"Active count\n< max_concurrency?"}
     CONC -- no --> SLEEP["Sleep poll_interval"]
     CONC -- yes --> POP["Atomic pop\nUPDATE → running"]
@@ -238,6 +240,8 @@ The scheduler emits `SchedulerEvent` variants over a `tokio::sync::broadcast` ch
 | `Preempted` | Task paused for higher-priority work           |
 | `Cancelled` | Task cancelled via `Scheduler::cancel()`       |
 | `Progress`  | Executor reported progress (0.0–1.0)           |
+| `Paused`    | Scheduler globally paused via `pause_all()`    |
+| `Resumed`   | Scheduler resumed via `resume_all()`           |
 
 Subscribe with `scheduler.subscribe()`. In a Tauri app, bridge events to the
 frontend with `app_handle.emit()`.
@@ -274,6 +278,39 @@ The `EstimatedProgress` struct provides:
 - **Pending/Paused**: deletes from store directly
 
 Emits a `Cancelled` event for running tasks.
+
+## Global pause/resume
+
+`Scheduler::pause_all()` and `Scheduler::resume_all()` provide a global pause
+mechanism for scenarios like app backgrounding, laptop sleep, or user-initiated
+"pause all" buttons.
+
+### Pause
+
+1. Sets the `paused` `AtomicBool` flag (checked at the top of each poll cycle)
+2. Calls `ActiveTaskMap::pause_all()` — cancels every running task's
+   `CancellationToken` and moves them to `paused` status in the store
+3. Emits `SchedulerEvent::Paused`
+
+While paused, the run loop skips both paused-task resumption and dispatch entirely —
+no CPU is wasted polling.
+
+### Resume
+
+1. Clears the `paused` flag
+2. Emits `SchedulerEvent::Resumed`
+
+On the next poll tick, the run loop resumes normally. Tasks that were paused in
+the store are picked up by the existing paused-task resumption logic and
+re-dispatched.
+
+### Design notes
+
+- The flag is an `AtomicBool` with `Release`/`Acquire` ordering — no lock contention
+  with the run loop
+- `try_dispatch()` does **not** check the flag, so it remains usable for manual
+  single-task dispatch even while globally paused
+- `SchedulerSnapshot::is_paused` reflects the current flag state for UI integration
 
 ## Graceful shutdown
 
@@ -536,6 +573,7 @@ handles parsing via `chrono::NaiveDateTime::parse_from_str`.
 - `ActiveTaskMap` wraps its inner `HashMap` in `Arc<Mutex<_>>` and is `Clone`
 - `DispatchGate` is `Send + Sync + 'static` — stored as `Box<dyn DispatchGate>` in `SchedulerInner`
 - `max_concurrency` uses `AtomicUsize` for lock-free runtime adjustment
+- `paused` uses `AtomicBool` for lock-free global pause/resume
 - `SmoothedReader` uses `RwLock` so readers never block each other
 - `TaskTypeRegistry` is immutable after startup, shared via `Arc`
 - Application state is stored as `Arc<dyn Any + Send + Sync>` — shared (not cloned) across all spawned tasks
@@ -567,6 +605,19 @@ async fn submit_batch(scheduler: tauri::State<'_, Scheduler>, subs: Vec<TaskSubm
 #[tauri::command]
 async fn scheduler_status(scheduler: tauri::State<'_, Scheduler>) -> Result<SchedulerSnapshot, StoreError> {
     scheduler.snapshot().await
+}
+
+// Global pause/resume — e.g., when the user clicks "pause all" or the app backgrounds.
+#[tauri::command]
+async fn pause_scheduler(scheduler: tauri::State<'_, Scheduler>) -> Result<(), ()> {
+    scheduler.pause_all().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn resume_scheduler(scheduler: tauri::State<'_, Scheduler>) -> Result<(), ()> {
+    scheduler.resume_all().await;
+    Ok(())
 }
 ```
 

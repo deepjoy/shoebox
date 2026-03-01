@@ -20,6 +20,7 @@ disk throughput.
 - **Task type registry** — `TaskExecutor` trait lets consumers register executors by name; enables restart recovery
 - **Composable backpressure** — any `PressureSource` impl feeds into a `ThrottlePolicy` that gates dispatch by priority
 - **Preemption** — high-priority tasks cancel lower-priority running work via `CancellationToken`
+- **Global pause/resume** — `pause_all()` stops dispatching and pauses running tasks; `resume_all()` resumes on the next poll tick
 - **Task cancellation** — cancel running or queued tasks via `Scheduler::cancel(task_id)`
 - **Retries** — failed retryable tasks are requeued at the same priority with `retry_count += 1`
 - **Lifecycle events** — subscribe to `SchedulerEvent` for UI integration (dispatch, complete, fail, preempt, cancel, progress)
@@ -183,6 +184,8 @@ Subscribe via `scheduler.subscribe()` to receive `SchedulerEvent` variants:
 | `Preempted` | Task paused for higher-priority work           |
 | `Cancelled` | Task cancelled via `scheduler.cancel(id)`      |
 | `Progress`  | Progress update from a running executor        |
+| `Paused`    | Scheduler globally paused via `pause_all()`    |
+| `Resumed`   | Scheduler resumed via `resume_all()`           |
 
 In a Tauri app, bridge these to the frontend:
 
@@ -237,6 +240,7 @@ let snap = scheduler.snapshot().await?;
 // snap.pressure        — aggregate backpressure (0.0–1.0)
 // snap.pressure_breakdown — per-source diagnostics: Vec<(String, f32)>
 // snap.max_concurrency — current concurrency limit
+// snap.is_paused       — whether the scheduler is globally paused
 ```
 
 This is designed for Tauri commands that return a single status object to the frontend:
@@ -316,6 +320,26 @@ The state is stored as `Arc<T>` internally and shared (not cloned) across all
 running tasks. This mirrors the state extraction pattern used by Axum, Actix,
 and Tauri. `state::<T>()` returns `None` if no state was registered or if the
 type doesn't match.
+
+## Global pause/resume
+
+Pause the entire scheduler when the app is backgrounded, the laptop goes to sleep,
+or the user clicks "pause all":
+
+```rust
+// Pause — stops the dispatch loop and pauses all running tasks.
+// Running tasks have their cancellation tokens triggered and are moved
+// back to 'paused' state in the store for re-dispatch on resume.
+scheduler.pause_all().await;
+
+assert!(scheduler.is_paused());
+
+// Resume — clears the pause flag. Paused tasks are picked up
+// automatically on the next poll tick.
+scheduler.resume_all().await;
+```
+
+Both methods emit `SchedulerEvent::Paused` / `SchedulerEvent::Resumed` for UI integration.
 
 ## Task cancellation
 
