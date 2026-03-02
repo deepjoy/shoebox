@@ -99,7 +99,8 @@ impl MetadataStore {
             .pragma("synchronous", "normal")
             .pragma("cache_size", "-64000")
             .pragma("journal_size_limit", "67108864")
-            .pragma("temp_store", "memory");
+            .pragma("temp_store", "memory")
+            .busy_timeout(std::time::Duration::from_secs(5));
 
         // TODO(#4): Make max_connections configurable (per-bucket or global).
         // https://github.com/deepjoy/shoebox/issues/4

@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS objects (
     -- L2 metadata (NULL until scanned)
     size INTEGER,
     file_mtime TEXT,
+    file_ctime TEXT,
+    inode INTEGER,
+    device_id INTEGER,
 
     -- L3 metadata (NULL until content-hashed)
     etag TEXT,                   -- stored WITH surrounding quotes, e.g. '"abc123"'

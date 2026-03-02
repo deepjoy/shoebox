@@ -20,24 +20,6 @@ impl ScanScope {
             Self::Bucket => true,
         }
     }
-
-    /// Serialise scope type for the `scan_jobs.scope_type` column.
-    pub fn scope_type(&self) -> &'static str {
-        match self {
-            Self::Files(_) => "files",
-            Self::Subtree { .. } => "subtree",
-            Self::Bucket => "bucket",
-        }
-    }
-
-    /// Serialise scope data as JSON for the `scan_jobs.scope_data` column.
-    pub fn scope_data(&self) -> Option<String> {
-        match self {
-            Self::Files(keys) => serde_json::to_string(keys).ok(),
-            Self::Subtree { prefix } => Some(prefix.clone()),
-            Self::Bucket => None,
-        }
-    }
 }
 
 #[cfg(test)]
