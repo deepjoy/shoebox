@@ -65,6 +65,9 @@ notify = "7"
 notify-debouncer-mini = "0.5"
 mime_guess = "2"
 
+# Task scheduling
+taskmill = { path = "crates/taskmill", default-features = false }
+
 # CLI (optional for library-only usage)
 clap = { version = "4.5", features = ["derive", "env"], optional = true }
 quick-xml = { version = "0.39.0", features = ["serialize"] }

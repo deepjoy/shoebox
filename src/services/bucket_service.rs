@@ -1,13 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
-
 use crate::auth::provider::CredentialProvider;
 use crate::config::BucketConfig;
 use crate::error::S3Error;
 use crate::metadata::MetadataStore;
-use crate::scanner::scheduler::ScanScheduler;
 use crate::scanner::watcher::FilesystemWatcher;
 use crate::storage::FilesystemStorage;
 
@@ -25,8 +22,9 @@ pub struct LoadedBucket {
     /// Filesystem watcher — kept alive to receive change events.
     /// Dropping this stops the watcher.
     pub watcher: Option<FilesystemWatcher>,
-    /// Scanner job scheduler for background L2/L3 scans.
-    pub scheduler: Arc<Mutex<ScanScheduler>>,
+    /// Taskmill scheduler for background scan tasks (L1/L2/L3).
+    /// `Scheduler` is `Clone` (internally `Arc`-wrapped).
+    pub scheduler: taskmill::Scheduler,
     /// True when this bucket's config was generated for the first time during build.
     pub freshly_created: bool,
 }

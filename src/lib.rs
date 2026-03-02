@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::routes::create_router;
@@ -25,10 +24,13 @@ use crate::error::{S3Error, ShoeboxError};
 use crate::metadata::sqlite::{ListEntry, ObjectRecord, Tag};
 use crate::metadata::MetadataStore;
 
+use crate::scanner::app_state::{BucketScanState, ScanAppState};
 use crate::scanner::backpressure::ScannerResources;
 use crate::scanner::levels;
-use crate::scanner::scheduler::{Priority, ScanJob, ScanLevel, ScanScheduler};
 use crate::scanner::scope::ScanScope;
+use crate::scanner::tasks::{
+    ScanL1Executor, ScanL1Task, ScanL2Executor, ScanL2Task, ScanL3Executor, ScanL3Task,
+};
 use crate::scanner::watcher::FilesystemWatcher;
 use crate::scanner::worker;
 use crate::services::copy_service::{self, CopyConditions, CopyResult};
@@ -267,14 +269,23 @@ impl Shoebox {
         ))
     }
 
-    // -- Scanner methods (Phase 6) --
+    // -- Scanner methods --
 
     /// Trigger a scan at the given level for a bucket.
-    pub async fn scan(&self, bucket: &str, level: ScanLevel) -> Result<(), S3Error> {
+    ///
+    /// Submits an L1 task that will cascade into L2/L3 based on the
+    /// requested target level.
+    pub async fn scan(&self, bucket: &str, target_level: i32) -> Result<(), S3Error> {
         let b = self.get_bucket(bucket)?;
-        let job = ScanJob::new(Priority::Reconcile, ScanScope::Bucket, level);
-        let mut sched = b.scheduler.lock().await;
-        sched.schedule(job);
+        b.scheduler
+            .submit_typed(&ScanL1Task {
+                bucket: bucket.to_string(),
+                scope: ScanScope::Bucket,
+                target_level,
+                background: false,
+            })
+            .await
+            .map_err(|_| S3Error::InternalError)?;
         Ok(())
     }
 
@@ -452,8 +463,20 @@ impl ShoeboxBuilder {
             .unwrap_or(9000);
 
         let shutdown_token = CancellationToken::new();
-        let resources = Arc::new(ScannerResources::new(100));
-        let mut buckets = HashMap::new();
+
+        // ── Phase 1: Resolve all buckets and run blocking L1 scans ───
+        struct ResolvedBucket {
+            name: String,
+            config: crate::config::BucketConfig,
+            root: PathBuf,
+            shoebox_dir: PathBuf,
+            metadata: MetadataStore,
+            storage: FilesystemStorage,
+            parts_dir: PathBuf,
+            freshly_created: bool,
+        }
+
+        let mut resolved: Vec<ResolvedBucket> = Vec::with_capacity(paths.len());
 
         for path in &paths {
             let state = resolve_bucket(path, self.data_dir.as_deref())
@@ -474,7 +497,7 @@ impl ShoeboxBuilder {
                 .await
                 .map_err(|e| ShoeboxError::Other(e.into()))?;
 
-            // Phase 6: Blocking L1 scan — discover files before serving
+            // Blocking L1 scan — discover files before serving
             let l1_report = levels::scan_l1(&metadata, &state.root, &ScanScope::Bucket)
                 .await
                 .map_err(|e| ShoeboxError::Other(e.into()))?;
@@ -488,20 +511,85 @@ impl ShoeboxBuilder {
                 );
             }
 
-            let scheduler = Arc::new(Mutex::new(ScanScheduler::new()));
+            resolved.push(ResolvedBucket {
+                name: state.name,
+                config: state.config,
+                root: state.root,
+                shoebox_dir: state.shoebox_dir,
+                metadata,
+                storage,
+                parts_dir,
+                freshly_created: state.freshly_created,
+            });
+        }
 
-            // Schedule background L2+L3 scan
-            {
-                let mut sched = scheduler.lock().await;
-                sched.schedule(ScanJob::new(
-                    Priority::Reconcile,
-                    ScanScope::Bucket,
-                    ScanLevel::Content,
-                ));
+        // ── Phase 2: Build ScanAppState with empty OnceLock schedulers ──
+        let scan_app_state = Arc::new(ScanAppState {
+            buckets: resolved
+                .iter()
+                .map(|r| {
+                    (
+                        r.name.clone(),
+                        BucketScanState {
+                            metadata: r.metadata.clone(),
+                            root: r.root.clone(),
+                            scheduler: std::sync::OnceLock::new(),
+                        },
+                    )
+                })
+                .collect(),
+        });
+
+        // ── Phase 3: Build per-bucket taskmill Schedulers ───────────
+        let mut buckets = HashMap::new();
+
+        for r in resolved {
+            let taskmill_db = r.shoebox_dir.join("taskmill.db");
+            let taskmill_db_str = taskmill_db.to_string_lossy().to_string();
+
+            let scheduler = taskmill::Scheduler::builder()
+                .store_path(&taskmill_db_str)
+                .typed_executor::<ScanL1Task, _>(Arc::new(ScanL1Executor))
+                .typed_executor::<ScanL2Task, _>(Arc::new(ScanL2Executor))
+                .typed_executor::<ScanL3Task, _>(Arc::new(ScanL3Executor))
+                .max_concurrency(1)
+                .pressure_source(Box::new(ScannerResources::new(100)))
+                .throttle_policy(taskmill::ThrottlePolicy::default_three_tier())
+                .app_state_arc(scan_app_state.clone())
+                .build()
+                .await
+                .map_err(|e| ShoeboxError::Other(e.into()))?;
+
+            // Fulfil the OnceLock so executors can submit continuation tasks.
+            if let Some(bucket_state) = scan_app_state.buckets.get(&r.name) {
+                let _ = bucket_state.scheduler.set(scheduler.clone());
             }
 
-            // Start filesystem watcher (uses spawn_blocking to avoid blocking the runtime
-            // during recursive inotify watch setup on large directory trees)
+            // Spawn the scheduler run loop.
+            tokio::spawn({
+                let sched = scheduler.clone();
+                let token = shutdown_token.child_token();
+                async move { sched.run(token).await }
+            });
+
+            // Submit initial background L2+L3 scan tasks.
+            let _ = scheduler
+                .submit_typed(&ScanL2Task {
+                    bucket: r.name.clone(),
+                    cursor: None,
+                    background: false,
+                })
+                .await;
+            let _ = scheduler
+                .submit_typed(&ScanL3Task {
+                    bucket: r.name.clone(),
+                    cursor: None,
+                    bytes_per_sec: None,
+                    background: false,
+                })
+                .await;
+
+            // Start filesystem watcher
             let watch_capacity = global_config
                 .as_ref()
                 .and_then(|gc| gc.watch_channel_capacity)
@@ -509,17 +597,16 @@ impl ShoeboxBuilder {
             let watcher = {
                 let (watch_tx, watch_rx) = tokio::sync::mpsc::channel(watch_capacity);
                 let watch_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
-                match FilesystemWatcher::spawn(state.root.clone(), watch_tx, watch_drops.clone())
-                    .await
+                match FilesystemWatcher::spawn(r.root.clone(), watch_tx, watch_drops.clone()).await
                 {
                     Ok(w) => {
-                        tracing::debug!(bucket = %state.name, "Filesystem watcher started");
-                        // Spawn watch processor
+                        tracing::debug!(bucket = %r.name, "Filesystem watcher started");
                         tokio::spawn(worker::run_watch_processor(
-                            metadata.clone(),
-                            state.root.clone(),
+                            r.metadata.clone(),
+                            r.root.clone(),
                             watch_rx,
                             scheduler.clone(),
+                            r.name.clone(),
                             watch_drops,
                             shutdown_token.clone(),
                         ));
@@ -527,7 +614,7 @@ impl ShoeboxBuilder {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            bucket = %state.name,
+                            bucket = %r.name,
                             error = %e,
                             "Failed to start filesystem watcher"
                         );
@@ -536,26 +623,17 @@ impl ShoeboxBuilder {
                 }
             };
 
-            // Spawn scan worker for this bucket
-            tokio::spawn(worker::run_scan_workers(
-                metadata.clone(),
-                state.root.clone(),
-                scheduler.clone(),
-                resources.clone(),
-                shutdown_token.clone(),
-            ));
-
             buckets.insert(
-                state.name.clone(),
+                r.name.clone(),
                 LoadedBucket {
-                    name: state.name,
-                    config: state.config,
-                    storage,
-                    metadata,
-                    parts_dir,
+                    name: r.name,
+                    config: r.config,
+                    storage: r.storage,
+                    metadata: r.metadata,
+                    parts_dir: r.parts_dir,
                     watcher,
                     scheduler,
-                    freshly_created: state.freshly_created,
+                    freshly_created: r.freshly_created,
                 },
             );
         }
