@@ -145,6 +145,32 @@ impl std::fmt::Display for TaskError {
 
 impl std::error::Error for TaskError {}
 
+/// Result of a task submission attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitOutcome {
+    /// Task was inserted as new.
+    Inserted(i64),
+    /// Duplicate key existed; its priority was upgraded (pending tasks only).
+    Upgraded(i64),
+    /// Duplicate key existed; no changes were made.
+    Duplicate,
+}
+
+impl SubmitOutcome {
+    /// Returns the task ID if the task was inserted or upgraded.
+    pub fn id(&self) -> Option<i64> {
+        match self {
+            Self::Inserted(id) | Self::Upgraded(id) => Some(*id),
+            Self::Duplicate => None,
+        }
+    }
+
+    /// Returns `true` if a new task was inserted.
+    pub fn is_inserted(&self) -> bool {
+        matches!(self, Self::Inserted(_))
+    }
+}
+
 /// Generate a dedup key by hashing the task type and payload.
 ///
 /// Produces a hex-encoded SHA-256 digest of `task_type` concatenated with

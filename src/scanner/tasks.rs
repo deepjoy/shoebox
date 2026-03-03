@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use taskmill::{Priority, TaskContext, TaskError, TaskExecutor, TaskResult, TypedTask};
+use taskmill::{TaskContext, TaskError, TaskExecutor, TaskResult, TypedTask};
 
 use crate::scanner::app_state::ScanAppState;
 use crate::scanner::levels;
@@ -33,23 +33,10 @@ pub struct ScanL1Task {
     pub bucket: String,
     pub scope: ScanScope,
     pub target_level: i32,
-    /// When true, this task runs at `BACKGROUND` priority so it yields to
-    /// all normal-priority work already in the queue (e.g. reconcile after
-    /// watch-channel overflow).
-    #[serde(default)]
-    pub background: bool,
 }
 
 impl TypedTask for ScanL1Task {
     const TASK_TYPE: &'static str = "scan-l1";
-
-    fn priority(&self) -> Priority {
-        if self.background {
-            Priority::BACKGROUND
-        } else {
-            Priority::NORMAL
-        }
-    }
 }
 
 /// L2: Collect filesystem metadata (size, mtime, ctime, inode) for objects
@@ -58,20 +45,10 @@ impl TypedTask for ScanL1Task {
 pub struct ScanL2Task {
     pub bucket: String,
     pub cursor: Option<String>,
-    #[serde(default)]
-    pub background: bool,
 }
 
 impl TypedTask for ScanL2Task {
     const TASK_TYPE: &'static str = "scan-l2";
-
-    fn priority(&self) -> Priority {
-        if self.background {
-            Priority::BACKGROUND
-        } else {
-            Priority::NORMAL
-        }
-    }
 }
 
 /// L3: Read files and compute content hashes (MD5 + SHA-256).
@@ -80,20 +57,10 @@ pub struct ScanL3Task {
     pub bucket: String,
     pub cursor: Option<String>,
     pub bytes_per_sec: Option<f64>,
-    #[serde(default)]
-    pub background: bool,
 }
 
 impl TypedTask for ScanL3Task {
     const TASK_TYPE: &'static str = "scan-l3";
-
-    fn priority(&self) -> Priority {
-        if self.background {
-            Priority::BACKGROUND
-        } else {
-            Priority::NORMAL
-        }
-    }
 }
 
 // ── Executors ────────────────────────────────────────────────────────
@@ -148,23 +115,30 @@ impl TaskExecutor for ScanL1Executor {
             actual_write_bytes: 0,
         })?;
 
+        // Propagate the current task's priority to downstream scans.
+        let priority = ctx.record.priority;
+
         if task.target_level >= 2 {
             let _ = scheduler
-                .submit_typed(&ScanL2Task {
-                    bucket: task.bucket.clone(),
-                    cursor: None,
-                    background: task.background,
-                })
+                .submit_typed_at(
+                    &ScanL2Task {
+                        bucket: task.bucket.clone(),
+                        cursor: None,
+                    },
+                    priority,
+                )
                 .await;
         }
         if task.target_level >= 3 {
             let _ = scheduler
-                .submit_typed(&ScanL3Task {
-                    bucket: task.bucket.clone(),
-                    cursor: None,
-                    bytes_per_sec: None,
-                    background: task.background,
-                })
+                .submit_typed_at(
+                    &ScanL3Task {
+                        bucket: task.bucket.clone(),
+                        cursor: None,
+                        bytes_per_sec: None,
+                    },
+                    priority,
+                )
                 .await;
         }
 
@@ -253,11 +227,13 @@ impl TaskExecutor for ScanL2Executor {
         if has_remaining {
             if let Some(scheduler) = bucket_state.scheduler.get() {
                 let _ = scheduler
-                    .submit_typed(&ScanL2Task {
-                        bucket: task.bucket.clone(),
-                        cursor: keys.last().cloned(),
-                        background: task.background,
-                    })
+                    .submit_typed_at(
+                        &ScanL2Task {
+                            bucket: task.bucket.clone(),
+                            cursor: keys.last().cloned(),
+                        },
+                        ctx.record.priority,
+                    )
                     .await;
             }
         }
@@ -395,12 +371,14 @@ impl TaskExecutor for ScanL3Executor {
         if has_remaining {
             if let Some(scheduler) = bucket_state.scheduler.get() {
                 let _ = scheduler
-                    .submit_typed(&ScanL3Task {
-                        bucket: task.bucket.clone(),
-                        cursor: keys.last().cloned(),
-                        bytes_per_sec: new_bytes_per_sec,
-                        background: task.background,
-                    })
+                    .submit_typed_at(
+                        &ScanL3Task {
+                            bucket: task.bucket.clone(),
+                            cursor: keys.last().cloned(),
+                            bytes_per_sec: new_bytes_per_sec,
+                        },
+                        ctx.record.priority,
+                    )
                     .await;
             }
         }
