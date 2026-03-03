@@ -106,10 +106,6 @@ pub struct BucketConfig {
     #[serde(default)]
     pub bucket_name: Option<String>,
 
-    /// Whether versioning is enabled.
-    #[serde(default)]
-    pub versioning_enabled: bool,
-
     /// Credentials for this bucket.
     #[serde(default)]
     pub credentials: Vec<Credential>,
@@ -265,7 +261,6 @@ pub async fn load_or_create_bucket_config(
 
     let config = BucketConfig {
         bucket_name: None,
-        versioning_enabled: false,
         credentials: vec![Credential {
             access_key_id: generate_access_key_id(),
             secret_access_key: generate_secret_access_key(),
@@ -482,7 +477,6 @@ mod tests {
         let (config, freshly_created) = load_or_create_bucket_config(&shoebox_dir).await.unwrap();
 
         assert!(freshly_created);
-        assert!(!config.versioning_enabled);
         assert_eq!(config.credentials.len(), 1);
         assert!(config.credentials[0].access_key_id.starts_with("AKIA"));
 
@@ -507,7 +501,6 @@ mod tests {
 
         let config_toml = r#"
 bucket_name = "my-custom-bucket"
-versioning_enabled = true
 
 [[credentials]]
 access_key_id = "AKIATEST1234567890AB"
@@ -519,7 +512,6 @@ description = "Test credential"
         let (config, freshly_created) = load_or_create_bucket_config(&shoebox_dir).await.unwrap();
         assert!(!freshly_created);
         assert_eq!(config.bucket_name.as_deref(), Some("my-custom-bucket"));
-        assert!(config.versioning_enabled);
         assert_eq!(config.credentials.len(), 1);
         assert_eq!(config.credentials[0].access_key_id, "AKIATEST1234567890AB");
     }
@@ -561,7 +553,6 @@ description = "Test credential"
 
         let config = BucketConfig {
             bucket_name: Some("my-bucket".to_string()),
-            versioning_enabled: true,
             credentials: vec![Credential {
                 access_key_id: "AKIATEST1234567890AB".to_string(),
                 secret_access_key: "secretkey1234567890123456789012345678".to_string(),
@@ -576,7 +567,6 @@ description = "Test credential"
         let (loaded, freshly_created) = load_or_create_bucket_config(&shoebox_dir).await.unwrap();
         assert!(!freshly_created);
         assert_eq!(loaded.bucket_name.as_deref(), Some("my-bucket"));
-        assert!(loaded.versioning_enabled);
         assert_eq!(loaded.credentials.len(), 1);
         assert_eq!(loaded.credentials[0].access_key_id, "AKIATEST1234567890AB");
         assert_eq!(
@@ -601,14 +591,12 @@ description = "Test credential"
 
         let config_v1 = BucketConfig {
             bucket_name: Some("v1".to_string()),
-            versioning_enabled: false,
             credentials: vec![],
         };
         save_bucket_config(&shoebox_dir, &config_v1).await.unwrap();
 
         let config_v2 = BucketConfig {
             bucket_name: Some("v2".to_string()),
-            versioning_enabled: true,
             credentials: vec![Credential {
                 access_key_id: "AKIANEW".to_string(),
                 secret_access_key: "newsecret".to_string(),
@@ -620,7 +608,6 @@ description = "Test credential"
 
         let (loaded, _) = load_or_create_bucket_config(&shoebox_dir).await.unwrap();
         assert_eq!(loaded.bucket_name.as_deref(), Some("v2"));
-        assert!(loaded.versioning_enabled);
         assert_eq!(loaded.credentials.len(), 1);
     }
 

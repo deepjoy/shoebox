@@ -249,7 +249,7 @@ mod tests {
     fn provider_lookup() {
         let config = BucketConfig {
             bucket_name: None,
-            versioning_enabled: false,
+
             credentials: vec![Credential {
                 access_key_id: "AKIATEST1234567890AB".to_string(),
                 secret_access_key: "secret123".to_string(),
@@ -283,7 +283,7 @@ mod tests {
     fn test_has_other_admin_single_admin() {
         let config = BucketConfig {
             bucket_name: None,
-            versioning_enabled: false,
+
             credentials: vec![Credential {
                 access_key_id: "AKIAONLY1234567890AB".to_string(),
                 secret_access_key: "secret".to_string(),
@@ -300,7 +300,7 @@ mod tests {
     fn test_has_other_admin_multiple_admins() {
         let config = BucketConfig {
             bucket_name: None,
-            versioning_enabled: false,
+
             credentials: vec![
                 Credential {
                     access_key_id: "AKIAADMIN1XXXXXXXXXX".to_string(),
@@ -327,7 +327,7 @@ mod tests {
         // Empty permissions (legacy Phase 1 creds) = admin
         let config = BucketConfig {
             bucket_name: None,
-            versioning_enabled: false,
+
             credentials: vec![Credential {
                 access_key_id: "AKIALEGACY0000000000".to_string(),
                 secret_access_key: "secret".to_string(),
@@ -344,7 +344,7 @@ mod tests {
     fn test_has_other_admin_read_only_not_admin() {
         let config = BucketConfig {
             bucket_name: None,
-            versioning_enabled: false,
+
             credentials: vec![
                 Credential {
                     access_key_id: "AKIAADMIN000000000AB".to_string(),
@@ -398,7 +398,7 @@ mod tests {
     fn provider_list_returns_all() {
         let config = BucketConfig {
             bucket_name: None,
-            versioning_enabled: false,
+
             credentials: vec![
                 Credential {
                     access_key_id: "AKIA1111111111111111".to_string(),
