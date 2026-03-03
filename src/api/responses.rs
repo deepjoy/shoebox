@@ -6,6 +6,8 @@ use axum::{
 };
 use serde::Serialize;
 
+use crate::types::ChecksumValues;
+
 /// Wraps a `Serialize`-able value and renders it as an S3-style XML response.
 pub struct XmlResponse<T: Serialize>(pub T);
 
@@ -52,6 +54,7 @@ pub struct ObjectResponse {
     pub etag: String,
     pub last_modified: String,
     pub metadata: HashMap<String, String>,
+    pub checksums: ChecksumValues,
 }
 
 impl IntoResponse for ObjectResponse {
@@ -66,6 +69,19 @@ impl IntoResponse for ObjectResponse {
             if let Ok(name) = HeaderName::from_bytes(format!("x-amz-meta-{}", key).as_bytes()) {
                 builder = builder.header(name, value);
             }
+        }
+
+        if let Some(ref v) = self.checksums.sha256 {
+            builder = builder.header("x-amz-checksum-sha256", v);
+        }
+        if let Some(ref v) = self.checksums.sha1 {
+            builder = builder.header("x-amz-checksum-sha1", v);
+        }
+        if let Some(ref v) = self.checksums.crc32 {
+            builder = builder.header("x-amz-checksum-crc32", v);
+        }
+        if let Some(ref v) = self.checksums.crc32c {
+            builder = builder.header("x-amz-checksum-crc32c", v);
         }
 
         builder

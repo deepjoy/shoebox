@@ -17,6 +17,33 @@ use crate::services::copy_service::{self, CopyConditions};
 use crate::services::object_service::{self, PutObjectInput};
 use crate::services::AppState;
 use crate::storage::filesystem::FileContent;
+use crate::types::ChecksumValues;
+
+/// Append non-None checksum headers to a response header list.
+fn append_checksum_headers(checksums: &ChecksumValues, headers: &mut Vec<(String, String)>) {
+    if let Some(ref v) = checksums.sha256 {
+        headers.push(("x-amz-checksum-sha256".to_string(), v.clone()));
+    }
+    if let Some(ref v) = checksums.sha1 {
+        headers.push(("x-amz-checksum-sha1".to_string(), v.clone()));
+    }
+    if let Some(ref v) = checksums.crc32 {
+        headers.push(("x-amz-checksum-crc32".to_string(), v.clone()));
+    }
+    if let Some(ref v) = checksums.crc32c {
+        headers.push(("x-amz-checksum-crc32c".to_string(), v.clone()));
+    }
+}
+
+/// Build a ChecksumValues from an ObjectRecord.
+fn checksums_from_record(record: &ObjectRecord) -> ChecksumValues {
+    ChecksumValues {
+        sha256: record.checksum_sha256.clone(),
+        sha1: record.checksum_sha1.clone(),
+        crc32: record.checksum_crc32.clone(),
+        crc32c: record.checksum_crc32c.clone(),
+    }
+}
 
 /// HTTP-date format per RFC 7231 (e.g. "Wed, 01 Jan 2024 00:00:00 GMT").
 /// Used for Last-Modified and Date HTTP headers. S3 XML responses use ISO 8601 (Rfc3339) instead.
@@ -145,6 +172,7 @@ pub async fn get_object(
     let etag = record.etag.clone().unwrap_or_default();
     let last_modified = format_http_date(&record.last_modified);
     let user_meta = parse_metadata_json(&record.metadata);
+    let checksums = checksums_from_record(&record);
 
     // Check for Range header
     if let Some(range_header) = headers.get(header::RANGE) {
@@ -181,6 +209,12 @@ pub async fn get_object(
             builder = builder.header(format!("x-amz-meta-{}", k), v);
         }
 
+        let mut checksum_headers = Vec::new();
+        append_checksum_headers(&checksums, &mut checksum_headers);
+        for (k, v) in &checksum_headers {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+
         return Ok(builder
             .body(body)
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()));
@@ -200,6 +234,7 @@ pub async fn get_object(
                 etag,
                 last_modified,
                 metadata: user_meta,
+                checksums: checksums.clone(),
             }
             .into_response())
         }
@@ -213,6 +248,7 @@ pub async fn get_object(
                 etag,
                 last_modified,
                 metadata: user_meta,
+                checksums,
             }
             .into_response())
         }
@@ -340,6 +376,13 @@ pub async fn put_object(
         .into_data_stream()
         .map(|result| result.map_err(std::io::Error::other));
 
+    let extract_header = |name: &str| -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    };
+
     let input = PutObjectInput {
         content_type: headers
             .get(header::CONTENT_TYPE)
@@ -347,16 +390,26 @@ pub async fn put_object(
             .unwrap_or("application/octet-stream")
             .to_string(),
         user_metadata: extract_metadata_headers(&headers),
-        content_md5: headers
-            .get("content-md5")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string()),
+        content_md5: extract_header("content-md5"),
+        checksum_sha256: extract_header("x-amz-checksum-sha256"),
+        checksum_sha1: extract_header("x-amz-checksum-sha1"),
+        checksum_crc32: extract_header("x-amz-checksum-crc32"),
+        checksum_crc32c: extract_header("x-amz-checksum-crc32c"),
     };
 
     let result =
         object_service::put_object(&bucket.storage, &bucket.metadata, &key, stream, input).await?;
 
-    Ok(([(header::ETAG, result.etag)], StatusCode::OK).into_response())
+    let mut resp_headers = vec![(header::ETAG.to_string(), result.etag)];
+    append_checksum_headers(&result.checksums, &mut resp_headers);
+
+    let mut builder = axum::http::Response::builder().status(StatusCode::OK);
+    for (k, v) in &resp_headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    Ok(builder
+        .body(axum::body::Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
 /// DELETE /{bucket}/{key} — delete an object or its tags.
@@ -411,6 +464,7 @@ pub async fn head_object(
     }
 
     let user_meta = parse_metadata_json(&metadata.metadata);
+    let checksums = checksums_from_record(&metadata);
     let mut resp_headers = vec![
         (
             header::CONTENT_TYPE.to_string(),
@@ -432,6 +486,8 @@ pub async fn head_object(
     for (key, value) in &user_meta {
         resp_headers.push((format!("x-amz-meta-{}", key), value.clone()));
     }
+
+    append_checksum_headers(&checksums, &mut resp_headers);
 
     let mut builder = axum::http::Response::builder().status(StatusCode::OK);
     for (k, v) in &resp_headers {

@@ -8,6 +8,15 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
 use crate::error::S3Error;
+use crate::types::ChecksumValues;
+
+/// Batch update entry for L3 content hashes.
+pub struct L3HashUpdate {
+    pub key: String,
+    pub etag: String,
+    pub checksums: ChecksumValues,
+    pub scan_level: i32,
+}
 
 /// A single entry from a streaming list operation.
 #[derive(Debug, Clone)]
@@ -47,7 +56,12 @@ pub struct ObjectRecord {
 
     // L3 metadata (None until content-hashed)
     pub etag: Option<String>,
-    pub content_hash: Option<String>,
+
+    // S3 checksums (base64-encoded, None until content-hashed)
+    pub checksum_sha256: Option<String>,
+    pub checksum_sha1: Option<String>,
+    pub checksum_crc32: Option<String>,
+    pub checksum_crc32c: Option<String>,
 
     // S3 metadata
     pub content_type: Option<String>,
@@ -73,7 +87,10 @@ impl Default for ObjectRecord {
             inode: None,
             device_id: None,
             etag: None,
-            content_hash: None,
+            checksum_sha256: None,
+            checksum_sha1: None,
+            checksum_crc32: None,
+            checksum_crc32c: None,
             content_type: None,
             last_modified: time::OffsetDateTime::UNIX_EPOCH,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
@@ -145,9 +162,9 @@ impl MetadataStore {
             r#"INSERT INTO objects (
                 id, key, parent_directory, is_directory, is_symlink, symlink_target,
                 size, file_mtime, file_ctime, inode, device_id,
-                etag, content_hash,
+                etag, checksum_sha256, checksum_sha1, checksum_crc32, checksum_crc32c,
                 content_type, last_modified, created_at, metadata, scan_level
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&obj.id)
         .bind(&obj.key)
@@ -161,7 +178,10 @@ impl MetadataStore {
         .bind(obj.inode)
         .bind(obj.device_id)
         .bind(&obj.etag)
-        .bind(&obj.content_hash)
+        .bind(&obj.checksum_sha256)
+        .bind(&obj.checksum_sha1)
+        .bind(&obj.checksum_crc32)
+        .bind(&obj.checksum_crc32c)
         .bind(&obj.content_type)
         .bind(obj.last_modified)
         .bind(obj.created_at)
@@ -184,9 +204,9 @@ impl MetadataStore {
                 r#"INSERT INTO objects (
                     id, key, parent_directory, is_directory, is_symlink, symlink_target,
                     size, file_mtime, file_ctime, inode, device_id,
-                    etag, content_hash,
+                    etag, checksum_sha256, checksum_sha1, checksum_crc32, checksum_crc32c,
                     content_type, last_modified, created_at, metadata, scan_level
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(&obj.id)
             .bind(&obj.key)
@@ -200,7 +220,10 @@ impl MetadataStore {
             .bind(obj.inode)
             .bind(obj.device_id)
             .bind(&obj.etag)
-            .bind(&obj.content_hash)
+            .bind(&obj.checksum_sha256)
+            .bind(&obj.checksum_sha1)
+            .bind(&obj.checksum_crc32)
+            .bind(&obj.checksum_crc32c)
             .bind(&obj.content_type)
             .bind(obj.last_modified)
             .bind(obj.created_at)
@@ -223,9 +246,9 @@ impl MetadataStore {
             r#"INSERT INTO objects (
                 id, key, parent_directory, is_directory, is_symlink, symlink_target,
                 size, file_mtime, file_ctime, inode, device_id,
-                etag, content_hash,
+                etag, checksum_sha256, checksum_sha1, checksum_crc32, checksum_crc32c,
                 content_type, last_modified, created_at, metadata, scan_level
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET
                 parent_directory = excluded.parent_directory,
                 is_directory = excluded.is_directory,
@@ -237,7 +260,10 @@ impl MetadataStore {
                 inode = excluded.inode,
                 device_id = excluded.device_id,
                 etag = excluded.etag,
-                content_hash = excluded.content_hash,
+                checksum_sha256 = excluded.checksum_sha256,
+                checksum_sha1 = excluded.checksum_sha1,
+                checksum_crc32 = excluded.checksum_crc32,
+                checksum_crc32c = excluded.checksum_crc32c,
                 content_type = excluded.content_type,
                 last_modified = excluded.last_modified,
                 metadata = excluded.metadata,
@@ -255,7 +281,10 @@ impl MetadataStore {
         .bind(obj.inode)
         .bind(obj.device_id)
         .bind(&obj.etag)
-        .bind(&obj.content_hash)
+        .bind(&obj.checksum_sha256)
+        .bind(&obj.checksum_sha1)
+        .bind(&obj.checksum_crc32)
+        .bind(&obj.checksum_crc32c)
         .bind(&obj.content_type)
         .bind(obj.last_modified)
         .bind(obj.created_at)
@@ -946,15 +975,20 @@ impl MetadataStore {
         &self,
         key: &str,
         etag: &str,
-        content_hash: &str,
+        checksums: &crate::types::ChecksumValues,
         scan_level: i32,
     ) -> Result<(), S3Error> {
         let result = sqlx::query(
-            "UPDATE objects SET etag = ?, content_hash = ?, scan_level = ?, last_modified = ? \
+            "UPDATE objects SET etag = ?, \
+             checksum_sha256 = ?, checksum_sha1 = ?, checksum_crc32 = ?, checksum_crc32c = ?, \
+             scan_level = ?, last_modified = ? \
              WHERE key = ? AND scan_level < ?",
         )
         .bind(etag)
-        .bind(content_hash)
+        .bind(&checksums.sha256)
+        .bind(&checksums.sha1)
+        .bind(&checksums.crc32)
+        .bind(&checksums.crc32c)
         .bind(scan_level)
         .bind(time::OffsetDateTime::now_utc())
         .bind(key)
@@ -1001,24 +1035,29 @@ impl MetadataStore {
     /// Update L3 content hashes for multiple objects in a single transaction.
     pub async fn update_objects_hashes_batch(
         &self,
-        updates: &[(String, String, String, i32)],
+        updates: &[L3HashUpdate],
     ) -> Result<(), S3Error> {
         if updates.is_empty() {
             return Ok(());
         }
         let mut tx = self.pool.begin().await?;
         let now = time::OffsetDateTime::now_utc();
-        for (key, etag, content_hash, scan_level) in updates {
+        for update in updates {
             sqlx::query(
-                "UPDATE objects SET etag = ?, content_hash = ?, scan_level = ?, last_modified = ? \
+                "UPDATE objects SET etag = ?, \
+                 checksum_sha256 = ?, checksum_sha1 = ?, checksum_crc32 = ?, checksum_crc32c = ?, \
+                 scan_level = ?, last_modified = ? \
                  WHERE key = ? AND scan_level < ?",
             )
-            .bind(etag)
-            .bind(content_hash)
-            .bind(scan_level)
+            .bind(&update.etag)
+            .bind(&update.checksums.sha256)
+            .bind(&update.checksums.sha1)
+            .bind(&update.checksums.crc32)
+            .bind(&update.checksums.crc32c)
+            .bind(update.scan_level)
             .bind(now)
-            .bind(key.as_str())
-            .bind(scan_level)
+            .bind(update.key.as_str())
+            .bind(update.scan_level)
             .execute(&mut *tx)
             .await?;
         }
