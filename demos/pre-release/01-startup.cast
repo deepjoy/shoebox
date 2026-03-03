@@ -25,5 +25,5 @@
 [42.560407, "o", "\r\n\u001b[38;2;73;110;93m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\u001b[0m\r\n\u001b[1m\u001b[38;2;216;198;176m  Done!\u001b[0m\r\n\u001b[38;2;73;110;93m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\u001b[0m\r\n\r\n"]
 [45.0624, "o", "  \u001b[38;2;197;185;155m# Each directory now has a .shoebox/config.toml with its credentials.\u001b[0m\r\n\r\n\u001b[38;2;142;155;105m▸ Peeking at generated config\u001b[0m\r\n"]
 [47.564555, "o", "\u001b[38;2;183;167;123m$ cat '/tmp/tmp.XM2e69TLpL/Photos/.shoebox/config.toml'\u001b[0m\r\n"]
-[47.566006, "o", "versioning_enabled = false\r\n\r\n[[credentials]]\r\naccess_key_id = \"AKIAW4LSTNXIRPKBQYRU\"\r\nsecret_access_key = \"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\"\r\ndescription = \"Full access (admin)\"\r\n"]
+[47.566006, "o", "[[credentials]]\r\naccess_key_id = \"AKIAW4LSTNXIRPKBQYRU\"\r\nsecret_access_key = \"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\"\r\ndescription = \"Full access (admin)\"\r\n"]
 [50.067434, "o", "\r\n  \u001b[38;2;142;155;105m✓ That's shoebox — zero-config, no-copy, S3-compatible local storage.\u001b[0m\r\n\r\n"]
