@@ -229,12 +229,30 @@ impl TaskStore {
             return Ok(SubmitOutcome::Inserted(result.last_insert_rowid()));
         }
 
-        // Dedup hit — try to upgrade priority on pending tasks.
+        // Dedup hit — try to upgrade priority on pending/paused tasks.
         // Lower numeric value = higher priority, so `priority > ?` means
         // the existing task has lower importance than the new submission.
         let row = sqlx::query(
             "UPDATE tasks SET priority = ?
-             WHERE key = ? AND status = 'pending' AND priority > ?
+             WHERE key = ? AND status IN ('pending', 'paused') AND priority > ?
+             RETURNING id",
+        )
+        .bind(priority)
+        .bind(&key)
+        .bind(priority)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(r) = row {
+            return Ok(SubmitOutcome::Upgraded(r.get("id")));
+        }
+
+        // Dedup hit on running/paused task — mark for re-queue so the task
+        // runs again after the current execution completes.
+        let row = sqlx::query(
+            "UPDATE tasks SET requeue = 1, requeue_priority = ?
+             WHERE key = ? AND status IN ('running', 'paused')
+               AND (requeue = 0 OR requeue_priority > ?)
              RETURNING id",
         )
         .bind(priority)
@@ -244,7 +262,7 @@ impl TaskStore {
         .await?;
 
         match row {
-            Some(r) => Ok(SubmitOutcome::Upgraded(r.get("id"))),
+            Some(r) => Ok(SubmitOutcome::Requeued(r.get("id"))),
             None => Ok(SubmitOutcome::Duplicate),
         }
     }
@@ -292,10 +310,10 @@ impl TaskStore {
             if result.rows_affected() > 0 {
                 results.push(SubmitOutcome::Inserted(result.last_insert_rowid()));
             } else {
-                // Dedup hit — try to upgrade priority.
+                // Dedup hit — try to upgrade priority on pending/paused tasks.
                 let row = sqlx::query(
                     "UPDATE tasks SET priority = ?
-                     WHERE key = ? AND status = 'pending' AND priority > ?
+                     WHERE key = ? AND status IN ('pending', 'paused') AND priority > ?
                      RETURNING id",
                 )
                 .bind(priority)
@@ -304,9 +322,26 @@ impl TaskStore {
                 .fetch_optional(&mut *conn)
                 .await?;
 
-                match row {
-                    Some(r) => results.push(SubmitOutcome::Upgraded(r.get("id"))),
-                    None => results.push(SubmitOutcome::Duplicate),
+                if let Some(r) = row {
+                    results.push(SubmitOutcome::Upgraded(r.get("id")));
+                } else {
+                    // Try requeue on running/paused tasks.
+                    let row = sqlx::query(
+                        "UPDATE tasks SET requeue = 1, requeue_priority = ?
+                         WHERE key = ? AND status IN ('running', 'paused')
+                           AND (requeue = 0 OR requeue_priority > ?)
+                         RETURNING id",
+                    )
+                    .bind(priority)
+                    .bind(&key)
+                    .bind(priority)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+
+                    match row {
+                        Some(r) => results.push(SubmitOutcome::Requeued(r.get("id"))),
+                        None => results.push(SubmitOutcome::Duplicate),
+                    }
                 }
             }
         }
@@ -440,11 +475,30 @@ impl TaskStore {
         .execute(&mut *conn)
         .await?;
 
-        // Remove from active queue.
-        sqlx::query("DELETE FROM tasks WHERE id = ?")
+        if task.requeue {
+            // Requeue flag set — reset to pending with requeue_priority
+            // instead of removing from the active queue.
+            let requeue_priority = task
+                .requeue_priority
+                .map(|p| p.value() as i32)
+                .unwrap_or(task.priority.value() as i32);
+            sqlx::query(
+                "UPDATE tasks SET status = 'pending', priority = ?,
+                    started_at = NULL, retry_count = 0, last_error = NULL,
+                    requeue = 0, requeue_priority = NULL
+                 WHERE id = ?",
+            )
+            .bind(requeue_priority)
             .bind(id)
             .execute(&mut *conn)
             .await?;
+        } else {
+            // Remove from active queue.
+            sqlx::query("DELETE FROM tasks WHERE id = ?")
+                .bind(id)
+                .execute(&mut *conn)
+                .await?;
+        }
 
         sqlx::query("COMMIT").execute(&mut *conn).await?;
         tracing::debug!(task_id = id, "store.complete: COMMIT ok");
@@ -885,6 +939,9 @@ fn row_to_task_record(row: &sqlx::sqlite::SqliteRow) -> TaskRecord {
     let created_at_str: String = row.get("created_at");
     let started_at_str: Option<String> = row.get("started_at");
 
+    let requeue_val: i32 = row.get("requeue");
+    let requeue_priority_val: Option<i32> = row.get("requeue_priority");
+
     TaskRecord {
         id: row.get("id"),
         task_type: row.get("task_type"),
@@ -898,6 +955,8 @@ fn row_to_task_record(row: &sqlx::sqlite::SqliteRow) -> TaskRecord {
         last_error: row.get("last_error"),
         created_at: parse_datetime(&created_at_str),
         started_at: started_at_str.map(|s| parse_datetime(&s)),
+        requeue: requeue_val != 0,
+        requeue_priority: requeue_priority_val.map(|p| Priority::new(p as u8)),
     }
 }
 
@@ -1004,18 +1063,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedup_no_upgrade_when_running() {
+    async fn dedup_requeues_when_running() {
         let store = test_store().await;
 
         // Submit and pop (transitions to running).
         let sub = make_submission("running-task", Priority::NORMAL);
         store.submit(&sub).await.unwrap();
-        store.pop_next().await.unwrap();
+        let task = store.pop_next().await.unwrap().unwrap();
 
-        // Submit same key at HIGH priority — should be Duplicate since task is running.
+        // Submit same key at HIGH priority — should be Requeued since task is running.
         let sub_high = make_submission("running-task", Priority::HIGH);
         let outcome = store.submit(&sub_high).await.unwrap();
-        assert_eq!(outcome, SubmitOutcome::Duplicate);
+        assert!(matches!(outcome, SubmitOutcome::Requeued(_)));
+
+        // Verify the requeue flag is set on the running task.
+        let key = sub.effective_key();
+        let running = store.task_by_key(&key).await.unwrap().unwrap();
+        assert!(running.requeue);
+        assert_eq!(running.requeue_priority, Some(Priority::HIGH));
+
+        // Complete the running task — should reset to pending with requeue_priority.
+        store
+            .complete(
+                task.id,
+                &TaskResult {
+                    actual_read_bytes: 0,
+                    actual_write_bytes: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Task should now be pending at HIGH priority.
+        let requeued = store.task_by_key(&key).await.unwrap().unwrap();
+        assert_eq!(requeued.status, TaskStatus::Pending);
+        assert_eq!(requeued.priority, Priority::HIGH);
+        assert!(!requeued.requeue);
+        assert_eq!(requeued.requeue_priority, None);
+
+        // Pop should return it.
+        let popped = store.pop_next().await.unwrap().unwrap();
+        assert_eq!(popped.id, task.id);
+    }
+
+    #[tokio::test]
+    async fn dedup_requeue_already_requeued_same_priority() {
+        let store = test_store().await;
+
+        let sub = make_submission("rq-dup", Priority::NORMAL);
+        store.submit(&sub).await.unwrap();
+        store.pop_next().await.unwrap();
+
+        // First requeue at HIGH.
+        let sub_high = make_submission("rq-dup", Priority::HIGH);
+        let outcome = store.submit(&sub_high).await.unwrap();
+        assert!(matches!(outcome, SubmitOutcome::Requeued(_)));
+
+        // Second requeue at same priority — should be Duplicate.
+        let outcome2 = store.submit(&sub_high).await.unwrap();
+        assert_eq!(outcome2, SubmitOutcome::Duplicate);
+    }
+
+    #[tokio::test]
+    async fn dedup_requeue_upgrades_priority() {
+        let store = test_store().await;
+
+        let sub = make_submission("rq-upgrade", Priority::BACKGROUND);
+        store.submit(&sub).await.unwrap();
+        store.pop_next().await.unwrap();
+
+        // First requeue at NORMAL.
+        let sub_normal = make_submission("rq-upgrade", Priority::NORMAL);
+        let outcome = store.submit(&sub_normal).await.unwrap();
+        assert!(matches!(outcome, SubmitOutcome::Requeued(_)));
+
+        // Second requeue at HIGH — should upgrade requeue_priority.
+        let sub_high = make_submission("rq-upgrade", Priority::HIGH);
+        let outcome2 = store.submit(&sub_high).await.unwrap();
+        assert!(matches!(outcome2, SubmitOutcome::Requeued(_)));
+
+        let key = sub.effective_key();
+        let task = store.task_by_key(&key).await.unwrap().unwrap();
+        assert_eq!(task.requeue_priority, Some(Priority::HIGH));
+    }
+
+    #[tokio::test]
+    async fn permanent_failure_drops_requeue() {
+        let store = test_store().await;
+
+        let sub = make_submission("fail-rq", Priority::NORMAL);
+        store.submit(&sub).await.unwrap();
+        let task = store.pop_next().await.unwrap().unwrap();
+
+        // Mark for requeue.
+        let sub_high = make_submission("fail-rq", Priority::HIGH);
+        store.submit(&sub_high).await.unwrap();
+
+        // Permanent failure — requeue flag is dropped.
+        store.fail(task.id, "boom", false, 0, 0, 0).await.unwrap();
+
+        // Key should be free for reuse.
+        let outcome = store.submit(&sub).await.unwrap();
+        assert!(outcome.is_inserted());
     }
 
     #[tokio::test]
