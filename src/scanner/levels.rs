@@ -1,17 +1,20 @@
 use std::path::Path;
 
 use async_walkdir::{Filtering, WalkDir};
+use base64::Engine;
 use futures::StreamExt;
 use md5::Md5;
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
 use crate::config::SHOEBOX_DIR;
 use crate::error::S3Error;
-use crate::metadata::sqlite::{ObjectMetadataUpdate, ObjectRecord};
+use crate::metadata::sqlite::{L3HashUpdate, ObjectMetadataUpdate, ObjectRecord};
 use crate::metadata::MetadataStore;
 use crate::scanner::platform;
 use crate::scanner::scope::ScanScope;
+use crate::types::ChecksumValues;
 
 /// Maximum number of rows per batch transaction.
 const BATCH_SIZE: usize = 1000;
@@ -313,7 +316,7 @@ enum L3FileResult {
     Hashed {
         key: String,
         etag: String,
-        content_hash: String,
+        checksums: ChecksumValues,
         size: u64,
     },
     /// File was a symlink — promote to scan_level 3 without hashing.
@@ -323,7 +326,7 @@ enum L3FileResult {
     Skipped,
 }
 
-/// Hash a single file, computing MD5 (ETag) and SHA-256 (content_hash).
+/// Hash a single file, computing MD5 (ETag) and all S3 checksums.
 ///
 /// Returns `L3FileResult::Hashed` on success or `L3FileResult::Skipped` if the
 /// file is missing, unreadable, a directory, or was modified during the scan.
@@ -378,6 +381,9 @@ async fn hash_one_file(root: &Path, key: &str, index: usize, total: usize) -> L3
 
     let mut md5_hasher = Md5::new();
     let mut sha256_hasher = Sha256::new();
+    let mut sha1_hasher = Sha1::new();
+    let mut crc32_hasher = crc32fast::Hasher::new();
+    let mut crc32c_value: u32 = 0;
     let mut buf = [0u8; 64 * 1024];
     let mut size = 0u64;
     let mut read_error = false;
@@ -394,6 +400,9 @@ async fn hash_one_file(root: &Path, key: &str, index: usize, total: usize) -> L3
         };
         md5_hasher.update(&buf[..n]);
         sha256_hasher.update(&buf[..n]);
+        sha1_hasher.update(&buf[..n]);
+        crc32_hasher.update(&buf[..n]);
+        crc32c_value = crc32c::crc32c_append(crc32c_value, &buf[..n]);
         size += n as u64;
     }
 
@@ -417,7 +426,13 @@ async fn hash_one_file(root: &Path, key: &str, index: usize, total: usize) -> L3
     }
 
     let etag = format!("\"{}\"", hex::encode(md5_hasher.finalize()));
-    let content_hash = format!("sha256:{}", hex::encode(sha256_hasher.finalize()));
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let checksums = ChecksumValues {
+        sha256: Some(b64.encode(sha256_hasher.finalize())),
+        sha1: Some(b64.encode(sha1_hasher.finalize())),
+        crc32: Some(b64.encode(crc32_hasher.finalize().to_be_bytes())),
+        crc32c: Some(b64.encode(crc32c_value.to_be_bytes())),
+    };
 
     tracing::debug!(
         key = %key,
@@ -429,12 +444,12 @@ async fn hash_one_file(root: &Path, key: &str, index: usize, total: usize) -> L3
     L3FileResult::Hashed {
         key: key.to_string(),
         etag,
-        content_hash,
+        checksums,
         size,
     }
 }
 
-/// L3: Read files and compute hashes (MD5 for ETag, SHA-256 for content_hash).
+/// L3: Read files and compute hashes (MD5 for ETag, plus all S3 checksums).
 ///
 /// Files are hashed concurrently using `buffer_unordered(concurrency)`.
 /// Use higher concurrency for small files (syscall-bound) and lower for large
@@ -471,19 +486,24 @@ pub async fn scan_l3(
         .await;
 
     // Batch-write results to the database
-    let mut batch: Vec<(String, String, String, i32)> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch: Vec<L3HashUpdate> = Vec::with_capacity(BATCH_SIZE);
     let mut symlink_keys: Vec<String> = Vec::new();
     for result in results {
         match result {
             L3FileResult::Hashed {
                 key,
                 etag,
-                content_hash,
+                checksums,
                 size,
             } => {
                 report.hashed += 1;
                 report.bytes += size;
-                batch.push((key, etag, content_hash, 3));
+                batch.push(L3HashUpdate {
+                    key,
+                    etag,
+                    checksums,
+                    scan_level: 3,
+                });
                 if batch.len() >= BATCH_SIZE {
                     metadata.update_objects_hashes_batch(&batch).await?;
                     batch.clear();
@@ -701,7 +721,7 @@ mod tests {
         let obj = store.get_object("file.txt").await.unwrap().unwrap();
         assert_eq!(obj.scan_level, 3);
         assert!(obj.etag.is_some());
-        assert!(obj.content_hash.as_ref().unwrap().starts_with("sha256:"));
+        assert!(obj.checksum_sha256.is_some());
 
         // Verify MD5 of "hello world"
         let expected_md5 = format!("\"{}\"", hex::encode(Md5::digest(b"hello world")));

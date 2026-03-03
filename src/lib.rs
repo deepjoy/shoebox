@@ -497,7 +497,8 @@ impl ShoeboxBuilder {
                 .await
                 .map_err(|e| ShoeboxError::Other(e.into()))?;
 
-            // Blocking L1 scan — discover files before serving
+            // Blocking L1 scan — discover files before serving so that
+            // list_objects returns results immediately after build().
             let l1_report = levels::scan_l1(&metadata, &state.root, &ScanScope::Bucket)
                 .await
                 .map_err(|e| ShoeboxError::Other(e.into()))?;
@@ -739,6 +740,10 @@ mod tests {
                     content_type: "text/plain".to_string(),
                     user_metadata: HashMap::new(),
                     content_md5: None,
+                    checksum_sha256: None,
+                    checksum_sha1: None,
+                    checksum_crc32: None,
+                    checksum_crc32c: None,
                 },
             )
             .await
@@ -779,6 +784,10 @@ mod tests {
                     content_type: "text/plain".to_string(),
                     user_metadata: HashMap::new(),
                     content_md5: None,
+                    checksum_sha256: None,
+                    checksum_sha1: None,
+                    checksum_crc32: None,
+                    checksum_crc32c: None,
                 },
             )
             .await
@@ -810,6 +819,10 @@ mod tests {
                         content_type: "text/plain".to_string(),
                         user_metadata: HashMap::new(),
                         content_md5: None,
+                        checksum_sha256: None,
+                        checksum_sha1: None,
+                        checksum_crc32: None,
+                        checksum_crc32c: None,
                     },
                 )
                 .await
@@ -1092,6 +1105,10 @@ mod tests {
                     content_type: "text/plain".to_string(),
                     user_metadata: HashMap::new(),
                     content_md5: None,
+                    checksum_sha256: None,
+                    checksum_sha1: None,
+                    checksum_crc32: None,
+                    checksum_crc32c: None,
                 },
             )
             .await

@@ -4,6 +4,7 @@ use crate::error::S3Error;
 use crate::metadata::sqlite::ObjectRecord;
 use crate::metadata::MetadataStore;
 use crate::storage::filesystem::{FileContent, FilesystemStorage};
+use crate::types::ChecksumValues;
 
 /// Result of a GetObject operation.
 pub struct GetObjectResult {
@@ -17,12 +18,19 @@ pub struct PutObjectInput {
     pub user_metadata: HashMap<String, String>,
     /// Base64-encoded MD5 from the `Content-MD5` header, if provided.
     pub content_md5: Option<String>,
+    /// Client-provided checksums for validation (base64-encoded).
+    pub checksum_sha256: Option<String>,
+    pub checksum_sha1: Option<String>,
+    pub checksum_crc32: Option<String>,
+    pub checksum_crc32c: Option<String>,
 }
 
 /// Result of a PutObject operation.
 pub struct PutObjectResult {
     /// Quoted ETag, e.g. `"d41d8cd98f00b204e9800998ecf8427e"`.
     pub etag: String,
+    /// Computed checksums for all four S3 algorithms.
+    pub checksums: ChecksumValues,
 }
 
 /// Get an object's content and metadata.
@@ -36,7 +44,8 @@ pub async fn get_object(
     Ok(GetObjectResult { content, record })
 }
 
-/// Upload an object, computing ETag and optionally validating Content-MD5.
+/// Upload an object, computing ETag and checksums, optionally validating
+/// Content-MD5 and client-provided additional checksums.
 pub async fn put_object(
     storage: &FilesystemStorage,
     metadata: &MetadataStore,
@@ -53,9 +62,24 @@ pub async fn put_object(
         let md5_bytes = hex::decode(&result.md5_hex).map_err(|_| S3Error::InternalError)?;
         let computed = base64::engine::general_purpose::STANDARD.encode(&md5_bytes);
         if *client_md5 != computed {
-            // Digest mismatch — remove the file we just wrote.
             let _ = storage.delete(key).await;
             return Err(S3Error::BadDigest);
+        }
+    }
+
+    // Validate additional checksums if the client provided them.
+    let checks: &[(&Option<String>, &Option<String>)] = &[
+        (&input.checksum_sha256, &result.checksums.sha256),
+        (&input.checksum_sha1, &result.checksums.sha1),
+        (&input.checksum_crc32, &result.checksums.crc32),
+        (&input.checksum_crc32c, &result.checksums.crc32c),
+    ];
+    for (client, computed) in checks {
+        if let (Some(client_val), Some(computed_val)) = (client, computed) {
+            if client_val != computed_val {
+                let _ = storage.delete(key).await;
+                return Err(S3Error::BadDigest);
+            }
         }
     }
 
@@ -70,7 +94,10 @@ pub async fn put_object(
         size: Some(result.bytes_written as i64),
         file_mtime: Some(now),
         etag: Some(etag.clone()),
-        content_hash: Some(result.md5_hex.clone()),
+        checksum_sha256: result.checksums.sha256.clone(),
+        checksum_sha1: result.checksums.sha1.clone(),
+        checksum_crc32: result.checksums.crc32.clone(),
+        checksum_crc32c: result.checksums.crc32c.clone(),
         content_type: Some(input.content_type),
         last_modified: now,
         created_at: now,
@@ -84,7 +111,10 @@ pub async fn put_object(
     };
 
     metadata.upsert_object(&obj).await?;
-    Ok(PutObjectResult { etag })
+    Ok(PutObjectResult {
+        etag,
+        checksums: result.checksums,
+    })
 }
 
 /// Delete an object. S3 returns success even if the key doesn't exist.

@@ -175,7 +175,7 @@ pub async fn complete(
         last_modified: time::OffsetDateTime::now_utc(),
         created_at: time::OffsetDateTime::now_utc(),
         metadata: upload.metadata,
-        scan_level: 2, // Has metadata, needs L3 for content_hash
+        scan_level: 2, // Has metadata, needs L3 for checksums
         ..Default::default()
     };
 

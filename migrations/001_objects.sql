@@ -17,7 +17,12 @@ CREATE TABLE IF NOT EXISTS objects (
 
     -- L3 metadata (NULL until content-hashed)
     etag TEXT,                   -- stored WITH surrounding quotes, e.g. '"abc123"'
-    content_hash TEXT,
+
+    -- S3 checksums (base64-encoded, NULL until content-hashed)
+    checksum_sha256 TEXT,
+    checksum_sha1 TEXT,
+    checksum_crc32 TEXT,
+    checksum_crc32c TEXT,
 
     -- S3 metadata
     content_type TEXT DEFAULT 'application/octet-stream',
@@ -30,4 +35,4 @@ CREATE TABLE IF NOT EXISTS objects (
 );
 
 CREATE INDEX IF NOT EXISTS idx_objects_parent ON objects(parent_directory);
-CREATE INDEX IF NOT EXISTS idx_objects_content_hash ON objects(content_hash);
+CREATE INDEX IF NOT EXISTS idx_objects_checksum_sha256 ON objects(checksum_sha256);

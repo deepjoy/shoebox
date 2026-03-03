@@ -1,12 +1,16 @@
 use std::path::{Path, PathBuf};
 
+use base64::Engine;
 use bytes::Bytes;
 use futures::StreamExt;
 use md5::{Digest, Md5};
+use sha1::Sha1;
+use sha2::Sha256;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::SHOEBOX_DIR;
 use crate::error::S3Error;
+use crate::types::ChecksumValues;
 
 /// What a key points to on disk.
 #[derive(Debug)]
@@ -17,11 +21,13 @@ pub enum FileContent {
     Symlink { target: String, len: u64 },
 }
 
-/// Result of a successful write: bytes written and hex-encoded MD5 digest.
+/// Result of a successful write: bytes written, hex-encoded MD5 digest, and
+/// base64-encoded checksums for all four S3 additional checksum algorithms.
 #[must_use]
 pub struct WriteResult {
     pub bytes_written: u64,
     pub md5_hex: String,
+    pub checksums: ChecksumValues,
 }
 
 /// Filesystem-backed storage layer for a single bucket.
@@ -206,23 +212,39 @@ impl FilesystemStorage {
         }
 
         let mut file = tokio::fs::File::create(&path).await?;
-        let mut hasher = Md5::new();
+        let mut md5_hasher = Md5::new();
+        let mut sha256_hasher = Sha256::new();
+        let mut sha1_hasher = Sha1::new();
+        let mut crc32_hasher = crc32fast::Hasher::new();
+        let mut crc32c_value: u32 = 0;
         let mut written: u64 = 0;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|_| S3Error::InternalError)?;
-            hasher.update(&chunk);
+            md5_hasher.update(&chunk);
+            sha256_hasher.update(&chunk);
+            sha1_hasher.update(&chunk);
+            crc32_hasher.update(&chunk);
+            crc32c_value = crc32c::crc32c_append(crc32c_value, &chunk);
             file.write_all(&chunk).await?;
             written += chunk.len() as u64;
         }
 
         file.sync_all().await?;
 
-        let md5_hex = hex::encode(hasher.finalize());
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let md5_hex = hex::encode(md5_hasher.finalize());
+        let checksums = ChecksumValues {
+            sha256: Some(b64.encode(sha256_hasher.finalize())),
+            sha1: Some(b64.encode(sha1_hasher.finalize())),
+            crc32: Some(b64.encode(crc32_hasher.finalize().to_be_bytes())),
+            crc32c: Some(b64.encode(crc32c_value.to_be_bytes())),
+        };
 
         Ok(WriteResult {
             bytes_written: written,
             md5_hex,
+            checksums,
         })
     }
 
