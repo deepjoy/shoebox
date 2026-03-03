@@ -1,6 +1,8 @@
 -- Active queue: pending, running, and paused tasks.
 -- The UNIQUE(key) constraint provides key-based deduplication —
 -- submitting a task with an existing key is a no-op (INSERT OR IGNORE).
+-- When a duplicate is submitted while the existing task is running or paused,
+-- the requeue flag is set so the task re-runs after the current execution.
 CREATE TABLE IF NOT EXISTS tasks (
     id                   INTEGER PRIMARY KEY,
     task_type            TEXT    NOT NULL,
@@ -14,6 +16,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_error           TEXT,
     created_at           TEXT    NOT NULL DEFAULT (datetime('now')),
     started_at           TEXT,
+    requeue              INTEGER NOT NULL DEFAULT 0,
+    requeue_priority     INTEGER,
     UNIQUE(key)
 );
 

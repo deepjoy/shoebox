@@ -84,6 +84,8 @@ pub struct TaskRecord {
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
+    pub requeue: bool,
+    pub requeue_priority: Option<Priority>,
 }
 
 impl TaskRecord {
@@ -150,17 +152,19 @@ impl std::error::Error for TaskError {}
 pub enum SubmitOutcome {
     /// Task was inserted as new.
     Inserted(i64),
-    /// Duplicate key existed; its priority was upgraded (pending tasks only).
+    /// Duplicate key existed; its priority was upgraded (pending/paused tasks only).
     Upgraded(i64),
+    /// Duplicate key existed and is running/paused; marked for re-queue after completion.
+    Requeued(i64),
     /// Duplicate key existed; no changes were made.
     Duplicate,
 }
 
 impl SubmitOutcome {
-    /// Returns the task ID if the task was inserted or upgraded.
+    /// Returns the task ID if the task was inserted, upgraded, or requeued.
     pub fn id(&self) -> Option<i64> {
         match self {
-            Self::Inserted(id) | Self::Upgraded(id) => Some(*id),
+            Self::Inserted(id) | Self::Upgraded(id) | Self::Requeued(id) => Some(*id),
             Self::Duplicate => None,
         }
     }
