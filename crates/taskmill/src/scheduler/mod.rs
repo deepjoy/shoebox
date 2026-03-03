@@ -17,7 +17,7 @@ use crate::registry::{TaskExecutor, TaskTypeRegistry};
 use crate::resource::sampler::{SamplerConfig, SmoothedReader};
 use crate::resource::{ResourceReader, ResourceSampler};
 use crate::store::{StoreConfig, StoreError, TaskStore};
-use crate::task::{generate_dedup_key, TaskLookup, TaskSubmission, TypedTask};
+use crate::task::{generate_dedup_key, SubmitOutcome, TaskLookup, TaskSubmission, TypedTask};
 
 use dispatch::ActiveTaskMap;
 use gate::{DefaultDispatchGate, GateContext};
@@ -264,15 +264,15 @@ impl Scheduler {
         &self.inner.store
     }
 
-    /// Submit a task. Returns `Ok(Some(id))` if enqueued, `Ok(None)` if deduped.
+    /// Submit a task.
     ///
     /// If the task's priority meets the preemption threshold, running tasks
     /// with lower priority are preempted (their cancellation tokens are cancelled
     /// and they are paused in the store).
-    pub async fn submit(&self, sub: &TaskSubmission) -> Result<Option<i64>, StoreError> {
-        let id = self.inner.store.submit(sub).await?;
+    pub async fn submit(&self, sub: &TaskSubmission) -> Result<SubmitOutcome, StoreError> {
+        let outcome = self.inner.store.submit(sub).await?;
 
-        if id.is_some() {
+        if !matches!(outcome, SubmitOutcome::Duplicate) {
             // Preempt if this is a high-priority task.
             if sub.priority.value() <= self.inner.preempt_priority.value() {
                 self.inner
@@ -281,32 +281,35 @@ impl Scheduler {
                     .await;
             }
 
-            // Wake the scheduler loop so it picks up the new task immediately.
+            // Wake the scheduler loop so it picks up the new/upgraded task.
             self.inner.work_notify.notify_one();
         }
 
-        Ok(id)
+        Ok(outcome)
     }
 
     /// Submit multiple tasks in a single SQLite transaction.
     ///
-    /// Returns a `Vec` with one entry per input: `Some(id)` if inserted,
-    /// `None` if deduplicated. Preemption is triggered once at the end if
-    /// any inserted task has high enough priority.
+    /// Preemption is triggered once at the end if any inserted or upgraded
+    /// task has high enough priority.
     pub async fn submit_batch(
         &self,
         submissions: &[TaskSubmission],
-    ) -> Result<Vec<Option<i64>>, StoreError> {
+    ) -> Result<Vec<SubmitOutcome>, StoreError> {
         let results = self.inner.store.submit_batch(submissions).await?;
 
-        // Find the highest (lowest numeric value) priority among newly inserted tasks.
+        // Find the highest (lowest numeric value) priority among tasks that
+        // were inserted or had their priority upgraded.
         let best_priority = submissions
             .iter()
             .zip(results.iter())
-            .filter_map(|(sub, id)| id.map(|_| sub.priority))
+            .filter(|(_, outcome)| !matches!(outcome, SubmitOutcome::Duplicate))
+            .map(|(sub, _)| sub.priority)
             .min_by_key(|p| p.value());
 
-        let any_inserted = results.iter().any(|id| id.is_some());
+        let any_changed = results
+            .iter()
+            .any(|o| !matches!(o, SubmitOutcome::Duplicate));
 
         if let Some(priority) = best_priority {
             if priority.value() <= self.inner.preempt_priority.value() {
@@ -317,7 +320,7 @@ impl Scheduler {
             }
         }
 
-        if any_inserted {
+        if any_changed {
             self.inner.work_notify.notify_one();
         }
 
@@ -326,10 +329,23 @@ impl Scheduler {
 
     /// Submit a [`TypedTask`], handling serialization automatically.
     ///
-    /// Equivalent to converting the task into a [`TaskSubmission`] via `TryFrom`
-    /// and calling [`submit`](Self::submit).
-    pub async fn submit_typed<T: TypedTask>(&self, task: &T) -> Result<Option<i64>, StoreError> {
+    /// Uses the priority from [`TypedTask::priority()`].
+    pub async fn submit_typed<T: TypedTask>(&self, task: &T) -> Result<SubmitOutcome, StoreError> {
         let sub = TaskSubmission::from_typed(task)?;
+        self.submit(&sub).await
+    }
+
+    /// Submit a [`TypedTask`] with an explicit priority override.
+    ///
+    /// The provided `priority` replaces whatever [`TypedTask::priority()`]
+    /// would return, keeping priority out of the serialized payload.
+    pub async fn submit_typed_at<T: TypedTask>(
+        &self,
+        task: &T,
+        priority: Priority,
+    ) -> Result<SubmitOutcome, StoreError> {
+        let mut sub = TaskSubmission::from_typed(task)?;
+        sub.priority = priority;
         self.submit(&sub).await
     }
 
@@ -1090,8 +1106,8 @@ mod tests {
 
         let first = sched.submit(&sub).await.unwrap();
         let second = sched.submit(&sub).await.unwrap();
-        assert!(first.is_some());
-        assert!(second.is_none());
+        assert!(first.is_inserted());
+        assert_eq!(second, SubmitOutcome::Duplicate);
     }
 
     #[tokio::test]
@@ -1117,6 +1133,7 @@ mod tests {
             })
             .await
             .unwrap()
+            .id()
             .unwrap();
 
         let cancelled = sched.cancel(id).await.unwrap();
@@ -1147,6 +1164,7 @@ mod tests {
             })
             .await
             .unwrap()
+            .id()
             .unwrap();
 
         // Dispatch it so it's running.
@@ -1237,13 +1255,13 @@ mod tests {
         let task = Thumb {
             path: "/a.jpg".into(),
         };
-        let id = sched.submit_typed(&task).await.unwrap();
-        assert!(id.is_some());
+        let outcome = sched.submit_typed(&task).await.unwrap();
+        assert!(outcome.is_inserted());
 
         // Verify the stored record has correct metadata.
         let record = sched
             .store()
-            .task_by_id(id.unwrap())
+            .task_by_id(outcome.id().unwrap())
             .await
             .unwrap()
             .expect("task should exist");

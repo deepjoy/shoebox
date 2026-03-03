@@ -282,7 +282,6 @@ impl Shoebox {
                 bucket: bucket.to_string(),
                 scope: ScanScope::Bucket,
                 target_level,
-                background: false,
             })
             .await
             .map_err(|_| S3Error::InternalError)?;
@@ -578,7 +577,6 @@ impl ShoeboxBuilder {
                 .submit_typed(&ScanL2Task {
                     bucket: r.name.clone(),
                     cursor: None,
-                    background: false,
                 })
                 .await;
             let _ = scheduler
@@ -586,7 +584,6 @@ impl ShoeboxBuilder {
                     bucket: r.name.clone(),
                     cursor: None,
                     bytes_per_sec: None,
-                    background: false,
                 })
                 .await;
 
