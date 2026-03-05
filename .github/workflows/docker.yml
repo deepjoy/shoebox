@@ -3,6 +3,7 @@ name: Docker
 on:
   push:
     tags: ['v*']
+  pull_request:  # TODO: remove after testing
   workflow_dispatch:
 
 env:
