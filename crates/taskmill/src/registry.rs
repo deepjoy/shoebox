@@ -39,10 +39,7 @@ impl StateMap {
 
     /// Insert a state value. Overwrites any previous value of the same type.
     pub async fn insert<T: Send + Sync + 'static>(&self, value: Arc<T>) {
-        self.inner
-            .write()
-            .await
-            .insert(TypeId::of::<T>(), value);
+        self.inner.write().await.insert(TypeId::of::<T>(), value);
     }
 }
 

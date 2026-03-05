@@ -205,7 +205,13 @@ impl Scheduler {
         policy: ThrottlePolicy,
     ) -> Self {
         let gate = Box::new(DefaultDispatchGate::new(pressure, policy));
-        Self::with_gate(store, config, registry, gate, Arc::new(crate::registry::StateMap::new()))
+        Self::with_gate(
+            store,
+            config,
+            registry,
+            gate,
+            Arc::new(crate::registry::StateMap::new()),
+        )
     }
 
     /// Create a scheduler with a custom dispatch gate.
@@ -924,7 +930,9 @@ impl SchedulerBuilder {
             .unwrap_or_else(ThrottlePolicy::default_three_tier);
         let gate = Box::new(DefaultDispatchGate::new(pressure, policy));
 
-        let app_state = Arc::new(crate::registry::StateMap::from_entries(self.app_state_entries));
+        let app_state = Arc::new(crate::registry::StateMap::from_entries(
+            self.app_state_entries,
+        ));
 
         let scheduler =
             Scheduler::with_gate(store, self.config, Arc::new(registry), gate, app_state);
