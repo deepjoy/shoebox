@@ -87,7 +87,8 @@ A complete list of taskmill's capabilities.
 
 ## Application State
 
-- **Shared services** — register shared state (HTTP clients, caches, DB pools) on the builder via `.app_state()`. Access from any executor via `ctx.state::<T>()`.
+- **Type-keyed state map** — register multiple state types on the builder via `.app_state()` / `.app_state_arc()`. Each type is keyed by `TypeId`; access from any executor via `ctx.state::<T>()`.
+- **Post-build injection** — call `scheduler.register_state(arc)` after build to let libraries inject their own state into a shared scheduler.
 - **Arc-based sharing** — state is wrapped in `Arc` internally; all tasks share the same instance.
 
 ## History & Pruning

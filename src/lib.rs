@@ -39,6 +39,35 @@ use crate::services::{tagging_service, AppState, LoadedBucket};
 use crate::storage::filesystem::FilesystemStorage;
 use std::pin::Pin;
 
+/// Register shoebox's scan executors on an external [`taskmill::SchedulerBuilder`].
+///
+/// Call this when building a shared scheduler for use with
+/// [`ShoeboxBuilder::scheduler`]. Registers the L1/L2/L3 scan executors
+/// so the scheduler can process scan tasks submitted by shoebox.
+///
+/// # Example
+///
+/// ```ignore
+/// let builder = shoebox::register_scan_executors(
+///     taskmill::Scheduler::builder()
+///         .store_path("app.db")
+///         .max_concurrency(4),
+/// );
+/// let scheduler = builder.build().await?;
+///
+/// let shoebox = Shoebox::builder()
+///     .bucket("/photos")
+///     .scheduler("photos", scheduler.clone())
+///     .build()
+///     .await?;
+/// ```
+pub fn register_scan_executors(builder: taskmill::SchedulerBuilder) -> taskmill::SchedulerBuilder {
+    builder
+        .typed_executor::<ScanL1Task, _>(Arc::new(ScanL1Executor))
+        .typed_executor::<ScanL2Task, _>(Arc::new(ScanL2Executor))
+        .typed_executor::<ScanL3Task, _>(Arc::new(ScanL3Executor))
+}
+
 /// A boxed, sendable stream of list entries.
 pub type ListStream<'a> =
     Pin<Box<dyn futures::Stream<Item = Result<ListEntry, S3Error>> + Send + 'a>>;
@@ -384,6 +413,7 @@ pub struct ShoeboxBuilder {
     data_dir: Option<PathBuf>,
     global_config: Option<GlobalConfig>,
     config_file: Option<PathBuf>,
+    external_schedulers: HashMap<String, taskmill::Scheduler>,
 }
 
 #[cfg(test)]
@@ -429,7 +459,20 @@ impl ShoeboxBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<Shoebox, ShoeboxError> {
+    /// Use a pre-built scheduler for a bucket instead of creating one internally.
+    ///
+    /// The scheduler must already have scan executors registered (see
+    /// [`register_scan_executors`]). Shoebox will inject its scan state via
+    /// [`taskmill::Scheduler::register_state`] and submit initial scan
+    /// tasks, but will **not** spawn the `run()` loop — the caller manages
+    /// the scheduler lifecycle.
+    pub fn scheduler(mut self, bucket: &str, scheduler: taskmill::Scheduler) -> Self {
+        self.external_schedulers
+            .insert(bucket.to_string(), scheduler);
+        self
+    }
+
+    pub async fn build(mut self) -> Result<Shoebox, ShoeboxError> {
         // Resolve global config: explicit object takes priority over file
         let global_config = match (self.global_config, self.config_file) {
             (Some(gc), _) => Some(gc),
@@ -544,33 +587,43 @@ impl ShoeboxBuilder {
         let mut buckets = HashMap::new();
 
         for r in resolved {
-            let taskmill_db = r.shoebox_dir.join("taskmill.db");
-            let taskmill_db_str = taskmill_db.to_string_lossy().to_string();
+            let external = self.external_schedulers.remove(&r.name);
 
-            let scheduler = taskmill::Scheduler::builder()
-                .store_path(&taskmill_db_str)
-                .typed_executor::<ScanL1Task, _>(Arc::new(ScanL1Executor))
-                .typed_executor::<ScanL2Task, _>(Arc::new(ScanL2Executor))
-                .typed_executor::<ScanL3Task, _>(Arc::new(ScanL3Executor))
-                .max_concurrency(1)
-                .pressure_source(Box::new(ScannerResources::new(100)))
-                .throttle_policy(taskmill::ThrottlePolicy::default_three_tier())
-                .app_state_arc(scan_app_state.clone())
-                .build()
-                .await
-                .map_err(|e| ShoeboxError::Other(e.into()))?;
+            let scheduler = if let Some(ext) = external {
+                // External scheduler — inject scan state, caller manages run loop.
+                ext.register_state(scan_app_state.clone()).await;
+                ext
+            } else {
+                // Internal scheduler — build and spawn.
+                let taskmill_db = r.shoebox_dir.join("taskmill.db");
+                let taskmill_db_str = taskmill_db.to_string_lossy().to_string();
+
+                let sched = taskmill::Scheduler::builder()
+                    .store_path(&taskmill_db_str)
+                    .typed_executor::<ScanL1Task, _>(Arc::new(ScanL1Executor))
+                    .typed_executor::<ScanL2Task, _>(Arc::new(ScanL2Executor))
+                    .typed_executor::<ScanL3Task, _>(Arc::new(ScanL3Executor))
+                    .max_concurrency(1)
+                    .pressure_source(Box::new(ScannerResources::new(100)))
+                    .throttle_policy(taskmill::ThrottlePolicy::default_three_tier())
+                    .app_state_arc(scan_app_state.clone())
+                    .build()
+                    .await
+                    .map_err(|e| ShoeboxError::Other(e.into()))?;
+
+                tokio::spawn({
+                    let s = sched.clone();
+                    let token = shutdown_token.child_token();
+                    async move { s.run(token).await }
+                });
+
+                sched
+            };
 
             // Fulfil the OnceLock so executors can submit continuation tasks.
             if let Some(bucket_state) = scan_app_state.buckets.get(&r.name) {
                 let _ = bucket_state.scheduler.set(scheduler.clone());
             }
-
-            // Spawn the scheduler run loop.
-            tokio::spawn({
-                let sched = scheduler.clone();
-                let token = shutdown_token.child_token();
-                async move { sched.run(token).await }
-            });
 
             // Submit initial background L2+L3 scan tasks.
             let _ = scheduler

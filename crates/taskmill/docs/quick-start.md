@@ -23,7 +23,7 @@ Each task type needs a `TaskExecutor` implementation. The executor receives a `T
 - `record` — the full `TaskRecord` with payload (up to 1 MiB), priority, retry count, etc.
 - `token` — a `CancellationToken` for preemption support
 - `progress` — a `ProgressReporter` for reporting progress back to the scheduler
-- Shared application state (if registered)
+- Shared application state (if registered via `.app_state()` or `register_state()`)
 
 ```rust
 use std::sync::Arc;

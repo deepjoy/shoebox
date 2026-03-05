@@ -392,21 +392,29 @@ in-flight tasks to pending, the scheduler needs the registry to re-dispatch them
 ## Application state
 
 Executors often need shared services. Rather than capturing `Arc<T>` per executor,
-the scheduler supports a single typed state slot:
+the scheduler provides a type-keyed `StateMap` that supports multiple state types:
 
 ```rust
 Scheduler::builder()
     .app_state(MyServices { http, db, cache })
+    .app_state(FeatureFlags { dark_mode: true })
     .build().await?;
 
 // In the executor:
 let svc = ctx.state::<MyServices>().expect("state not set");
+let flags = ctx.state::<FeatureFlags>().expect("flags not set");
 ```
 
-State flows: `SchedulerBuilder` → `Arc<dyn Any + Send + Sync>` in
-`SchedulerInner` → cloned (cheaply, via `Arc`) into each `TaskContext` →
-downcast via `ctx.state::<T>()`. This mirrors Axum's `State<T>` / Tauri's
-`State<T>` pattern.
+State flows: `SchedulerBuilder` collects `(TypeId, Arc<dyn Any>)` entries →
+assembled into `Arc<StateMap>` at build time → a `StateSnapshot` (lock-free
+`HashMap` clone) is taken once per dispatch and placed in `TaskContext` →
+executors call `ctx.state::<T>()` which does a `TypeId` lookup + downcast.
+
+Libraries that embed a shared scheduler can inject their own state **after**
+build via `scheduler.register_state(Arc::new(LibState { .. })).await`. This
+is how shoebox injects `ScanAppState` into an externally-provided scheduler.
+
+This mirrors Axum's `State<T>` / Tauri's `State<T>` pattern.
 
 ## Global pause / resume
 

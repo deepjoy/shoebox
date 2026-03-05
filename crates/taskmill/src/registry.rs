@@ -1,12 +1,75 @@
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::scheduler::ProgressReporter;
 use crate::task::{TaskError, TaskRecord, TaskResult, TypedTask};
+
+// ── State Map ────────────────────────────────────────────────────────
+
+/// Type-keyed map of shared application state.
+///
+/// Multiple state types can be registered (one value per concrete type).
+/// Executors retrieve them via [`TaskContext::state::<T>()`]. This is the
+/// same pattern used by Axum `Extensions` and Tauri `State`.
+///
+/// The map supports post-build insertion via [`Scheduler::register_state`]
+/// so that library consumers (e.g. shoebox inside a Tauri app) can inject
+/// state after the scheduler has been constructed by the parent.
+#[derive(Default)]
+pub struct StateMap {
+    inner: RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
+}
+
+impl StateMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a `StateMap` from pre-collected entries.
+    pub(crate) fn from_entries(entries: Vec<(TypeId, Arc<dyn Any + Send + Sync>)>) -> Self {
+        Self {
+            inner: RwLock::new(entries.into_iter().collect()),
+        }
+    }
+
+    /// Insert a state value. Overwrites any previous value of the same type.
+    pub async fn insert<T: Send + Sync + 'static>(&self, value: Arc<T>) {
+        self.inner.write().await.insert(TypeId::of::<T>(), value);
+    }
+}
+
+/// Snapshot of state for passing into a [`TaskContext`].
+///
+/// Created by cloning the inner map under the lock once, then used
+/// lock-free for the lifetime of the task execution.
+#[derive(Clone, Default)]
+pub(crate) struct StateSnapshot {
+    entries: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+}
+
+impl StateSnapshot {
+    pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.entries
+            .get(&TypeId::of::<T>())
+            .and_then(|arc| arc.downcast_ref::<T>())
+    }
+}
+
+impl StateMap {
+    /// Take a lock-free snapshot for use inside a task context.
+    pub(crate) async fn snapshot(&self) -> StateSnapshot {
+        StateSnapshot {
+            entries: self.inner.read().await.clone(),
+        }
+    }
+}
+
+// ── Task Context ─────────────────────────────────────────────────────
 
 /// Execution context passed to a [`TaskExecutor`].
 ///
@@ -22,7 +85,7 @@ pub struct TaskContext {
     /// Report progress back to the scheduler (0.0–1.0).
     pub progress: ProgressReporter,
     /// Shared application state set via [`SchedulerBuilder::app_state`].
-    pub(crate) app_state: Option<Arc<dyn Any + Send + Sync>>,
+    pub(crate) app_state: StateSnapshot,
 }
 
 impl TaskContext {
@@ -35,11 +98,10 @@ impl TaskContext {
     }
 
     /// Retrieve shared application state registered via
-    /// [`SchedulerBuilder::app_state`].
+    /// [`SchedulerBuilder::app_state`] or [`Scheduler::register_state`].
     ///
-    /// Returns `None` if no state was registered or if the type doesn't
-    /// match. This mirrors the state extraction pattern used by Axum and
-    /// Tauri.
+    /// Returns `None` if the type was never registered. Multiple types can
+    /// coexist — each is keyed by its concrete `TypeId`.
     ///
     /// # Example
     ///
@@ -51,7 +113,7 @@ impl TaskContext {
     /// svc.db.query("...").await?;
     /// ```
     pub fn state<T: Send + Sync + 'static>(&self) -> Option<&T> {
-        self.app_state.as_ref()?.downcast_ref::<T>()
+        self.app_state.get::<T>()
     }
 }
 

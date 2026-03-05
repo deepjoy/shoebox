@@ -2,7 +2,6 @@ pub(crate) mod dispatch;
 pub(crate) mod gate;
 pub mod progress;
 
-use std::any::Any;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
@@ -171,8 +170,8 @@ struct SchedulerInner {
     event_tx: tokio::sync::broadcast::Sender<SchedulerEvent>,
     /// Token to cancel the background resource sampler (if started).
     sampler_token: CancellationToken,
-    /// Shared application state passed to every executor via [`TaskContext::state`].
-    app_state: Option<Arc<dyn Any + Send + Sync>>,
+    /// Type-keyed application state passed to every executor via [`TaskContext::state`].
+    app_state: Arc<crate::registry::StateMap>,
     /// Global pause flag — when `true`, the run loop skips dispatching.
     paused: AtomicBool,
     /// Wakes the run loop when new work is submitted or the scheduler is resumed.
@@ -206,7 +205,13 @@ impl Scheduler {
         policy: ThrottlePolicy,
     ) -> Self {
         let gate = Box::new(DefaultDispatchGate::new(pressure, policy));
-        Self::with_gate(store, config, registry, gate, None)
+        Self::with_gate(
+            store,
+            config,
+            registry,
+            gate,
+            Arc::new(crate::registry::StateMap::new()),
+        )
     }
 
     /// Create a scheduler with a custom dispatch gate.
@@ -215,7 +220,7 @@ impl Scheduler {
         config: SchedulerConfig,
         registry: Arc<TaskTypeRegistry>,
         gate: Box<dyn gate::DispatchGate>,
-        app_state: Option<Arc<dyn Any + Send + Sync>>,
+        app_state: Arc<crate::registry::StateMap>,
     ) -> Self {
         let (event_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
@@ -262,6 +267,15 @@ impl Scheduler {
     /// Get a reference to the underlying store for direct queries.
     pub fn store(&self) -> &TaskStore {
         &self.inner.store
+    }
+
+    /// Register shared application state after the scheduler has been built.
+    ///
+    /// This is useful when library code (e.g. shoebox) needs to inject its
+    /// own state into a scheduler that was constructed by a parent
+    /// application. Multiple types can coexist — each is keyed by `TypeId`.
+    pub async fn register_state<T: Send + Sync + 'static>(&self, state: Arc<T>) {
+        self.inner.app_state.insert(state).await;
     }
 
     /// Submit a task.
@@ -476,7 +490,7 @@ impl Scheduler {
             self.inner.active.clone(),
             self.inner.event_tx.clone(),
             self.inner.max_retries,
-            self.inner.app_state.clone(),
+            self.inner.app_state.snapshot().await,
         )
         .await;
 
@@ -716,7 +730,7 @@ pub struct SchedulerBuilder {
     enable_resource_monitoring: bool,
     custom_sampler: Option<Box<dyn ResourceSampler>>,
     sampler_config: SamplerConfig,
-    app_state: Option<Arc<dyn Any + Send + Sync>>,
+    app_state_entries: Vec<(std::any::TypeId, Arc<dyn std::any::Any + Send + Sync>)>,
 }
 
 impl SchedulerBuilder {
@@ -732,7 +746,7 @@ impl SchedulerBuilder {
             enable_resource_monitoring: false,
             custom_sampler: None,
             sampler_config: SamplerConfig::default(),
-            app_state: None,
+            app_state_entries: Vec::new(),
         }
     }
 
@@ -838,8 +852,12 @@ impl SchedulerBuilder {
         self
     }
 
-    /// Set shared application state accessible from every executor via
+    /// Register shared application state accessible from every executor via
     /// [`TaskContext::state`].
+    ///
+    /// Multiple types can be registered — each is keyed by its concrete
+    /// `TypeId`. Calling this twice with the same `T` overwrites the
+    /// previous value.
     ///
     /// The state is stored as `Arc<T>` internally, so it is shared (not
     /// cloned) across all running tasks. This mirrors how Axum, Actix, and
@@ -856,20 +874,23 @@ impl SchedulerBuilder {
     ///     .build()
     ///     .await?;
     /// ```
-    pub fn app_state<T: Send + Sync + 'static>(mut self, state: T) -> Self {
-        self.app_state = Some(Arc::new(state));
-        self
+    pub fn app_state<T: Send + Sync + 'static>(self, state: T) -> Self {
+        self.app_state_arc(Arc::new(state))
     }
 
-    /// Set shared application state from a pre-existing `Arc`.
+    /// Register shared application state from a pre-existing `Arc`.
     ///
     /// Use this instead of [`app_state`](Self::app_state) when you already
     /// have an `Arc<T>` and need to retain a handle for use outside the
     /// scheduler (e.g. to populate `OnceLock` fields after build). Avoids
     /// double-wrapping (`Arc<Arc<T>>`), which would cause
     /// [`TaskContext::state`] downcasts to fail.
+    ///
+    /// Multiple types can be registered — each is keyed by its concrete
+    /// `TypeId`.
     pub fn app_state_arc<T: Send + Sync + 'static>(mut self, state: Arc<T>) -> Self {
-        self.app_state = Some(state);
+        self.app_state_entries
+            .push((std::any::TypeId::of::<T>(), state));
         self
     }
 
@@ -909,8 +930,12 @@ impl SchedulerBuilder {
             .unwrap_or_else(ThrottlePolicy::default_three_tier);
         let gate = Box::new(DefaultDispatchGate::new(pressure, policy));
 
+        let app_state = Arc::new(crate::registry::StateMap::from_entries(
+            self.app_state_entries,
+        ));
+
         let scheduler =
-            Scheduler::with_gate(store, self.config, Arc::new(registry), gate, self.app_state);
+            Scheduler::with_gate(store, self.config, Arc::new(registry), gate, app_state);
 
         // Set up resource monitoring.
         if self.enable_resource_monitoring {

@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -186,7 +185,7 @@ pub(crate) async fn spawn_task(
     active: ActiveTaskMap,
     event_tx: tokio::sync::broadcast::Sender<SchedulerEvent>,
     max_retries: i32,
-    app_state: Option<Arc<dyn Any + Send + Sync>>,
+    app_state: crate::registry::StateSnapshot,
 ) {
     let child_token = CancellationToken::new();
 
