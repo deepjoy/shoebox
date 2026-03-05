@@ -32,7 +32,7 @@ pub mod task;
 // Convenience re-exports.
 pub use backpressure::{CompositePressure, PressureSource, ThrottlePolicy};
 pub use priority::Priority;
-pub use registry::{TaskContext, TaskExecutor};
+pub use registry::{StateMap, TaskContext, TaskExecutor};
 pub use resource::sampler::{SamplerConfig, SmoothedReader};
 pub use resource::{ResourceReader, ResourceSampler, ResourceSnapshot};
 pub use scheduler::{

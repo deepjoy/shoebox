@@ -53,6 +53,35 @@ async fn main() {
 }
 ```
 
+## Shared scheduler (library embedding)
+
+A single `Scheduler` can be shared across an application and any libraries it embeds.
+Multiple state types can coexist — each is keyed by its concrete `TypeId`, and new state
+can be injected after the scheduler is built via `register_state`.
+
+```rust
+use std::sync::Arc;
+use taskmill::Scheduler;
+
+// The host app builds the scheduler and registers its own executors.
+let scheduler = Scheduler::builder()
+    .store_path("app.db")
+    .executor("thumbnail", Arc::new(ThumbnailGenerator))
+    .app_state(MyAppServices { /* ... */ })
+    .max_concurrency(4)
+    .build()
+    .await
+    .unwrap();
+
+// A library can inject its own state after build.
+scheduler.register_state(Arc::new(LibraryState { /* ... */ })).await;
+
+// Both the host and the library submit tasks to the same queue.
+// The host manages the run loop.
+let token = CancellationToken::new();
+scheduler.run(token).await;
+```
+
 ## Features
 
 - **SQLite persistence** — tasks survive restarts; crash recovery requeues interrupted work
@@ -68,7 +97,7 @@ async fn main() {
 - **Batch submission** — bulk enqueue in a single SQLite transaction
 - **Graceful shutdown** — configurable drain timeout before force-cancellation
 - **Global pause/resume** — pause all work when the app is backgrounded
-- **Shared application state** — inject services and access from any executor
+- **Type-keyed application state** — register multiple state types, inject pre- or post-build
 - **Clone-friendly** — `Scheduler` is `Clone` via `Arc` for easy sharing
 - **Serde on all public types** — ready for Tauri IPC
 
