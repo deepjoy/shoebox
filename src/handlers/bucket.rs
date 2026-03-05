@@ -109,7 +109,7 @@ async fn get_bucket_versioning(
 
 /// POST /{bucket} dispatcher — routes on query string.
 ///
-/// Currently `?delete` is the only supported POST operation.
+/// Supported operations: `?delete`, `?sync`.
 pub async fn post_bucket_dispatcher(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
@@ -118,6 +118,11 @@ pub async fn post_bucket_dispatcher(
 ) -> Result<Response, S3Error> {
     if params.contains_key("delete") {
         return delete_objects(State(state), Path(bucket), body)
+            .await
+            .map(IntoResponse::into_response);
+    }
+    if params.contains_key("sync") {
+        return super::sync::sync_bucket(State(state), Path(bucket))
             .await
             .map(IntoResponse::into_response);
     }

@@ -16,6 +16,10 @@ pub struct CopyConditions {
 
 /// Result of a successful CopyObject.
 pub struct CopyResult {
+    /// The persisted object ID (from the `objects.id` column).
+    pub object_id: String,
+    /// Size of the copied object in bytes.
+    pub size: i64,
     pub etag: String,
     pub last_modified: OffsetDateTime,
 }
@@ -75,9 +79,11 @@ pub async fn copy_object(
         ..Default::default()
     };
 
-    dst_metadata.upsert_object(&dst_record).await?;
+    let object_id = dst_metadata.upsert_object(&dst_record).await?;
 
     Ok(CopyResult {
+        object_id,
+        size: src_record.size.unwrap_or(0),
         etag: src_record.etag.unwrap_or_default(),
         last_modified: dst_record.last_modified,
     })
