@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/deepjoy/shoebox/compare/shoebox-v0.2.1...shoebox-v0.3.0) - 2026-03-05
+
+### Added
+
+- add duplicate detection, integrity checking, and directory comparison ([#49](https://github.com/deepjoy/shoebox/pull/49))
+- add sync endpoint with move detection and inode tracking ([#48](https://github.com/deepjoy/shoebox/pull/48))
+- *(taskmill)* type-keyed state map with post-build injection ([#46](https://github.com/deepjoy/shoebox/pull/46))
+- add S3 additional checksums (SHA-256, SHA-1, CRC32, CRC32C) ([#42](https://github.com/deepjoy/shoebox/pull/42))
+- *(taskmill)* add adaptive priority task scheduler with IO-aware concurrency ([#38](https://github.com/deepjoy/shoebox/pull/38))
+
+### Other
+
+- *(docker)* enable PR trigger and copy crates dir in Dockerfile ([#47](https://github.com/deepjoy/shoebox/pull/47))
+- *(taskmill)* separate priority from task payload, upgrade on dedup ([#44](https://github.com/deepjoy/shoebox/pull/44))
+- remove versioning_enabled field from BucketConfig ([#43](https://github.com/deepjoy/shoebox/pull/43))
+- *(scanner)* migrate from custom scheduler to taskmill ([#41](https://github.com/deepjoy/shoebox/pull/41))
+
 ## [0.2.1](https://github.com/deepjoy/shoebox/compare/v0.2.0...v0.2.1) - 2026-02-26
 
 ### Fixed
