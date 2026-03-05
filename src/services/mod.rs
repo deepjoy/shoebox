@@ -1,5 +1,8 @@
 pub mod bucket_service;
 pub mod copy_service;
+pub mod duplicates_service;
+pub mod integrity_service;
+pub mod merge_service;
 pub mod multipart_service;
 pub mod object_service;
 pub mod sync_service;

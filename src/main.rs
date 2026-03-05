@@ -103,6 +103,47 @@ enum Commands {
         #[command(subcommand)]
         action: PresignAction,
     },
+
+    /// Run an integrity check on a bucket.
+    IntegrityCheck {
+        /// Path to the bucket directory.
+        bucket_path: PathBuf,
+        /// Only check objects with this key prefix.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+
+    /// Find duplicate files in a bucket (or across all buckets with --global).
+    Duplicates {
+        /// Path to the bucket directory (omit for --global).
+        bucket_path: Option<PathBuf>,
+        /// Search across all configured buckets.
+        #[arg(long)]
+        global: bool,
+        /// Maximum number of duplicate groups to return.
+        #[arg(long, default_value_t = 100)]
+        max_results: i32,
+        /// Allow partial results when scan is incomplete.
+        #[arg(long)]
+        allow_partial: bool,
+        /// Output format.
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+
+    /// Compare two directories across buckets.
+    CompareDirs {
+        /// Left path: BUCKET_PATH/PREFIX
+        left: String,
+        /// Right path: BUCKET_PATH/PREFIX
+        right: String,
+        /// Output format.
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -347,6 +388,171 @@ async fn handle_command(command: Commands) -> Result<(), Box<dyn std::error::Err
             println!("Renamed {} -> {}", source_key, dest_key);
         }
 
+        Commands::IntegrityCheck {
+            bucket_path,
+            scope,
+            format,
+        } => {
+            let shoebox = shoebox::Shoebox::builder()
+                .bucket(&bucket_path)
+                .build()
+                .await?;
+
+            let bucket_name = bucket_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("Invalid bucket path")?;
+
+            let result = shoebox
+                .check_integrity(bucket_name, scope.as_deref())
+                .await
+                .map_err(|e| format!("Integrity check failed: {}", e))?;
+
+            if format == "json" {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| "serialization error".into())
+                );
+            } else {
+                println!("Integrity Check: {}", result.check_id);
+                println!("Status: {}", result.status);
+                println!(
+                    "Files checked: {} ({} bytes)",
+                    result.files_checked, result.bytes_checked
+                );
+                println!("Files OK: {}", result.files_ok);
+                if result.discrepancies.is_empty() {
+                    println!("No discrepancies found.");
+                } else {
+                    println!("Discrepancies ({}):", result.discrepancies.len());
+                    for d in &result.discrepancies {
+                        println!("  {} — {} ({})", d.key, d.reason, d.object_id);
+                    }
+                }
+            }
+        }
+
+        Commands::Duplicates {
+            bucket_path,
+            global: _,
+            max_results,
+            allow_partial,
+            format,
+        } => {
+            let bucket_path =
+                bucket_path.ok_or("bucket_path is required (--global not yet supported in CLI)")?;
+            let shoebox = shoebox::Shoebox::builder()
+                .bucket(&bucket_path)
+                .build()
+                .await?;
+
+            let bucket_name = bucket_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("Invalid bucket path")?;
+
+            let report = shoebox
+                .find_bucket_duplicates(bucket_name, max_results, allow_partial)
+                .await
+                .map_err(|e| format!("Duplicate search failed: {}", e))?;
+
+            if format == "json" {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .unwrap_or_else(|_| "serialization error".into())
+                );
+            } else {
+                if report.duplicates.is_empty() {
+                    println!("No duplicates found in bucket '{}'.", bucket_name);
+                } else {
+                    println!(
+                        "Found {} duplicate group(s) in bucket '{}':",
+                        report.duplicates.len(),
+                        bucket_name
+                    );
+                    for (i, group) in report.duplicates.iter().enumerate() {
+                        let wasted = group.size * (group.files.len() as i64 - 1);
+                        println!(
+                            "\n  Group {} — {} ({} bytes each, {} wasted):",
+                            i + 1,
+                            &group.checksum_sha256[..16],
+                            group.size,
+                            wasted,
+                        );
+                        for f in &group.files {
+                            println!("    {} ({})", f.key, f.object_id);
+                        }
+                    }
+                }
+                if !report.scan_complete {
+                    println!("\nWarning: Scan incomplete — results may be partial.");
+                }
+            }
+        }
+
+        Commands::CompareDirs {
+            left,
+            right,
+            format,
+        } => {
+            // Parse "bucket_path/prefix" into path and prefix
+            let (left_path, left_prefix) = parse_dir_arg(&left)?;
+            let (right_path, right_prefix) = parse_dir_arg(&right)?;
+
+            let mut builder = shoebox::Shoebox::builder();
+            builder = builder.bucket(&left_path);
+            if left_path != right_path {
+                builder = builder.bucket(&right_path);
+            }
+            let shoebox = builder.build().await?;
+
+            let left_bucket = left_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("Invalid left bucket path")?;
+            let right_bucket = right_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("Invalid right bucket path")?;
+
+            let comparison = shoebox
+                .compare_dirs(left_bucket, &left_prefix, right_bucket, &right_prefix)
+                .await
+                .map_err(|e| format!("Compare failed: {}", e))?;
+
+            if format == "json" {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&comparison)
+                        .unwrap_or_else(|_| "serialization error".into())
+                );
+            } else {
+                println!(
+                    "Comparing {}/{} vs {}/{}",
+                    left_bucket, left_prefix, right_bucket, right_prefix
+                );
+                println!("Identical: {}", comparison.identical);
+                println!("  Files identical: {}", comparison.summary.files_identical);
+                println!("  Only in left: {}", comparison.summary.files_only_in_left);
+                println!(
+                    "  Only in right: {}",
+                    comparison.summary.files_only_in_right
+                );
+                println!(
+                    "  Different content: {}",
+                    comparison.summary.files_different
+                );
+                if !comparison.differences.is_empty() {
+                    println!("\nDifferences:");
+                    for d in &comparison.differences {
+                        println!("  {} — {}", d.key, d.status);
+                    }
+                }
+            }
+        }
+
         Commands::Presign { action } => match action {
             PresignAction::Get {
                 bucket,
@@ -412,6 +618,34 @@ async fn get_first_credential(
         .into_iter()
         .next()
         .ok_or_else(|| "No credentials found for this bucket".into())
+}
+
+/// Parse a CLI directory argument like "/path/to/bucket/some/prefix" into
+/// (bucket_path, prefix). The bucket_path is the first path component that
+/// is an existing directory, and the rest is the prefix.
+fn parse_dir_arg(arg: &str) -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
+    let path = PathBuf::from(arg);
+    // Walk up until we find an existing directory
+    let mut bucket_path = path.clone();
+    let mut prefix_parts = Vec::new();
+    while !bucket_path.is_dir() {
+        if let Some(name) = bucket_path.file_name() {
+            prefix_parts.push(name.to_string_lossy().to_string());
+            bucket_path = bucket_path
+                .parent()
+                .ok_or_else(|| format!("Cannot find bucket directory in path: {}", arg))?
+                .to_path_buf();
+        } else {
+            return Err(format!("Cannot parse directory argument: {}", arg).into());
+        }
+    }
+    prefix_parts.reverse();
+    let prefix = if prefix_parts.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", prefix_parts.join("/"))
+    };
+    Ok((bucket_path, prefix))
 }
 
 /// Check if a server is running on the given port and print a warning.

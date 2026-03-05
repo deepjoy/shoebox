@@ -1344,6 +1344,235 @@ impl MetadataStore {
         Ok(uploads)
     }
 
+    // -------------------------------------------------------------------------
+    // Phase 8: Duplicate Detection + Integrity Methods
+    // -------------------------------------------------------------------------
+
+    /// Get scan status: total files and files at each scan level.
+    pub async fn get_scan_status(&self) -> Result<ScanStatus, S3Error> {
+        let rows: Vec<(i32, i64)> =
+            sqlx::query_as("SELECT scan_level, COUNT(*) FROM objects GROUP BY scan_level")
+                .fetch_all(&self.pool)
+                .await?;
+
+        let mut total_files: i64 = 0;
+        let mut files_at_level_3: i64 = 0;
+        for (level, count) in &rows {
+            total_files += count;
+            if *level >= 3 {
+                files_at_level_3 += count;
+            }
+        }
+
+        Ok(ScanStatus {
+            total_files,
+            files_at_level_3,
+        })
+    }
+
+    /// Find duplicate hash groups, ordered by total wasted size descending.
+    pub async fn find_duplicate_hashes(
+        &self,
+        max_results: i32,
+    ) -> Result<Vec<DuplicateGroup>, S3Error> {
+        let rows: Vec<DuplicateGroup> = sqlx::query_as(
+            "SELECT checksum_sha256, COUNT(*) as count, SUM(COALESCE(size, 0)) as total_size \
+             FROM objects WHERE checksum_sha256 IS NOT NULL \
+             GROUP BY checksum_sha256 HAVING COUNT(*) > 1 \
+             ORDER BY total_size DESC LIMIT ?",
+        )
+        .bind(max_results)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Get all objects with a specific checksum_sha256.
+    pub async fn get_objects_by_hash(
+        &self,
+        checksum_sha256: &str,
+    ) -> Result<Vec<ObjectRecord>, S3Error> {
+        let records = sqlx::query_as::<_, ObjectRecord>(
+            "SELECT * FROM objects WHERE checksum_sha256 = ? ORDER BY key",
+        )
+        .bind(checksum_sha256)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Keyset-paginated fetch of objects ordered by checksum_sha256.
+    /// Used by the cross-bucket merge cursor.
+    pub async fn fetch_objects_by_hash_page(
+        &self,
+        after: Option<&str>,
+        limit: i32,
+    ) -> Result<Vec<ObjectRecord>, S3Error> {
+        let records = match after {
+            Some(hash) => {
+                sqlx::query_as::<_, ObjectRecord>(
+                    "SELECT * FROM objects \
+                     WHERE checksum_sha256 IS NOT NULL AND checksum_sha256 >= ? \
+                     ORDER BY checksum_sha256, key LIMIT ?",
+                )
+                .bind(hash)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as::<_, ObjectRecord>(
+                    "SELECT * FROM objects \
+                     WHERE checksum_sha256 IS NOT NULL \
+                     ORDER BY checksum_sha256, key LIMIT ?",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        Ok(records)
+    }
+
+    /// Get all objects with a given key prefix.
+    pub async fn get_objects_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<ObjectRecord>, S3Error> {
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        let records = sqlx::query_as::<_, ObjectRecord>(
+            "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
+        )
+        .bind(&pattern)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Get all objects at scan level 3 (content-hashed).
+    pub async fn get_all_objects_at_level_3(&self) -> Result<Vec<ObjectRecord>, S3Error> {
+        let records = sqlx::query_as::<_, ObjectRecord>(
+            "SELECT * FROM objects WHERE scan_level >= 3 ORDER BY key",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Get a single object by its UUID id.
+    pub async fn get_object_by_id(&self, id: &str) -> Result<Option<ObjectRecord>, S3Error> {
+        let record = sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(record)
+    }
+
+    /// Delete an object by its UUID id. Returns true if a row was deleted.
+    pub async fn delete_object_by_id(&self, id: &str) -> Result<bool, S3Error> {
+        let result = sqlx::query("DELETE FROM objects WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 8: Directory Hash Methods
+    // -------------------------------------------------------------------------
+
+    /// Insert or update a directory hash record.
+    pub async fn upsert_directory_hash(&self, record: &DirectoryHashRecord) -> Result<(), S3Error> {
+        sqlx::query(
+            "INSERT INTO directory_hashes (id, prefix, dir_hash, file_count, total_size, computed_at, stale) \
+             VALUES (?, ?, ?, ?, ?, ?, FALSE) \
+             ON CONFLICT(prefix) DO UPDATE SET \
+                dir_hash = excluded.dir_hash, \
+                file_count = excluded.file_count, \
+                total_size = excluded.total_size, \
+                computed_at = excluded.computed_at, \
+                stale = FALSE",
+        )
+        .bind(&record.id)
+        .bind(&record.prefix)
+        .bind(&record.dir_hash)
+        .bind(record.file_count)
+        .bind(record.total_size)
+        .bind(&record.computed_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Find duplicate directory groups by dir_hash.
+    pub async fn find_duplicate_dir_hashes(
+        &self,
+        min_files: i32,
+        max_results: i32,
+    ) -> Result<Vec<DuplicateDirGroup>, S3Error> {
+        let rows: Vec<DuplicateDirGroup> = sqlx::query_as(
+            "SELECT dir_hash, COUNT(*) as count, \
+             MIN(file_count) as file_count, SUM(total_size) as total_size \
+             FROM directory_hashes \
+             WHERE stale = FALSE AND file_count >= ? \
+             GROUP BY dir_hash HAVING COUNT(*) > 1 \
+             ORDER BY total_size DESC LIMIT ?",
+        )
+        .bind(min_files)
+        .bind(max_results)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Get all directory hash records with a specific dir_hash.
+    pub async fn get_dirs_by_hash(
+        &self,
+        dir_hash: &str,
+    ) -> Result<Vec<DirectoryHashRecord>, S3Error> {
+        let records = sqlx::query_as::<_, DirectoryHashRecord>(
+            "SELECT * FROM directory_hashes WHERE dir_hash = ? ORDER BY prefix",
+        )
+        .bind(dir_hash)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Get all distinct parent_directory values (immediate directories).
+    pub async fn list_parent_directories(&self) -> Result<Vec<String>, S3Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT parent_directory FROM objects \
+             WHERE parent_directory != '' ORDER BY parent_directory",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(p,)| p).collect())
+    }
+
+    /// Mark all directory hashes as stale (for rebuild).
+    pub async fn mark_all_dir_hashes_stale(&self) -> Result<(), S3Error> {
+        sqlx::query("UPDATE directory_hashes SET stale = TRUE")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Find abandoned multipart uploads older than cutoff time.
     pub async fn find_abandoned_uploads(
         &self,
@@ -1359,6 +1588,41 @@ impl MetadataStore {
 
         Ok(uploads)
     }
+}
+
+/// Scan status summary for a bucket.
+pub struct ScanStatus {
+    pub total_files: i64,
+    pub files_at_level_3: i64,
+}
+
+/// A group of files sharing the same checksum_sha256.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DuplicateGroup {
+    pub checksum_sha256: String,
+    pub count: i32,
+    pub total_size: i64,
+}
+
+/// A group of directories sharing the same dir_hash.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DuplicateDirGroup {
+    pub dir_hash: String,
+    pub count: i32,
+    pub file_count: i32,
+    pub total_size: i64,
+}
+
+/// A directory hash record from the directory_hashes table.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DirectoryHashRecord {
+    pub id: String,
+    pub prefix: String,
+    pub dir_hash: String,
+    pub file_count: i32,
+    pub total_size: i64,
+    pub computed_at: String,
+    pub stale: bool,
 }
 
 /// L2 metadata update payload (used by scanner).

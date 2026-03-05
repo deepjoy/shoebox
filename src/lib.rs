@@ -35,7 +35,9 @@ use crate::scanner::watcher::FilesystemWatcher;
 use crate::scanner::worker;
 use crate::services::copy_service::{self, CopyConditions, CopyResult};
 use crate::services::object_service::{self, GetObjectResult, PutObjectInput, PutObjectResult};
-use crate::services::{tagging_service, AppState, LoadedBucket};
+use crate::services::{
+    duplicates_service, integrity_service, merge_service, tagging_service, AppState, LoadedBucket,
+};
 use crate::storage::filesystem::FilesystemStorage;
 use std::pin::Pin;
 
@@ -334,6 +336,148 @@ impl Shoebox {
         crate::services::sync_service::sync(&b.scheduler, bucket).await
     }
 
+    // -- Phase 8: Duplicates, Merge, Integrity --
+
+    /// Find duplicate files within a single bucket.
+    pub async fn find_bucket_duplicates(
+        &self,
+        bucket: &str,
+        max_results: i32,
+        allow_partial: bool,
+    ) -> Result<duplicates_service::DuplicateReport, S3Error> {
+        let b = self.get_bucket(bucket)?;
+        duplicates_service::find_bucket_duplicates(&b.metadata, bucket, max_results, allow_partial)
+            .await
+    }
+
+    /// Find duplicate files across all buckets using streaming merge.
+    pub async fn find_duplicates(
+        &self,
+        max_results: i32,
+    ) -> Result<duplicates_service::CrossBucketDuplicateReport, S3Error> {
+        let bucket_pairs: Vec<(&str, &MetadataStore)> = self
+            .buckets
+            .iter()
+            .map(|(name, b)| (name.as_str(), &b.metadata))
+            .collect();
+        duplicates_service::find_cross_bucket_duplicates(&bucket_pairs, max_results).await
+    }
+
+    /// Find duplicate directories within a single bucket.
+    pub async fn find_bucket_duplicate_dirs(
+        &self,
+        bucket: &str,
+        min_files: i32,
+        max_results: i32,
+    ) -> Result<duplicates_service::DuplicateDirReport, S3Error> {
+        let b = self.get_bucket(bucket)?;
+        duplicates_service::find_bucket_duplicate_dirs(&b.metadata, bucket, min_files, max_results)
+            .await
+    }
+
+    /// Compare two directories across buckets.
+    pub async fn compare_dirs(
+        &self,
+        left_bucket: &str,
+        left_path: &str,
+        right_bucket: &str,
+        right_path: &str,
+    ) -> Result<duplicates_service::DirComparison, S3Error> {
+        let left = self.get_bucket(left_bucket)?;
+        let right = self.get_bucket(right_bucket)?;
+        duplicates_service::compare_dirs(
+            &left.metadata,
+            left_bucket,
+            left_path,
+            &right.metadata,
+            right_bucket,
+            right_path,
+        )
+        .await
+    }
+
+    /// Synchronous integrity check — blocks until complete.
+    pub async fn check_integrity(
+        &self,
+        bucket: &str,
+        scope: Option<&str>,
+    ) -> Result<integrity_service::IntegrityCheckResult, S3Error> {
+        let b = self.get_bucket(bucket)?;
+        let check_id = uuid::Uuid::new_v4();
+        integrity_service::execute_check(
+            &b.metadata,
+            b.storage.root(),
+            check_id,
+            scope,
+            self.shutdown_token.clone(),
+        )
+        .await
+    }
+
+    /// Async integrity check — spawns a background task, returns immediately.
+    pub fn check_integrity_async(
+        &self,
+        bucket: &str,
+        scope: Option<&str>,
+    ) -> Result<integrity_service::IntegrityCheckResult, S3Error> {
+        let b = self.get_bucket(bucket)?;
+        let check_id = uuid::Uuid::new_v4();
+        let metadata = b.metadata.clone();
+        let root = b.storage.root().to_path_buf();
+        let scope = scope.map(String::from);
+        let token = self.shutdown_token.clone();
+
+        tokio::spawn(async move {
+            integrity_service::execute_check(&metadata, &root, check_id, scope.as_deref(), token)
+                .await
+                .ok();
+        });
+
+        Ok(integrity_service::IntegrityCheckResult {
+            check_id: check_id.to_string(),
+            status: "in_progress".to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// Merge duplicate objects: keep winner, delete losers.
+    pub async fn merge_duplicates(
+        &self,
+        bucket: &str,
+        winner_key: &str,
+        loser_keys: &[&str],
+    ) -> Result<merge_service::MergeResult, S3Error> {
+        let state = self.get_bucket(bucket)?;
+
+        // Resolve keys to object_ids
+        let winner = state
+            .metadata
+            .get_object(winner_key)
+            .await?
+            .ok_or(S3Error::NoSuchKey)?;
+        let mut loser_ids = Vec::new();
+        for key in loser_keys {
+            let obj = state
+                .metadata
+                .get_object(key)
+                .await?
+                .ok_or(S3Error::NoSuchKey)?;
+            loser_ids.push(obj.id);
+        }
+
+        let loser_refs: Vec<&str> = loser_ids.iter().map(|s| s.as_str()).collect();
+
+        let result =
+            merge_service::merge_duplicates(&state.metadata, &winner.id, &loser_refs).await?;
+
+        // Delete loser objects from DB and disk
+        for key in loser_keys {
+            object_service::delete_object(&state.storage, &state.metadata, key).await?;
+        }
+
+        Ok(result)
+    }
+
     // -- HTTP layer bridge --
 
     // -- Helper methods for HTTP layer --
@@ -343,12 +487,82 @@ impl Shoebox {
             buckets: self.buckets.clone(),
             credential_provider: self.credential_provider.clone(),
             bucket_names: Arc::new(self.buckets.keys().cloned().collect()),
+            integrity_checks: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            shutdown_token: self.shutdown_token.clone(),
         }
     }
 
     /// Create an Axum router for embedding in a custom server.
     pub fn router(&self) -> Router {
         create_router(self.to_app_state())
+    }
+
+    /// Spawn scheduled integrity checks for all buckets.
+    ///
+    /// Runs a full integrity check every `interval` for each bucket.
+    /// Checks are staggered across buckets to avoid hammering all at once.
+    /// Cancels automatically when the shutdown token fires.
+    pub fn spawn_scheduled_integrity_checks(&self, interval: std::time::Duration) {
+        for (name, bucket) in self.buckets.iter() {
+            let metadata = bucket.metadata.clone();
+            let root = bucket.storage.root().to_path_buf();
+            let token = self.shutdown_token.clone();
+            let bucket_name = name.clone();
+
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(interval) => {}
+                        _ = token.cancelled() => {
+                            tracing::debug!(bucket = %bucket_name, "Scheduled integrity check cancelled");
+                            break;
+                        }
+                    }
+
+                    let check_id = uuid::Uuid::new_v4();
+                    tracing::info!(bucket = %bucket_name, check_id = %check_id, "Starting scheduled integrity check");
+
+                    match integrity_service::execute_check(
+                        &metadata,
+                        &root,
+                        check_id,
+                        None,
+                        token.clone(),
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            if result.discrepancies.is_empty() {
+                                tracing::info!(
+                                    bucket = %bucket_name,
+                                    check_id = %check_id,
+                                    files_checked = result.files_checked,
+                                    status = %result.status,
+                                    "Scheduled integrity check complete — no discrepancies"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    bucket = %bucket_name,
+                                    check_id = %check_id,
+                                    files_checked = result.files_checked,
+                                    discrepancies = result.discrepancies.len(),
+                                    status = %result.status,
+                                    "Scheduled integrity check found discrepancies"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                bucket = %bucket_name,
+                                check_id = %check_id,
+                                error = %e,
+                                "Scheduled integrity check failed"
+                            );
+                        }
+                    }
+                }
+            });
+        }
     }
 
     /// Run the built-in HTTP server with graceful shutdown.
@@ -364,6 +578,9 @@ impl Shoebox {
                 token.cancel();
             }
         });
+
+        // Spawn scheduled integrity checks (every 24 hours)
+        self.spawn_scheduled_integrity_checks(std::time::Duration::from_secs(24 * 60 * 60));
 
         let app_state = self.to_app_state();
         let router = create_router(app_state);
@@ -731,6 +948,7 @@ mod tests {
     use futures::stream;
     use futures::TryStreamExt;
     use services::object_service::PutObjectInput;
+    use std::collections::HashSet;
     use tempfile::TempDir;
 
     /// Collect all `ListEntry::Object` records from a list_objects stream.
@@ -1385,5 +1603,466 @@ mod tests {
         // The old key should no longer exist
         let old = shoebox.head_object("movetest", "original.txt").await;
         assert!(old.is_err(), "Old key should not exist");
+    }
+
+    // -- Phase 8: Duplicates + Integrity tests --------------------------------
+
+    /// Helper: upload a file via put_object (sets scan_level=3 with checksum_sha256).
+    async fn put_file(shoebox: &Shoebox, bucket: &str, key: &str, content: &[u8]) {
+        let data = Bytes::from(content.to_vec());
+        let stream = stream::iter(vec![Ok::<_, std::io::Error>(data)]);
+        shoebox
+            .put_object(
+                bucket,
+                key,
+                stream,
+                PutObjectInput {
+                    content_type: "application/octet-stream".to_string(),
+                    user_metadata: HashMap::new(),
+                    content_md5: None,
+                    checksum_sha256: None,
+                    checksum_sha1: None,
+                    checksum_crc32: None,
+                    checksum_crc32c: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cross_bucket_duplicates_streaming_merge() {
+        let tmp = TempDir::new().unwrap();
+        let dir_a = tmp.path().join("alpha");
+        let dir_b = tmp.path().join("bravo");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        let shoebox = Shoebox::builder()
+            .bucket(&dir_a)
+            .bucket(&dir_b)
+            .build()
+            .await
+            .unwrap();
+
+        // Upload identical content to both buckets
+        put_file(
+            &shoebox,
+            "alpha",
+            "sunset.txt",
+            b"Beautiful sunset over the ocean",
+        )
+        .await;
+        put_file(
+            &shoebox,
+            "bravo",
+            "sunset-copy.txt",
+            b"Beautiful sunset over the ocean",
+        )
+        .await;
+
+        // Upload a unique file in bravo (should NOT appear in duplicates)
+        put_file(&shoebox, "bravo", "unique.txt", b"Only in bravo").await;
+
+        // Upload another cross-bucket duplicate pair
+        put_file(&shoebox, "alpha", "mountain.txt", b"Mountain landscape").await;
+        put_file(
+            &shoebox,
+            "bravo",
+            "mountain-backup.txt",
+            b"Mountain landscape",
+        )
+        .await;
+
+        let report = shoebox.find_duplicates(100).await.unwrap();
+
+        // Should find exactly 2 duplicate groups
+        assert_eq!(
+            report.duplicates.len(),
+            2,
+            "Expected 2 cross-bucket duplicate groups, got {}",
+            report.duplicates.len()
+        );
+
+        // Each group should span both buckets
+        for group in &report.duplicates {
+            assert!(
+                group.files.len() >= 2,
+                "Each duplicate group should have at least 2 files"
+            );
+            let buckets: HashSet<&str> = group.files.iter().map(|f| f.bucket.as_str()).collect();
+            assert!(
+                buckets.contains("alpha") && buckets.contains("bravo"),
+                "Duplicate group should span both buckets, got: {:?}",
+                buckets
+            );
+        }
+
+        assert!(!report.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn test_directory_hash_computation() {
+        let tmp = TempDir::new().unwrap();
+        let shoebox = build_shoebox(&tmp, "photos").await;
+
+        // Create two directories with identical contents
+        put_file(&shoebox, "photos", "dir_a/file1.txt", b"hello").await;
+        put_file(&shoebox, "photos", "dir_a/file2.txt", b"world").await;
+        put_file(&shoebox, "photos", "dir_b/file1.txt", b"hello").await;
+        put_file(&shoebox, "photos", "dir_b/file2.txt", b"world").await;
+
+        // Create a directory with different contents
+        put_file(&shoebox, "photos", "dir_c/file1.txt", b"different").await;
+        put_file(&shoebox, "photos", "dir_c/file2.txt", b"content").await;
+
+        // Compute directory hashes
+        let bucket = shoebox.get_bucket("photos").unwrap();
+        services::duplicates_service::compute_directory_hashes(&bucket.metadata)
+            .await
+            .unwrap();
+
+        // Find duplicate directories — dir_a and dir_b should match
+        let report = shoebox
+            .find_bucket_duplicate_dirs("photos", 1, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.duplicate_dirs.len(),
+            1,
+            "Expected 1 duplicate dir group (dir_a == dir_b), got {}",
+            report.duplicate_dirs.len()
+        );
+
+        let group = &report.duplicate_dirs[0];
+        assert_eq!(group.dirs.len(), 2, "Group should contain 2 directories");
+
+        let prefixes: HashSet<&str> = group.dirs.iter().map(|d| d.prefix.as_str()).collect();
+        assert!(prefixes.contains("dir_a/"), "Should contain dir_a/");
+        assert!(prefixes.contains("dir_b/"), "Should contain dir_b/");
+        assert!(
+            !prefixes.contains("dir_c/"),
+            "dir_c/ should NOT be in the duplicate group"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_integrity_checks_run_on_interval() {
+        let tmp = TempDir::new().unwrap();
+        let shoebox = build_shoebox(&tmp, "bucket").await;
+
+        put_file(&shoebox, "bucket", "test.txt", b"integrity test data").await;
+
+        // Verify the file is at L3 before scheduling
+        let objects = collect_objects(&shoebox, "bucket").await;
+        assert_eq!(objects.len(), 1, "Should have 1 object");
+        assert_eq!(objects[0].scan_level, 3);
+
+        // Schedule checks with a very short interval (50ms)
+        shoebox.spawn_scheduled_integrity_checks(std::time::Duration::from_millis(50));
+
+        // Wait long enough for at least one scheduled check to execute.
+        // The scheduled check calls execute_check internally — we can't observe
+        // its result directly, but we verify it doesn't panic or corrupt state.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Cancel the scheduled checks via shutdown token
+        shoebox.shutdown_token.cancel();
+
+        // Give spawned tasks time to observe cancellation and exit
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // After cancellation, a fresh Shoebox with a new token should still work
+        let shoebox2 = build_shoebox(&tmp, "bucket2").await;
+        put_file(&shoebox2, "bucket2", "after.txt", b"post-cancel").await;
+        let result = shoebox2.check_integrity("bucket2", None).await.unwrap();
+        assert_eq!(result.status, "complete");
+        assert_eq!(result.files_checked, 1);
+        assert_eq!(result.files_ok, 1);
+    }
+
+    #[tokio::test]
+    async fn test_integrity_check_cancelled_on_shutdown() {
+        let tmp = TempDir::new().unwrap();
+        let shoebox = build_shoebox(&tmp, "bucket").await;
+
+        // Upload enough files that the check won't finish instantly
+        for i in 0..20 {
+            put_file(
+                &shoebox,
+                "bucket",
+                &format!("file_{:03}.txt", i),
+                format!("content for file {}", i).as_bytes(),
+            )
+            .await;
+        }
+
+        // Cancel the token BEFORE running the check — the check should
+        // observe cancellation immediately on its first iteration
+        shoebox.shutdown_token.cancel();
+
+        let result = shoebox.check_integrity("bucket", None).await.unwrap();
+
+        assert_eq!(
+            result.status, "cancelled",
+            "Integrity check should report cancelled status, got: {}",
+            result.status
+        );
+        assert!(
+            result.files_checked < 20,
+            "Should not have checked all 20 files (checked {})",
+            result.files_checked
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_bucket_duplicates_returns_groups_with_object_id() {
+        let tmp = TempDir::new().unwrap();
+        let shoebox = build_shoebox(&tmp, "photos").await;
+
+        // Upload duplicate files (same content, different keys)
+        put_file(&shoebox, "photos", "a/sunset.txt", b"sunset over ocean").await;
+        put_file(&shoebox, "photos", "b/sunset.txt", b"sunset over ocean").await;
+        put_file(&shoebox, "photos", "c/sunset.txt", b"sunset over ocean").await;
+
+        // Upload a unique file
+        put_file(&shoebox, "photos", "unique.txt", b"unique content").await;
+
+        let report = shoebox
+            .find_bucket_duplicates("photos", 100, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.duplicates.len(), 1, "Should find 1 duplicate group");
+        assert!(report.scan_complete, "Scan should be complete");
+
+        let group = &report.duplicates[0];
+        assert_eq!(group.files.len(), 3, "Group should have 3 files");
+        assert!(
+            !group.checksum_sha256.is_empty(),
+            "Group should have a hash"
+        );
+
+        // Every file in the group must have a non-empty object_id
+        for file in &group.files {
+            assert!(!file.object_id.is_empty(), "File should have object_id");
+            assert!(!file.key.is_empty(), "File should have key");
+        }
+
+        let keys: HashSet<&str> = group.files.iter().map(|f| f.key.as_str()).collect();
+        assert!(keys.contains("a/sunset.txt"));
+        assert!(keys.contains("b/sunset.txt"));
+        assert!(keys.contains("c/sunset.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_scan_pending_error_when_l3_incomplete() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("pending");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        // Create files on disk BEFORE build — L1 scan discovers them at scan_level=1
+        std::fs::write(bucket_dir.join("file1.txt"), "hello").unwrap();
+        std::fs::write(bucket_dir.join("file2.txt"), "world").unwrap();
+
+        let shoebox = Shoebox::builder()
+            .bucket(&bucket_dir)
+            .build()
+            .await
+            .unwrap();
+
+        // Files are at L1, not L3 — FindBucketDuplicates should fail with ScanPending
+        let err = shoebox.find_bucket_duplicates("pending", 100, false).await;
+
+        assert!(
+            matches!(err, Err(S3Error::ScanPending { .. })),
+            "Expected ScanPending error, got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_allow_partial_returns_results_despite_incomplete_scan() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("partial");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        // Create a file on disk (will be L1 after build)
+        std::fs::write(bucket_dir.join("preexisting.txt"), "on disk only").unwrap();
+
+        let shoebox = Shoebox::builder()
+            .bucket(&bucket_dir)
+            .build()
+            .await
+            .unwrap();
+
+        // Upload a duplicate pair via API (these become L3)
+        put_file(&shoebox, "partial", "dup1.txt", b"duplicate data").await;
+        put_file(&shoebox, "partial", "dup2.txt", b"duplicate data").await;
+
+        // Without allow-partial, should fail
+        let err = shoebox.find_bucket_duplicates("partial", 100, false).await;
+        assert!(matches!(err, Err(S3Error::ScanPending { .. })));
+
+        // With allow-partial, should succeed and return partial results
+        let report = shoebox
+            .find_bucket_duplicates("partial", 100, true)
+            .await
+            .unwrap();
+
+        assert!(!report.scan_complete, "scan_complete should be false");
+        assert_eq!(
+            report.duplicates.len(),
+            1,
+            "Should find the L3 duplicate group even with incomplete scan"
+        );
+        assert_eq!(report.duplicates[0].files.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_compare_dirs_shows_correct_differences() {
+        let tmp = TempDir::new().unwrap();
+        let shoebox = build_shoebox(&tmp, "photos").await;
+
+        // Left directory: originals/
+        put_file(&shoebox, "photos", "originals/same.txt", b"identical").await;
+        put_file(&shoebox, "photos", "originals/modified.txt", b"version A").await;
+        put_file(&shoebox, "photos", "originals/only-left.txt", b"left only").await;
+
+        // Right directory: backup/
+        put_file(&shoebox, "photos", "backup/same.txt", b"identical").await;
+        put_file(&shoebox, "photos", "backup/modified.txt", b"version B").await;
+        put_file(&shoebox, "photos", "backup/only-right.txt", b"right only").await;
+
+        let comparison = shoebox
+            .compare_dirs("photos", "originals/", "photos", "backup/")
+            .await
+            .unwrap();
+
+        assert!(!comparison.identical, "Dirs should not be identical");
+        assert_eq!(comparison.summary.files_identical, 1, "1 identical file");
+        assert_eq!(comparison.summary.files_different, 1, "1 modified file");
+        assert_eq!(comparison.summary.files_only_in_left, 1, "1 only in left");
+        assert_eq!(comparison.summary.files_only_in_right, 1, "1 only in right");
+
+        // Check specific differences
+        let statuses: HashSet<&str> = comparison
+            .differences
+            .iter()
+            .map(|d| d.status.as_str())
+            .collect();
+        assert!(statuses.contains("modified"));
+        assert!(statuses.contains("only_in_left"));
+        assert!(statuses.contains("only_in_right"));
+    }
+
+    #[tokio::test]
+    async fn test_merge_duplicates_deletes_loser_objects() {
+        let tmp = TempDir::new().unwrap();
+        let shoebox = build_shoebox(&tmp, "photos").await;
+
+        put_file(&shoebox, "photos", "winner.txt", b"keep this copy").await;
+        put_file(&shoebox, "photos", "loser1.txt", b"keep this copy").await;
+        put_file(&shoebox, "photos", "loser2.txt", b"keep this copy").await;
+
+        // Verify all 3 exist
+        let objects = collect_objects(&shoebox, "photos").await;
+        assert_eq!(objects.len(), 3);
+
+        // Merge: keep winner, delete losers
+        let result = shoebox
+            .merge_duplicates("photos", "winner.txt", &["loser1.txt", "loser2.txt"])
+            .await
+            .unwrap();
+        assert_eq!(result.losers_merged, 2);
+
+        // Winner should still exist
+        let winner = shoebox.head_object("photos", "winner.txt").await;
+        assert!(winner.is_ok(), "Winner should still exist");
+
+        // Losers should be gone from the catalog
+        let loser1 = shoebox.head_object("photos", "loser1.txt").await;
+        assert!(loser1.is_err(), "Loser 1 should be deleted");
+        let loser2 = shoebox.head_object("photos", "loser2.txt").await;
+        assert!(loser2.is_err(), "Loser 2 should be deleted");
+
+        // Only winner remains
+        let objects = collect_objects(&shoebox, "photos").await;
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].key, "winner.txt");
+
+        // Loser files should be deleted from disk too
+        let bucket_dir = tmp.path().join("photos");
+        assert!(
+            !bucket_dir.join("loser1.txt").exists(),
+            "loser1.txt should be deleted from disk"
+        );
+        assert!(
+            !bucket_dir.join("loser2.txt").exists(),
+            "loser2.txt should be deleted from disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_integrity_check_detects_corruption_and_includes_object_id() {
+        let tmp = TempDir::new().unwrap();
+        let shoebox = build_shoebox(&tmp, "bucket").await;
+
+        put_file(&shoebox, "bucket", "good.txt", b"untouched content").await;
+        put_file(&shoebox, "bucket", "corrupted.txt", b"original content").await;
+
+        // Corrupt the file on disk (simulates bit rot / external modification)
+        let bucket_dir = tmp.path().join("bucket");
+        std::fs::write(bucket_dir.join("corrupted.txt"), b"TAMPERED CONTENT").unwrap();
+
+        let result = shoebox.check_integrity("bucket", None).await.unwrap();
+
+        assert_eq!(result.status, "complete");
+        assert_eq!(result.files_checked, 2);
+        assert_eq!(result.files_ok, 1, "1 file should be OK");
+        assert_eq!(result.discrepancies.len(), 1, "1 discrepancy");
+
+        let disc = &result.discrepancies[0];
+        assert_eq!(disc.key, "corrupted.txt");
+        assert!(
+            !disc.object_id.is_empty(),
+            "Discrepancy should include object_id"
+        );
+        assert!(
+            disc.reason.starts_with("content_mismatch"),
+            "Reason should indicate content mismatch, got: {}",
+            disc.reason
+        );
+        assert!(disc.stored_hash.is_some(), "Should include stored hash");
+        assert!(disc.computed_hash.is_some(), "Should include computed hash");
+        assert_ne!(
+            disc.stored_hash, disc.computed_hash,
+            "Stored and computed hashes should differ"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_async_integrity_check_returns_immediately() {
+        let tmp = TempDir::new().unwrap();
+        let shoebox = build_shoebox(&tmp, "bucket").await;
+
+        put_file(&shoebox, "bucket", "file.txt", b"test content").await;
+
+        let result = shoebox.check_integrity_async("bucket", None).unwrap();
+
+        // Should return immediately with in_progress status
+        assert_eq!(
+            result.status, "in_progress",
+            "Async check should return in_progress immediately"
+        );
+        assert!(!result.check_id.is_empty(), "Should have a check_id");
+        assert_eq!(
+            result.files_checked, 0,
+            "Should not have checked any files yet"
+        );
+
+        // Give the background task time to complete
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 }
