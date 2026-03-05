@@ -16,8 +16,8 @@ pub fn create_router(state: AppState) -> Router {
     let bucket_names = state.bucket_names.clone();
 
     Router::new()
-        // Service-level: GET / → ListBuckets
-        .route("/", get(handlers::bucket::list_buckets))
+        // Service-level: GET / → ListBuckets (or cross-bucket queries)
+        .route("/", get(handlers::bucket::service_get_dispatcher))
         // Admin endpoints
         .route(
             "/_shoebox/credentials",

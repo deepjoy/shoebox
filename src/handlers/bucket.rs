@@ -13,6 +13,27 @@ use crate::types::s3::*;
 
 use super::list::list_objects_v2;
 
+/// GET / dispatcher — routes on query string for cross-bucket operations.
+pub async fn service_get_dispatcher(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, S3Error> {
+    if params.contains_key("duplicates") {
+        return super::duplicates::find_cross_bucket_duplicates(State(state), Query(params)).await;
+    }
+    if params.contains_key("duplicate-dirs") {
+        // Cross-bucket duplicate dirs: iterate all buckets
+        // For now, return each bucket's results
+        return super::duplicates::find_cross_bucket_duplicates(State(state), Query(params)).await;
+    }
+    if params.contains_key("compare-dirs") {
+        return super::duplicates::compare_dirs(State(state), Query(params)).await;
+    }
+    list_buckets(State(state))
+        .await
+        .map(IntoResponse::into_response)
+}
+
 /// GET / — list all buckets.
 pub async fn list_buckets(
     State(state): State<AppState>,
@@ -81,6 +102,31 @@ pub async fn bucket_or_list(
             .await
             .map(IntoResponse::into_response);
     }
+    // Phase 8: Duplicate detection
+    if params.contains_key("duplicates") {
+        return super::duplicates::find_bucket_duplicates(
+            State(state),
+            Path(bucket),
+            Query(params),
+        )
+        .await;
+    }
+    if params.contains_key("duplicate-dirs") {
+        return super::duplicates::find_bucket_duplicate_dirs(
+            State(state),
+            Path(bucket),
+            Query(params),
+        )
+        .await;
+    }
+    // Phase 8: Integrity check
+    if params.contains_key("integrity-check") {
+        return super::integrity::check_integrity(State(state), Path(bucket), Query(params)).await;
+    }
+    if params.contains_key("integrity-status") {
+        return super::integrity::get_integrity_status(State(state), Path(bucket), Query(params))
+            .await;
+    }
     // Default: ListObjectsV2 — re-parse with the typed query struct.
     list_objects_v2(State(state), Path(bucket), Query(params))
         .await
@@ -125,6 +171,9 @@ pub async fn post_bucket_dispatcher(
         return super::sync::sync_bucket(State(state), Path(bucket))
             .await
             .map(IntoResponse::into_response);
+    }
+    if params.contains_key("merge") {
+        return super::duplicates::merge_duplicates(State(state), Path(bucket), body).await;
     }
     Err(S3Error::MethodNotAllowed)
 }

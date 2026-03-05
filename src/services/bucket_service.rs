@@ -29,12 +29,21 @@ pub struct LoadedBucket {
     pub freshly_created: bool,
 }
 
+/// Shared storage for async integrity check results.
+pub type IntegrityCheckStore = Arc<
+    tokio::sync::RwLock<HashMap<String, crate::services::integrity_service::IntegrityCheckResult>>,
+>;
+
 /// Shared application state passed to all handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub buckets: Arc<HashMap<String, LoadedBucket>>,
     pub credential_provider: Arc<tokio::sync::RwLock<CredentialProvider>>,
     pub bucket_names: Arc<Vec<String>>,
+    /// Async integrity check results, keyed by check_id.
+    pub integrity_checks: IntegrityCheckStore,
+    /// Shutdown token for cancelling background tasks.
+    pub shutdown_token: tokio_util::sync::CancellationToken,
 }
 
 impl AppState {

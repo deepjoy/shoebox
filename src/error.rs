@@ -74,6 +74,16 @@ pub enum S3Error {
     #[error("Bad Request: {0}")]
     BadRequest(String),
 
+    #[error("{files_pending} files pending content scan for {operation}")]
+    ScanPending {
+        operation: &'static str,
+        files_pending: i64,
+        percent_complete: f64,
+    },
+
+    #[error("{0}")]
+    InvalidRequest(String),
+
     #[error("We encountered an internal error, please try again")]
     InternalError,
 }
@@ -105,6 +115,8 @@ impl S3Error {
             Self::RangeNotSatisfiable => "InvalidRange",
             Self::Conflict(_) => "Conflict",
             Self::BadRequest(_) => "BadRequest",
+            Self::ScanPending { .. } => "ScanIncomplete",
+            Self::InvalidRequest(_) => "InvalidRequest",
             Self::InternalError => "InternalError",
         }
     }
@@ -115,7 +127,7 @@ impl S3Error {
     /// transient I/O errors, and other temporary failures. `AccessDenied`,
     /// `NoSuchKey`, and other variants represent permanent conditions.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::InternalError)
+        matches!(self, Self::InternalError | Self::ScanPending { .. })
     }
 
     /// Human-readable error message.
@@ -138,7 +150,8 @@ impl S3Error {
             | Self::AuthorizationHeaderMalformed
             | Self::MissingSecurityHeader
             | Self::InvalidRange
-            | Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            | Self::BadRequest(_)
+            | Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             Self::NoSuchCredential => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::BucketAlreadyExists | Self::BucketAlreadyOwnedByYou | Self::Conflict(_) => {
@@ -147,17 +160,33 @@ impl S3Error {
             Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             Self::NotModified => StatusCode::NOT_MODIFIED,
             Self::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
+            Self::ScanPending { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
     /// Render to S3-compatible XML error response.
     pub fn to_xml(&self, request_id: &str) -> String {
+        let extra = if let Self::ScanPending {
+            operation,
+            files_pending,
+            percent_complete,
+        } = self
+        {
+            format!(
+                "\n  <Operation>{}</Operation>\n  <FilesPending>{}</FilesPending>\n  <PercentComplete>{:.1}</PercentComplete>",
+                escape_xml(operation),
+                files_pending,
+                percent_complete,
+            )
+        } else {
+            String::new()
+        };
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <Error>
   <Code>{}</Code>
-  <Message>{}</Message>
+  <Message>{}</Message>{extra}
   <RequestId>{}</RequestId>
 </Error>"#,
             self.code(),
@@ -200,11 +229,18 @@ impl IntoResponse for S3Error {
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let body = self.to_xml(&request_id);
+        let is_scan_pending = matches!(self, Self::ScanPending { .. });
 
-        axum::http::Response::builder()
+        let mut builder = axum::http::Response::builder()
             .status(self.status_code())
             .header("content-type", "application/xml")
-            .header("x-amz-request-id", &request_id)
+            .header("x-amz-request-id", &request_id);
+
+        if is_scan_pending {
+            builder = builder.header("Retry-After", "5");
+        }
+
+        builder
             .body(axum::body::Body::from(body))
             .unwrap_or_else(|_| {
                 axum::http::Response::builder()
