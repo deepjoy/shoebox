@@ -27,6 +27,7 @@ pub struct L1Report {
     pub discovered: u64,
     pub deleted: u64,
     pub unchanged: u64,
+    pub moved: u64,
 }
 
 /// Result of an L2 (metadata) scan.
@@ -163,11 +164,14 @@ pub async fn scan_l1(
             .first_or_octet_stream()
             .to_string();
 
-        // Stat the file to get size so it's available immediately after L1
-        let size = tokio::fs::symlink_metadata(&path)
-            .await
-            .ok()
-            .map(|m| m.len() as i64);
+        // Stat the file to get size and inode/device_id so they're
+        // available immediately after L1 (inode is needed for move detection).
+        let fs_meta = tokio::fs::symlink_metadata(&path).await.ok();
+        let size = fs_meta.as_ref().map(|m| m.len() as i64);
+        let (inode, device_id) = fs_meta
+            .as_ref()
+            .map(platform::file_identity)
+            .unwrap_or((None, None));
 
         let now = time::OffsetDateTime::now_utc();
         let obj = ObjectRecord {
@@ -177,6 +181,8 @@ pub async fn scan_l1(
             is_symlink,
             symlink_target,
             size,
+            inode: inode.map(|v| v as i64),
+            device_id: device_id.map(|v| v as i64),
             content_type: Some(content_type),
             scan_level: 1,
             last_modified: now,
@@ -206,14 +212,16 @@ pub async fn scan_l1(
         "L1 walk complete, merging into catalog"
     );
 
-    // Merge: insert new objects and delete stale ones in two SQL statements
+    // Merge: detect moves, insert new objects, and delete stale ones
     let delete_stale = matches!(scope, ScanScope::Bucket);
-    let (discovered, deleted) = MetadataStore::l1_scan_finish(&mut conn, delete_stale).await?;
+    let (discovered, deleted, moved) =
+        MetadataStore::l1_scan_finish(&mut conn, delete_stale).await?;
 
-    let unchanged = files_walked.saturating_sub(discovered);
+    let unchanged = files_walked.saturating_sub(discovered + moved);
 
     tracing::info!(
         discovered = discovered,
+        moved = moved,
         unchanged = unchanged,
         deleted = deleted,
         elapsed = ?scan_start.elapsed(),
@@ -224,6 +232,7 @@ pub async fn scan_l1(
         discovered,
         deleted,
         unchanged,
+        moved,
     })
 }
 

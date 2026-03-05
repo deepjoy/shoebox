@@ -27,6 +27,10 @@ pub struct PutObjectInput {
 
 /// Result of a PutObject operation.
 pub struct PutObjectResult {
+    /// The persisted object ID (from the `objects.id` column).
+    pub object_id: String,
+    /// Size of the written content in bytes.
+    pub size: i64,
     /// Quoted ETag, e.g. `"d41d8cd98f00b204e9800998ecf8427e"`.
     pub etag: String,
     /// Computed checksums for all four S3 algorithms.
@@ -110,8 +114,10 @@ pub async fn put_object(
         ..Default::default()
     };
 
-    metadata.upsert_object(&obj).await?;
+    let object_id = metadata.upsert_object(&obj).await?;
     Ok(PutObjectResult {
+        object_id,
+        size: result.bytes_written as i64,
         etag,
         checksums: result.checksums,
     })

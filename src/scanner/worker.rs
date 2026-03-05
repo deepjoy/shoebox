@@ -44,6 +44,7 @@ pub async fn run_watch_processor(
                         bucket: bucket_name.clone(),
                         scope: ScanScope::Bucket,
                         target_level: 3,
+                        priority: None,
                     }, taskmill::Priority::BACKGROUND).await;
                 }
             }
@@ -71,6 +72,7 @@ pub async fn run_watch_processor(
                                     let _ = scheduler.submit_typed(&ScanL2Task {
                                         bucket: bucket_name.clone(),
                                         cursor: None,
+                                        priority: None,
                                     }).await;
                                     let _ = scheduler.submit_typed(&ScanL3Task {
                                         bucket: bucket_name.clone(),

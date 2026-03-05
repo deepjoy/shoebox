@@ -241,8 +241,11 @@ impl MetadataStore {
     /// On conflict the existing row's `id` and `created_at` are preserved
     /// (i.e. the values in the supplied `ObjectRecord` are ignored for those
     /// two columns on update). All other fields are overwritten.
-    pub async fn upsert_object(&self, obj: &ObjectRecord) -> Result<(), S3Error> {
-        sqlx::query(
+    ///
+    /// Returns the persisted `id` — on insert this is the supplied id; on
+    /// update (overwrite) it is the existing row's id.
+    pub async fn upsert_object(&self, obj: &ObjectRecord) -> Result<String, S3Error> {
+        let row: (String,) = sqlx::query_as(
             r#"INSERT INTO objects (
                 id, key, parent_directory, is_directory, is_symlink, symlink_target,
                 size, file_mtime, file_ctime, inode, device_id,
@@ -267,7 +270,8 @@ impl MetadataStore {
                 content_type = excluded.content_type,
                 last_modified = excluded.last_modified,
                 metadata = excluded.metadata,
-                scan_level = excluded.scan_level"#,
+                scan_level = excluded.scan_level
+            RETURNING id"#,
         )
         .bind(&obj.id)
         .bind(&obj.key)
@@ -290,10 +294,10 @@ impl MetadataStore {
         .bind(obj.created_at)
         .bind(&obj.metadata)
         .bind(obj.scan_level)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
 
-        Ok(())
+        Ok(row.0)
     }
 
     /// Delete an object record by key. Returns true if a row was deleted.
@@ -683,6 +687,27 @@ impl MetadataStore {
     // Scanner Methods (Phase 6)
     // -------------------------------------------------------------------------
 
+    /// Look up an object by inode and device_id (for move detection).
+    ///
+    /// Returns the first matching record, or `None` if no object has this
+    /// inode+device_id combination. Used by the L1 scanner to detect file
+    /// moves (same inode, different key).
+    pub async fn get_object_by_inode(
+        &self,
+        inode: i64,
+        device_id: i64,
+    ) -> Result<Option<ObjectRecord>, S3Error> {
+        let record = sqlx::query_as::<_, ObjectRecord>(
+            "SELECT * FROM objects WHERE inode = ? AND device_id = ? LIMIT 1",
+        )
+        .bind(inode)
+        .bind(device_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(record)
+    }
+
     /// Count files and total bytes remaining below a given scan level.
     ///
     /// Returns `(file_count, total_bytes)` for objects with `scan_level < level`.
@@ -810,6 +835,8 @@ impl MetadataStore {
                 is_symlink BOOLEAN NOT NULL DEFAULT FALSE,
                 symlink_target TEXT,
                 size INTEGER,
+                inode INTEGER,
+                device_id INTEGER,
                 content_type TEXT,
                 last_modified TEXT NOT NULL,
                 created_at TEXT NOT NULL
@@ -833,8 +860,8 @@ impl MetadataStore {
             sqlx::query(
                 "INSERT OR IGNORE INTO l1_disk (
                     key, id, parent_directory, is_symlink, symlink_target,
-                    size, content_type, last_modified, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    size, inode, device_id, content_type, last_modified, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&obj.key)
             .bind(&obj.id)
@@ -842,6 +869,8 @@ impl MetadataStore {
             .bind(obj.is_symlink)
             .bind(&obj.symlink_target)
             .bind(obj.size)
+            .bind(obj.inode)
+            .bind(obj.device_id)
             .bind(&obj.content_type)
             .bind(obj.last_modified)
             .bind(obj.created_at)
@@ -852,22 +881,66 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// Merge the L1 temp table into `objects`: insert newly discovered files,
-    /// optionally delete stale entries, and return `(discovered, deleted)`.
-    /// Drops the temp table when done.
+    /// Merge the L1 temp table into `objects`: detect moves, insert newly
+    /// discovered files, optionally delete stale entries, and return
+    /// `(discovered, deleted, moved)`. Drops the temp table when done.
+    ///
+    /// Move detection: when a new key (in l1_disk but not in objects) has an
+    /// inode+device_id that matches an existing object under a different key,
+    /// we treat it as a move — updating the existing row's key rather than
+    /// inserting a new one. This preserves the object_id across renames.
     pub(crate) async fn l1_scan_finish(
         conn: &mut sqlx::SqliteConnection,
         delete_stale: bool,
-    ) -> Result<(u64, u64), S3Error> {
-        // Insert new objects that exist on disk but not in the catalog
+    ) -> Result<(u64, u64, u64), S3Error> {
+        // Step 1: Detect moves — new keys whose inode+device_id match an
+        // existing object under a different key.
+        let moves: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT d.key, o.key, o.id
+             FROM l1_disk d
+             INNER JOIN objects o ON d.inode = o.inode AND d.device_id = o.device_id
+             WHERE d.key NOT IN (SELECT key FROM objects)
+               AND d.inode IS NOT NULL
+               AND o.key != d.key",
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+
+        let mut moved: u64 = 0;
+        for (new_key, _old_key, _object_id) in &moves {
+            // Update the existing object's key to the new location
+            let parent = new_key
+                .rsplit_once('/')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_default();
+            sqlx::query(
+                "UPDATE objects SET key = ?, parent_directory = ?, last_modified = ?
+                 WHERE id = ?",
+            )
+            .bind(new_key)
+            .bind(&parent)
+            .bind(time::OffsetDateTime::now_utc())
+            .bind(_object_id)
+            .execute(&mut *conn)
+            .await?;
+            tracing::info!(
+                old_key = %_old_key,
+                new_key = %new_key,
+                object_id = %_object_id,
+                "Move detected, preserving object_id"
+            );
+            moved += 1;
+        }
+
+        // Step 2: Insert truly new objects (not in catalog AND not a move)
         let inserted = sqlx::query(
             "INSERT INTO objects (
                 id, key, parent_directory, is_directory, is_symlink, symlink_target,
-                size, content_type, last_modified, created_at, scan_level
+                size, inode, device_id, content_type, last_modified, created_at, scan_level
             )
             SELECT
                 d.id, d.key, d.parent_directory, FALSE, d.is_symlink, d.symlink_target,
-                d.size, d.content_type, d.last_modified, d.created_at, 1
+                d.size, d.inode, d.device_id, d.content_type, d.last_modified, d.created_at, 1
             FROM l1_disk d
             WHERE d.key NOT IN (SELECT key FROM objects)",
         )
@@ -875,7 +948,7 @@ impl MetadataStore {
         .await?;
         let discovered = inserted.rows_affected();
 
-        // Delete objects that are in the catalog but no longer on disk
+        // Step 3: Delete objects that are in the catalog but no longer on disk
         let deleted = if delete_stale {
             let result =
                 sqlx::query("DELETE FROM objects WHERE key NOT IN (SELECT key FROM l1_disk)")
@@ -891,7 +964,7 @@ impl MetadataStore {
             .execute(&mut *conn)
             .await?;
 
-        Ok((discovered, deleted))
+        Ok((discovered, deleted, moved))
     }
 
     /// Reset an object's scan level (e.g. after a file is modified on disk).

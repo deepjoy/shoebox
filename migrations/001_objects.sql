@@ -36,3 +36,4 @@ CREATE TABLE IF NOT EXISTS objects (
 
 CREATE INDEX IF NOT EXISTS idx_objects_parent ON objects(parent_directory);
 CREATE INDEX IF NOT EXISTS idx_objects_checksum_sha256 ON objects(checksum_sha256);
+CREATE INDEX IF NOT EXISTS idx_objects_inode ON objects(inode, device_id) WHERE inode IS NOT NULL;

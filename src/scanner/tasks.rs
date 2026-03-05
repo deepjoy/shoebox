@@ -33,10 +33,21 @@ pub struct ScanL1Task {
     pub bucket: String,
     pub scope: ScanScope,
     pub target_level: i32,
+    /// Override the default priority. When `None`, uses `TypedTask::priority()`
+    /// default (NORMAL). Sync sets this to HIGH to preempt background work.
+    #[serde(default)]
+    pub priority: Option<u8>,
 }
 
 impl TypedTask for ScanL1Task {
     const TASK_TYPE: &'static str = "scan-l1";
+
+    fn priority(&self) -> taskmill::Priority {
+        match self.priority {
+            Some(p) => taskmill::Priority::new(p),
+            None => taskmill::Priority::NORMAL,
+        }
+    }
 }
 
 /// L2: Collect filesystem metadata (size, mtime, ctime, inode) for objects
@@ -45,10 +56,21 @@ impl TypedTask for ScanL1Task {
 pub struct ScanL2Task {
     pub bucket: String,
     pub cursor: Option<String>,
+    /// Override the default priority. When `None`, uses `TypedTask::priority()`
+    /// default (NORMAL). Sync sets this to NORMAL to run before BACKGROUND tasks.
+    #[serde(default)]
+    pub priority: Option<u8>,
 }
 
 impl TypedTask for ScanL2Task {
     const TASK_TYPE: &'static str = "scan-l2";
+
+    fn priority(&self) -> taskmill::Priority {
+        match self.priority {
+            Some(p) => taskmill::Priority::new(p),
+            None => taskmill::Priority::NORMAL,
+        }
+    }
 }
 
 /// L3: Read files and compute content hashes (MD5 + SHA-256).
@@ -124,6 +146,7 @@ impl TaskExecutor for ScanL1Executor {
                     &ScanL2Task {
                         bucket: task.bucket.clone(),
                         cursor: None,
+                        priority: None,
                     },
                     priority,
                 )
@@ -231,6 +254,7 @@ impl TaskExecutor for ScanL2Executor {
                         &ScanL2Task {
                             bucket: task.bucket.clone(),
                             cursor: keys.last().cloned(),
+                            priority: None,
                         },
                         ctx.record.priority,
                     )

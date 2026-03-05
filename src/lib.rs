@@ -311,6 +311,7 @@ impl Shoebox {
                 bucket: bucket.to_string(),
                 scope: ScanScope::Bucket,
                 target_level,
+                priority: None,
             })
             .await
             .map_err(|_| S3Error::InternalError)?;
@@ -321,6 +322,16 @@ impl Shoebox {
     pub async fn scan_l1(&self, bucket: &str) -> Result<scanner::L1Report, S3Error> {
         let b = self.get_bucket(bucket)?;
         levels::scan_l1(&b.metadata, b.storage.root(), &ScanScope::Bucket).await
+    }
+
+    /// Trigger sync for a bucket — submits L1 (HIGH) + L2 (NORMAL) tasks
+    /// to TaskMill and returns immediately.
+    ///
+    /// Does NOT run L3 (content hashing) — that runs in the background
+    /// via taskmill at its own pace.
+    pub async fn sync(&self, bucket: &str) -> Result<(), S3Error> {
+        let b = self.get_bucket(bucket)?;
+        crate::services::sync_service::sync(&b.scheduler, bucket).await
     }
 
     // -- HTTP layer bridge --
@@ -630,6 +641,7 @@ impl ShoeboxBuilder {
                 .submit_typed(&ScanL2Task {
                     bucket: r.name.clone(),
                     cursor: None,
+                    priority: None,
                 })
                 .await;
             let _ = scheduler
@@ -1297,5 +1309,81 @@ mod tests {
         assert_eq!(shoebox.host, "1.2.3.4");
         assert_eq!(shoebox.port, 7777);
         assert!(shoebox.buckets.contains_key("file-cfg"));
+    }
+
+    // -- Phase 7 tests --
+
+    #[tokio::test]
+    async fn test_sync_library_method() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("synctest");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        std::fs::write(bucket_dir.join("a.txt"), "a").unwrap();
+
+        let shoebox = Shoebox::builder()
+            .bucket(&bucket_dir)
+            .build()
+            .await
+            .unwrap();
+
+        // Sync should submit tasks and return immediately without error
+        shoebox.sync("synctest").await.unwrap();
+
+        // Sync on nonexistent bucket should fail
+        let err = shoebox.sync("nonexistent").await;
+        assert!(matches!(err, Err(S3Error::NoSuchBucket)));
+    }
+
+    #[tokio::test]
+    async fn test_move_detection_preserves_object_id() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("movetest");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        std::fs::write(bucket_dir.join("original.txt"), "move me").unwrap();
+
+        let shoebox = Shoebox::builder()
+            .bucket(&bucket_dir)
+            .build()
+            .await
+            .unwrap();
+
+        // Get the original object's id
+        let original = shoebox
+            .head_object("movetest", "original.txt")
+            .await
+            .unwrap();
+        let original_id = original.id.clone();
+
+        // Rename the file on disk (filesystem-level move)
+        std::fs::rename(
+            bucket_dir.join("original.txt"),
+            bucket_dir.join("renamed.txt"),
+        )
+        .unwrap();
+
+        // Run L1 scan to detect the move
+        let report = shoebox.scan_l1("movetest").await.unwrap();
+
+        // Should detect 1 move, 0 new discoveries, 0 deletions
+        assert_eq!(report.moved, 1, "Should detect 1 move");
+        assert_eq!(report.discovered, 0, "No new files");
+        assert_eq!(
+            report.deleted, 0,
+            "Old key should not be deleted (it was moved)"
+        );
+
+        // The renamed file should exist with the SAME object_id
+        let renamed = shoebox
+            .head_object("movetest", "renamed.txt")
+            .await
+            .unwrap();
+        assert_eq!(
+            renamed.id, original_id,
+            "Object ID should be preserved across rename"
+        );
+
+        // The old key should no longer exist
+        let old = shoebox.head_object("movetest", "original.txt").await;
+        assert!(old.is_err(), "Old key should not exist");
     }
 }
