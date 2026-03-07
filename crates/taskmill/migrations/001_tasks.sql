@@ -50,3 +50,15 @@ CREATE TABLE IF NOT EXISTS task_history (
 CREATE INDEX IF NOT EXISTS idx_history_type_completed
     ON task_history (task_type, completed_at DESC)
     WHERE status = 'completed';
+
+-- Index for task lookup by key (used by task dedup and status checks).
+CREATE INDEX IF NOT EXISTS idx_history_key
+    ON task_history (key, completed_at DESC);
+
+-- Index for paginating and pruning history by completion time.
+CREATE INDEX IF NOT EXISTS idx_history_completed
+    ON task_history (completed_at DESC);
+
+-- Index for filtering history by status (e.g. listing failed tasks).
+CREATE INDEX IF NOT EXISTS idx_history_status
+    ON task_history (status, completed_at DESC);
