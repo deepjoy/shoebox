@@ -1588,6 +1588,123 @@ impl MetadataStore {
 
         Ok(uploads)
     }
+
+    // -- CORS rules (Phase 9) --
+
+    /// Get CORS rules from the bucket_config table.
+    pub async fn get_cors_rules(&self) -> Result<Vec<crate::types::cors::CorsRule>, S3Error> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM bucket_config WHERE key = 'cors_rules'")
+                .fetch_optional(&self.pool)
+                .await?;
+        match row {
+            Some((json,)) => serde_json::from_str(&json).map_err(|e| {
+                tracing::error!("Failed to parse CORS rules JSON: {e}");
+                S3Error::InternalError
+            }),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Set CORS rules in the bucket_config table (upsert).
+    pub async fn set_cors_rules(
+        &self,
+        rules: &[crate::types::cors::CorsRule],
+    ) -> Result<(), S3Error> {
+        let json = serde_json::to_string(rules).map_err(|e| {
+            tracing::error!("Failed to serialize CORS rules: {e}");
+            S3Error::InternalError
+        })?;
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        sqlx::query(
+            "INSERT INTO bucket_config (key, value, updated_at) VALUES ('cors_rules', ?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = ?1, updated_at = ?2",
+        )
+        .bind(&json)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete CORS rules from the bucket_config table.
+    pub async fn delete_cors_rules(&self) -> Result<(), S3Error> {
+        sqlx::query("DELETE FROM bucket_config WHERE key = 'cors_rules'")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // -- Webhook configs (Phase 9) --
+
+    /// Get webhook configurations from the bucket_config table.
+    pub async fn get_webhook_configs(
+        &self,
+    ) -> Result<Vec<crate::types::notification::WebhookConfig>, S3Error> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM bucket_config WHERE key = 'webhooks'")
+                .fetch_optional(&self.pool)
+                .await?;
+        match row {
+            Some((json,)) => serde_json::from_str(&json).map_err(|e| {
+                tracing::error!("Failed to parse webhook configs JSON: {e}");
+                S3Error::InternalError
+            }),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Set webhook configurations in the bucket_config table (upsert).
+    pub async fn set_webhook_configs(
+        &self,
+        webhooks: &[crate::types::notification::WebhookConfig],
+    ) -> Result<(), S3Error> {
+        let json = serde_json::to_string(webhooks).map_err(|e| {
+            tracing::error!("Failed to serialize webhook configs: {e}");
+            S3Error::InternalError
+        })?;
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        sqlx::query(
+            "INSERT INTO bucket_config (key, value, updated_at) VALUES ('webhooks', ?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = ?1, updated_at = ?2",
+        )
+        .bind(&json)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Log a webhook delivery attempt.
+    pub async fn log_delivery(
+        &self,
+        webhook_id: &str,
+        object_key: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), S3Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        sqlx::query(
+            "INSERT INTO notification_delivery_log (id, webhook_id, event_type, object_key, delivered_at, attempts, last_error, status) \
+             VALUES (?1, ?2, 'webhook', ?3, ?4, 1, ?5, ?6)",
+        )
+        .bind(&id)
+        .bind(webhook_id)
+        .bind(object_key)
+        .bind(&now)
+        .bind(error)
+        .bind(status)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// Scan status summary for a bucket.

@@ -1,3 +1,4 @@
+pub mod cors;
 pub mod middleware;
 pub mod presigned;
 pub mod provider;

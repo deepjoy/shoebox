@@ -17,6 +17,7 @@ use crate::services::copy_service::{self, CopyConditions};
 use crate::services::object_service::{self, PutObjectInput};
 use crate::services::AppState;
 use crate::storage::filesystem::FileContent;
+use crate::types::notification::S3Event;
 use crate::types::ChecksumValues;
 
 /// Append non-None checksum headers to a response header list.
@@ -347,6 +348,20 @@ pub async fn put_object(
         )
         .await?;
 
+        // Emit event after successful copy
+        dst_bucket.event_bus.emit(S3Event {
+            event_name: "s3:ObjectCreated:Copy".to_string(),
+            event_time: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            bucket: bucket_name.to_string(),
+            object_id: result.object_id.clone(),
+            object_key: key.to_string(),
+            size: Some(result.size),
+            etag: Some(result.etag.clone()),
+            source_object_id: None,
+        });
+
         // Return CopyObjectResult XML
         let last_modified = result
             .last_modified
@@ -400,6 +415,20 @@ pub async fn put_object(
     let result =
         object_service::put_object(&bucket.storage, &bucket.metadata, &key, stream, input).await?;
 
+    // Emit event after successful put
+    bucket.event_bus.emit(S3Event {
+        event_name: "s3:ObjectCreated:Put".to_string(),
+        event_time: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        bucket: bucket_name.to_string(),
+        object_id: result.object_id.clone(),
+        object_key: key.to_string(),
+        size: Some(result.size),
+        etag: Some(result.etag.clone()),
+        source_object_id: None,
+    });
+
     let mut resp_headers = vec![(header::ETAG.to_string(), result.etag)];
     append_checksum_headers(&result.checksums, &mut resp_headers);
 
@@ -443,9 +472,24 @@ pub async fn delete_object(
     }
 
     let State(state) = state;
-    let Path((bucket, key)) = path;
-    let bucket = state.get_bucket(&bucket)?;
+    let Path((bucket_name, key)) = path;
+    let bucket = state.get_bucket(&bucket_name)?;
     object_service::delete_object(&bucket.storage, &bucket.metadata, &key).await?;
+
+    // Emit event after successful delete
+    bucket.event_bus.emit(S3Event {
+        event_name: "s3:ObjectRemoved:Delete".to_string(),
+        event_time: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        bucket: bucket_name.to_string(),
+        object_id: String::new(), // object already deleted, no ID available
+        object_key: key.to_string(),
+        size: None,
+        etag: None,
+        source_object_id: None,
+    });
+
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

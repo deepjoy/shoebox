@@ -113,12 +113,43 @@ impl Shoebox {
         input: PutObjectInput,
     ) -> Result<PutObjectResult, S3Error> {
         let b = self.get_bucket(bucket)?;
-        object_service::put_object(&b.storage, &b.metadata, key, stream, input).await
+        let result =
+            object_service::put_object(&b.storage, &b.metadata, key, stream, input).await?;
+
+        b.event_bus.emit(crate::types::notification::S3Event {
+            event_name: "s3:ObjectCreated:Put".to_string(),
+            event_time: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            bucket: bucket.to_string(),
+            object_id: result.object_id.clone(),
+            object_key: key.to_string(),
+            size: Some(result.size),
+            etag: Some(result.etag.clone()),
+            source_object_id: None,
+        });
+
+        Ok(result)
     }
 
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
         let b = self.get_bucket(bucket)?;
-        object_service::delete_object(&b.storage, &b.metadata, key).await
+        object_service::delete_object(&b.storage, &b.metadata, key).await?;
+
+        b.event_bus.emit(crate::types::notification::S3Event {
+            event_name: "s3:ObjectRemoved:Delete".to_string(),
+            event_time: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            bucket: bucket.to_string(),
+            object_id: String::new(),
+            object_key: key.to_string(),
+            size: None,
+            etag: None,
+            source_object_id: None,
+        });
+
+        Ok(())
     }
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectRecord, S3Error> {
@@ -153,7 +184,7 @@ impl Shoebox {
     ) -> Result<CopyResult, S3Error> {
         let src = self.get_bucket(src_bucket)?;
         let dst = self.get_bucket(dst_bucket)?;
-        copy_service::copy_object(
+        let result = copy_service::copy_object(
             &src.storage,
             &src.metadata,
             src_key,
@@ -162,7 +193,22 @@ impl Shoebox {
             dst_key,
             conditions,
         )
-        .await
+        .await?;
+
+        dst.event_bus.emit(crate::types::notification::S3Event {
+            event_name: "s3:ObjectCreated:Copy".to_string(),
+            event_time: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            bucket: dst_bucket.to_string(),
+            object_id: result.object_id.clone(),
+            object_key: dst_key.to_string(),
+            size: Some(result.size),
+            etag: Some(result.etag.clone()),
+            source_object_id: None,
+        });
+
+        Ok(result)
     }
 
     pub async fn rename_object(
@@ -476,6 +522,53 @@ impl Shoebox {
         }
 
         Ok(result)
+    }
+
+    // -- Phase 9: CORS configuration --
+
+    pub async fn get_cors_rules(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<crate::types::cors::CorsRule>, S3Error> {
+        let b = self.get_bucket(bucket)?;
+        services::cors_service::get_rules(&b.metadata).await
+    }
+
+    pub async fn set_cors_rules(
+        &self,
+        bucket: &str,
+        rules: Vec<crate::types::cors::CorsRule>,
+    ) -> Result<(), S3Error> {
+        let b = self.get_bucket(bucket)?;
+        services::cors_service::set_rules(&b.metadata, rules).await?;
+        services::cors_service::invalidate_cache(&b.cors_cache).await;
+        Ok(())
+    }
+
+    pub async fn delete_cors_rules(&self, bucket: &str) -> Result<(), S3Error> {
+        let b = self.get_bucket(bucket)?;
+        services::cors_service::delete_rules(&b.metadata).await?;
+        services::cors_service::invalidate_cache(&b.cors_cache).await;
+        Ok(())
+    }
+
+    // -- Phase 9: Webhook configuration --
+
+    pub async fn get_webhooks(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<crate::types::notification::WebhookConfig>, S3Error> {
+        let b = self.get_bucket(bucket)?;
+        services::notification_service::get_webhook_config(&b.metadata).await
+    }
+
+    pub async fn set_webhooks(
+        &self,
+        bucket: &str,
+        webhooks: Vec<crate::types::notification::WebhookConfig>,
+    ) -> Result<(), S3Error> {
+        let b = self.get_bucket(bucket)?;
+        services::notification_service::set_webhook_config(&b.metadata, webhooks).await
     }
 
     // -- HTTP layer bridge --
@@ -914,8 +1007,25 @@ impl ShoeboxBuilder {
                     watcher,
                     scheduler,
                     freshly_created: r.freshly_created,
+                    cors_cache: Arc::new(tokio::sync::RwLock::new(None)),
+                    event_bus: crate::types::notification::EventBus::new(256),
                 },
             );
+        }
+
+        // Subscribe NotificationService to each bucket's EventBus for webhook delivery
+        for (name, bucket) in &buckets {
+            let metadata = Arc::new(bucket.metadata.clone());
+            let (notification_svc, delivery_worker) =
+                crate::services::notification_service::NotificationService::new(
+                    metadata,
+                    shutdown_token.clone(),
+                );
+            let rx = bucket.event_bus.subscribe();
+            let listen_future = notification_svc.listen(rx);
+            tokio::spawn(listen_future);
+            tokio::spawn(delivery_worker);
+            tracing::debug!(bucket = %name, "Notification service subscribed to EventBus");
         }
 
         let mut provider = CredentialProvider::from_buckets(
