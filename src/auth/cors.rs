@@ -65,10 +65,20 @@ pub async fn cors_middleware(
                 cors.allow_origin.parse().unwrap(),
             );
             headers.insert(header::VARY, "Origin".parse().unwrap());
-            if !cors.expose_headers.is_empty() {
+            // Always expose S3 checksum headers so the browser can read them.
+            let expose = merge_expose_headers(
+                &cors.expose_headers,
+                &[
+                    "x-amz-checksum-sha256",
+                    "x-amz-checksum-sha1",
+                    "x-amz-checksum-crc32",
+                    "x-amz-checksum-crc32c",
+                ],
+            );
+            if !expose.is_empty() {
                 headers.insert(
                     header::ACCESS_CONTROL_EXPOSE_HEADERS,
-                    cors.expose_headers.parse().unwrap(),
+                    expose.parse().unwrap(),
                 );
             }
         }
@@ -134,6 +144,25 @@ fn build_preflight_response(cors: &CorsHeaders) -> Response {
     }
 
     (StatusCode::OK, headers).into_response()
+}
+
+/// Merge user-configured expose headers with always-required S3 headers,
+/// deduplicating case-insensitively.
+fn merge_expose_headers(user_headers: &str, extra: &[&str]) -> String {
+    let mut parts: Vec<String> = if user_headers.is_empty() {
+        Vec::new()
+    } else {
+        user_headers
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+    for &h in extra {
+        if !parts.iter().any(|p| p.eq_ignore_ascii_case(h)) {
+            parts.push(h.to_string());
+        }
+    }
+    parts.join(", ")
 }
 
 /// Extract bucket name from a path-style URL.

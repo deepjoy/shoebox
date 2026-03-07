@@ -100,6 +100,34 @@ impl Default for ObjectRecord {
     }
 }
 
+/// Compute the exclusive upper-bound key for a prefix range scan.
+///
+/// For a prefix like `"photos/"`, returns `Some("photos0")` — where `0` is
+/// the character after `/` in ASCII (0x30 vs 0x2F). The caller can then use
+/// `key >= prefix AND key < upper` instead of `key LIKE 'photos/%' ESCAPE '\'`,
+/// which lets SQLite use a B-tree range seek on the `key` unique index.
+///
+/// Returns `None` for an empty prefix (meaning "match all keys").
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut bytes = prefix.as_bytes().to_vec();
+    // Walk backwards to find a byte we can increment without overflow.
+    while let Some(last) = bytes.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            // Safety: incrementing a valid UTF-8 byte may produce a non-UTF-8
+            // sequence, but SQLite compares as raw bytes so this is fine for
+            // the range bound. We use from_utf8_lossy to get a String.
+            return Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.pop();
+    }
+    // All bytes were 0xFF — no upper bound needed (prefix is the max).
+    None
+}
+
 /// SQLite-backed metadata store for a single bucket.
 #[derive(Clone)]
 pub struct MetadataStore {
@@ -335,18 +363,21 @@ impl MetadataStore {
         prefix: &str,
         max_keys: i32,
     ) -> Result<Vec<ObjectRecord>, S3Error> {
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("{escaped}%");
-        let records = sqlx::query_as::<_, ObjectRecord>(
-            "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key LIMIT ?",
-        )
-        .bind(&pattern)
-        .bind(max_keys)
-        .fetch_all(&self.pool)
-        .await?;
+        let records = if let Some(upper) = prefix_upper_bound(prefix) {
+            sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key >= ? AND key < ? ORDER BY key LIMIT ?",
+            )
+            .bind(prefix)
+            .bind(&upper)
+            .bind(max_keys)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects ORDER BY key LIMIT ?")
+                .bind(max_keys)
+                .fetch_all(&self.pool)
+                .await?
+        };
 
         Ok(records)
     }
@@ -367,31 +398,40 @@ impl MetadataStore {
         delimiter: Option<&str>,
         start_after: Option<&str>,
     ) -> Pin<Box<dyn Stream<Item = Result<ListEntry, S3Error>> + Send + '_>> {
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("{escaped}%");
+        let upper = prefix_upper_bound(prefix);
+        let prefix_owned = prefix.to_string();
+        let after_owned = start_after.map(|s| s.to_string());
 
         let raw_stream: Pin<Box<dyn Stream<Item = Result<ObjectRecord, sqlx::Error>> + Send + '_>> =
-            if let Some(after) = start_after {
-                let after = after.to_string();
-                Box::pin(
+            match (after_owned, upper) {
+                (Some(after), Some(ub)) => Box::pin(
                     sqlx::query_as::<_, ObjectRecord>(
-                        "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' AND key > ? ORDER BY key",
+                        "SELECT * FROM objects WHERE key >= ? AND key < ? AND key > ? ORDER BY key",
                     )
-                    .bind(pattern)
+                    .bind(prefix_owned.clone())
+                    .bind(ub)
                     .bind(after)
                     .fetch(&self.pool),
-                )
-            } else {
-                Box::pin(
+                ),
+                (Some(after), None) => Box::pin(
                     sqlx::query_as::<_, ObjectRecord>(
-                        "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
+                        "SELECT * FROM objects WHERE key > ? ORDER BY key",
                     )
-                    .bind(pattern)
+                    .bind(after)
                     .fetch(&self.pool),
-                )
+                ),
+                (None, Some(ub)) => Box::pin(
+                    sqlx::query_as::<_, ObjectRecord>(
+                        "SELECT * FROM objects WHERE key >= ? AND key < ? ORDER BY key",
+                    )
+                    .bind(prefix_owned.clone())
+                    .bind(ub)
+                    .fetch(&self.pool),
+                ),
+                (None, None) => Box::pin(
+                    sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects ORDER BY key")
+                        .fetch(&self.pool),
+                ),
             };
 
         match delimiter {
@@ -475,17 +515,12 @@ impl MetadataStore {
         max_keys: i32,
         start_after: Option<&str>,
     ) -> Result<(Vec<ObjectRecord>, Vec<String>, bool, Option<String>), S3Error> {
-        let escaped_prefix = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("{escaped_prefix}%");
         let max = max_keys as usize;
 
         // No delimiter: flat list with one extra row for truncation detection.
         let Some(delim) = delimiter else {
             let limit = max_keys as i64 + 1;
-            let records = self.fetch_page(&pattern, start_after, limit).await?;
+            let records = self.fetch_page(prefix, start_after, limit).await?;
             let is_truncated = records.len() > max;
             let mut objects = records;
             if is_truncated {
@@ -508,7 +543,7 @@ impl MetadataStore {
         let mut common_prefixes = std::collections::BTreeSet::new();
         let mut cursor: Option<String> = None;
 
-        let keys = self.fetch_keys(&pattern, start_after).await?;
+        let keys = self.fetch_keys(prefix, start_after).await?;
         for key in keys {
             let count = object_keys.len() + common_prefixes.len();
             if count > max {
@@ -557,53 +592,85 @@ impl MetadataStore {
         Ok((objects, cp_vec, is_truncated, next_token))
     }
 
-    /// Fetch a page of records matching a LIKE pattern, optionally after a cursor key.
+    /// Fetch a page of records matching a prefix range, optionally after a cursor key.
     async fn fetch_page(
         &self,
-        pattern: &str,
+        prefix: &str,
         after: Option<&str>,
         limit: i64,
     ) -> Result<Vec<ObjectRecord>, S3Error> {
-        if let Some(after) = after {
-            sqlx::query_as::<_, ObjectRecord>(
-                "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' AND key > ? ORDER BY key LIMIT ?",
+        let upper = prefix_upper_bound(prefix);
+        match (after, &upper) {
+            (Some(after), Some(ub)) => sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key >= ? AND key < ? AND key > ? ORDER BY key LIMIT ?",
             )
-            .bind(pattern)
+            .bind(prefix)
+            .bind(ub)
             .bind(after)
             .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(Into::into)
-        } else {
-            sqlx::query_as::<_, ObjectRecord>(
-                "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key LIMIT ?",
+            .map_err(Into::into),
+            (Some(after), None) => sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key > ? ORDER BY key LIMIT ?",
             )
-            .bind(pattern)
+            .bind(after)
             .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(Into::into)
+            .map_err(Into::into),
+            (None, Some(ub)) => sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key >= ? AND key < ? ORDER BY key LIMIT ?",
+            )
+            .bind(prefix)
+            .bind(ub)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into),
+            (None, None) => {
+                sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects ORDER BY key LIMIT ?")
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(Into::into)
+            }
         }
     }
 
-    /// Fetch only the `key` column for all objects matching `pattern`, optionally
+    /// Fetch only the `key` column for all objects matching a prefix, optionally
     /// starting after `after`. Uses the covering index on `key` (no row lookup).
-    async fn fetch_keys(&self, pattern: &str, after: Option<&str>) -> Result<Vec<String>, S3Error> {
-        if let Some(after) = after {
-            sqlx::query_scalar(
-                "SELECT key FROM objects WHERE key LIKE ? ESCAPE '\\' AND key > ? ORDER BY key",
+    async fn fetch_keys(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>, S3Error> {
+        let upper = prefix_upper_bound(prefix);
+        match (after, &upper) {
+            (Some(after), Some(ub)) => sqlx::query_scalar(
+                "SELECT key FROM objects WHERE key >= ? AND key < ? AND key > ? ORDER BY key",
             )
-            .bind(pattern)
+            .bind(prefix)
+            .bind(ub)
             .bind(after)
             .fetch_all(&self.pool)
             .await
-            .map_err(Into::into)
-        } else {
-            sqlx::query_scalar("SELECT key FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key")
-                .bind(pattern)
+            .map_err(Into::into),
+            (Some(after), None) => {
+                sqlx::query_scalar("SELECT key FROM objects WHERE key > ? ORDER BY key")
+                    .bind(after)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(Into::into)
+            }
+            (None, Some(ub)) => sqlx::query_scalar(
+                "SELECT key FROM objects WHERE key >= ? AND key < ? ORDER BY key",
+            )
+            .bind(prefix)
+            .bind(ub)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into),
+            (None, None) => sqlx::query_scalar("SELECT key FROM objects ORDER BY key")
                 .fetch_all(&self.pool)
                 .await
-                .map_err(Into::into)
+                .map_err(Into::into),
         }
     }
 
@@ -1465,17 +1532,19 @@ impl MetadataStore {
         &self,
         prefix: &str,
     ) -> Result<Vec<ObjectRecord>, S3Error> {
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("{escaped}%");
-        let records = sqlx::query_as::<_, ObjectRecord>(
-            "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
-        )
-        .bind(&pattern)
-        .fetch_all(&self.pool)
-        .await?;
+        let records = if let Some(upper) = prefix_upper_bound(prefix) {
+            sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key >= ? AND key < ? ORDER BY key",
+            )
+            .bind(prefix)
+            .bind(&upper)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects ORDER BY key")
+                .fetch_all(&self.pool)
+                .await?
+        };
 
         Ok(records)
     }

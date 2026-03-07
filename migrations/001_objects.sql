@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS objects (
     scan_level INTEGER NOT NULL DEFAULT 1
 );
 
-CREATE INDEX IF NOT EXISTS idx_objects_parent ON objects(parent_directory);
-CREATE INDEX IF NOT EXISTS idx_objects_checksum_sha256 ON objects(checksum_sha256);
+CREATE INDEX IF NOT EXISTS idx_objects_parent ON objects(parent_directory, key);
+CREATE INDEX IF NOT EXISTS idx_objects_checksum_sha256 ON objects(checksum_sha256, key);
 CREATE INDEX IF NOT EXISTS idx_objects_inode ON objects(inode, device_id) WHERE inode IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_objects_scan_level_key ON objects(scan_level, key);
