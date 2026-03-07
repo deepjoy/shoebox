@@ -72,7 +72,28 @@ p02_cors_preflight() {
 }
 part p02_cors_preflight "CORS Preflight"
 
-p03_cors_on_regular_request() {
+p03_cors_root_path() {
+  step "Verify CORS on root path (ListBuckets)"
+
+  note "ListBuckets (GET /) has no bucket in the path."
+  note "CORS middleware checks all loaded buckets for a matching rule."
+  echo ""
+
+  note "OPTIONS preflight on root path — should return 200 with CORS headers"
+  run "curl -s -D - -o /dev/null -X OPTIONS '$ENDPOINT/' -H 'Origin: https://example.com' -H 'Access-Control-Request-Method: GET' 2>&1 | head -10"
+  echo ""
+
+  note "GET / with Origin header — response should include CORS headers"
+  run "signed_curl GET '/' -H 'Origin: https://example.com' -D - -o /dev/null 2>&1 | head -10"
+  echo ""
+
+  note "Unauthorized origin on root — should return 403"
+  run "curl -s -o /dev/null -w 'HTTP Status: %{http_code}\n' -X OPTIONS '$ENDPOINT/' -H 'Origin: https://evil.com' -H 'Access-Control-Request-Method: GET'"
+  echo ""
+}
+part p03_cors_root_path "CORS on Root Path"
+
+p04_cors_on_regular_request() {
   step "Verify CORS headers on regular (authenticated) request"
 
   note "Upload a test file"
@@ -88,9 +109,9 @@ p03_cors_on_regular_request() {
   run "signed_curl GET '/photos/cors-test.txt' -H 'Origin: https://cdn.example.com' -D - -o /dev/null 2>&1 | head -15"
   echo ""
 }
-part p03_cors_on_regular_request "CORS on Requests"
+part p04_cors_on_regular_request "CORS on Requests"
 
-p04_notification_configuration() {
+p05_notification_configuration() {
   step "Configure webhook notifications"
 
   note "PUT bucket notification configuration"
@@ -102,9 +123,9 @@ p04_notification_configuration() {
   run "signed_curl GET '/photos?notification' | python3 -m json.tool"
   echo ""
 }
-part p04_notification_configuration "Notification Configuration"
+part p05_notification_configuration "Notification Configuration"
 
-p05_events_on_operations() {
+p06_events_on_operations() {
   step "Upload & delete objects (events emitted to EventBus)"
 
   note "Upload a file — triggers s3:ObjectCreated:Put event"
@@ -120,9 +141,9 @@ p05_events_on_operations() {
   note "Since no webhook server is running, delivery will be attempted and logged."
   echo ""
 }
-part p05_events_on_operations "Event Emission"
+part p06_events_on_operations "Event Emission"
 
-p06_delete_cors() {
+p07_delete_cors() {
   step "Delete CORS configuration"
 
   run "signed_curl DELETE '/photos?cors' -o /dev/null -w 'HTTP Status: %{http_code}\n'"
@@ -136,12 +157,13 @@ p06_delete_cors() {
   run "curl -s -o /dev/null -w 'HTTP Status: %{http_code}\n' -X OPTIONS '$ENDPOINT/photos/test.jpg' -H 'Origin: https://example.com' -H 'Access-Control-Request-Method: GET'"
   echo ""
 }
-part p06_delete_cors "Delete CORS"
+part p07_delete_cors "Delete CORS"
 
 p99_done() {
   echo ""
   ok "CORS configuration: PUT, GET, DELETE all working."
   ok "CORS preflight: exact and subdomain wildcard matching verified."
+  ok "CORS on root path: ListBuckets preflight and response headers verified."
   ok "Notification configuration: PUT and GET working."
   ok "Events emitted on object create and delete."
   echo ""
