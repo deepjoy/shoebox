@@ -37,63 +37,77 @@ pub async fn cors_middleware(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
+    let bucket_name = extract_bucket_from_path(&path);
+
     // Handle preflight requests
     if method == Method::OPTIONS {
         if let Some(ref origin) = origin {
-            let bucket_name = extract_bucket_from_path(&path);
-
-            if let Some(bucket_name) = bucket_name {
-                if let Ok(bucket) = state.get_bucket(&bucket_name) {
-                    if let Ok(rules) =
-                        cors_service::get_rules_cached(&bucket.cors_cache, &bucket.metadata).await
-                    {
-                        let rm = requested_method.as_deref().unwrap_or("GET");
-
-                        if let Some(cors) = cors_service::check_origin(&rules, origin, rm) {
-                            return build_preflight_response(&cors);
-                        }
-                    }
-                }
+            let rm = requested_method.as_deref().unwrap_or("GET");
+            if let Some(cors) = find_cors_match(&state, bucket_name.as_deref(), origin, rm).await {
+                return build_preflight_response(&cors);
             }
         }
 
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // Extract bucket BEFORE consuming request
-    let bucket_name = extract_bucket_from_path(&path);
-
     // Regular request — run handler
     let mut response = next.run(request).await;
 
     // Add CORS headers to response
     if let Some(ref origin) = origin {
-        if let Some(bucket_name) = bucket_name {
-            if let Ok(bucket) = state.get_bucket(&bucket_name) {
-                if let Ok(rules) =
-                    cors_service::get_rules_cached(&bucket.cors_cache, &bucket.metadata).await
-                {
-                    if let Some(cors) = cors_service::check_origin(&rules, origin, method.as_str())
-                    {
-                        let headers = response.headers_mut();
-                        headers.insert(
-                            header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                            cors.allow_origin.parse().unwrap(),
-                        );
-                        headers.insert(header::VARY, "Origin".parse().unwrap());
-                        if !cors.expose_headers.is_empty() {
-                            headers.insert(
-                                header::ACCESS_CONTROL_EXPOSE_HEADERS,
-                                cors.expose_headers.parse().unwrap(),
-                            );
-                        }
-                    }
-                }
+        if let Some(cors) =
+            find_cors_match(&state, bucket_name.as_deref(), origin, method.as_str()).await
+        {
+            let headers = response.headers_mut();
+            headers.insert(
+                header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                cors.allow_origin.parse().unwrap(),
+            );
+            headers.insert(header::VARY, "Origin".parse().unwrap());
+            if !cors.expose_headers.is_empty() {
+                headers.insert(
+                    header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                    cors.expose_headers.parse().unwrap(),
+                );
             }
         }
     }
 
     response
+}
+
+/// Find a CORS match for the given origin and method.
+///
+/// When `bucket_name` is Some, checks only that bucket's rules.
+/// When None (e.g. ListBuckets at `/`), checks all loaded buckets and
+/// returns the first match — any bucket allowing the origin is sufficient
+/// for server-level operations.
+async fn find_cors_match(
+    state: &AppState,
+    bucket_name: Option<&str>,
+    origin: &str,
+    method: &str,
+) -> Option<CorsHeaders> {
+    if let Some(name) = bucket_name {
+        let bucket = state.get_bucket(name).ok()?;
+        let rules = cors_service::get_rules_cached(&bucket.cors_cache, &bucket.metadata)
+            .await
+            .ok()?;
+        return cors_service::check_origin(&rules, origin, method);
+    }
+
+    // No bucket in path — check all buckets for a matching CORS rule
+    for bucket in state.buckets.values() {
+        if let Ok(rules) =
+            cors_service::get_rules_cached(&bucket.cors_cache, &bucket.metadata).await
+        {
+            if let Some(cors) = cors_service::check_origin(&rules, origin, method) {
+                return Some(cors);
+            }
+        }
+    }
+    None
 }
 
 fn build_preflight_response(cors: &CorsHeaders) -> Response {

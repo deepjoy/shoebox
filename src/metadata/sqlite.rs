@@ -499,73 +499,58 @@ impl MetadataStore {
             return Ok((objects, Vec::new(), is_truncated, next_token));
         };
 
-        // With delimiter: requery loop to fill the page.
-        // We collapse keys into common prefixes which reduces the count,
-        // so a single fetch may not yield enough entries to fill max_keys.
+        // With delimiter: two-phase approach for efficiency.
+        // Phase 1 scans only the `key` column (covering-index scan) to
+        // classify keys into objects vs common prefixes. Phase 2 fetches
+        // full ObjectRecords only for the (few) actual object keys we return.
         let prefix_len = prefix.len();
-        let mut objects = Vec::new();
+        let mut object_keys: Vec<String> = Vec::new();
         let mut common_prefixes = std::collections::BTreeSet::new();
-        let mut cursor = start_after.map(|s| s.to_string());
-        let batch_size = (max_keys as i64 + 1).max(100);
+        let mut cursor: Option<String> = None;
 
-        loop {
-            let records = self
-                .fetch_page(&pattern, cursor.as_deref(), batch_size)
-                .await?;
-            let exhausted = (records.len() as i64) < batch_size;
-
-            for record in records {
-                let count = objects.len() + common_prefixes.len();
-                if count > max {
-                    // We have enough to detect truncation; stop.
-                    break;
-                }
-
-                cursor = Some(record.key.clone());
-                let suffix = &record.key[prefix_len..];
-                if let Some(pos) = suffix.find(delim) {
-                    let cp = format!("{}{}", prefix, &suffix[..pos + delim.len()]);
-                    common_prefixes.insert(cp);
-                } else {
-                    objects.push(record);
-                }
-            }
-
-            let count = objects.len() + common_prefixes.len();
-            if count > max || exhausted {
+        let keys = self.fetch_keys(&pattern, start_after).await?;
+        for key in keys {
+            let count = object_keys.len() + common_prefixes.len();
+            if count > max {
                 break;
+            }
+            cursor = Some(key.clone());
+            let suffix = &key[prefix_len..];
+            if let Some(pos) = suffix.find(delim) {
+                let cp = format!("{}{}", prefix, &suffix[..pos + delim.len()]);
+                common_prefixes.insert(cp);
+            } else {
+                object_keys.push(key);
             }
         }
 
-        let count = objects.len() + common_prefixes.len();
+        let count = object_keys.len() + common_prefixes.len();
         let is_truncated = count > max;
 
-        // Trim to exactly max_keys entries. Remove excess objects first
-        // (common prefixes sort earlier and are typically fewer).
+        // Trim to exactly max_keys entries. Remove excess items,
+        // popping the lexicographically last item each iteration.
         if is_truncated {
-            while objects.len() + common_prefixes.len() > max {
-                // Pop the lexicographically last item.
-                let last_obj = objects.last().map(|o| o.key.as_str());
+            while object_keys.len() + common_prefixes.len() > max {
+                let last_obj = object_keys.last().map(|o| o.as_str());
                 let last_cp = common_prefixes.iter().next_back().map(|s| s.as_str());
                 match (last_obj, last_cp) {
                     (Some(o), Some(c)) if o > c => {
-                        objects.pop();
+                        object_keys.pop();
                     }
                     (_, Some(_)) => {
                         common_prefixes.pop_last();
                     }
                     (Some(_), None) => {
-                        objects.pop();
+                        object_keys.pop();
                     }
                     _ => break,
                 }
             }
         }
 
-        // The continuation token is the last key in sort order among the
-        // items we're returning. For common prefixes, the token must be
-        // the last *actual key* that falls under that prefix so that the
-        // next page starts after all keys in the group.
+        // Phase 2: fetch full records only for the object keys we're returning.
+        let objects = self.fetch_objects_by_keys(&object_keys).await?;
+
         let next_token = if is_truncated { cursor } else { None };
         let cp_vec: Vec<String> = common_prefixes.into_iter().collect();
 
@@ -599,6 +584,44 @@ impl MetadataStore {
             .await
             .map_err(Into::into)
         }
+    }
+
+    /// Fetch only the `key` column for all objects matching `pattern`, optionally
+    /// starting after `after`. Uses the covering index on `key` (no row lookup).
+    async fn fetch_keys(&self, pattern: &str, after: Option<&str>) -> Result<Vec<String>, S3Error> {
+        if let Some(after) = after {
+            sqlx::query_scalar(
+                "SELECT key FROM objects WHERE key LIKE ? ESCAPE '\\' AND key > ? ORDER BY key",
+            )
+            .bind(pattern)
+            .bind(after)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into)
+        } else {
+            sqlx::query_scalar("SELECT key FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key")
+                .bind(pattern)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Into::into)
+        }
+    }
+
+    /// Fetch full ObjectRecords for a specific set of keys.
+    async fn fetch_objects_by_keys(&self, keys: &[String]) -> Result<Vec<ObjectRecord>, S3Error> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: String = keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT * FROM objects WHERE key IN ({}) ORDER BY key",
+            placeholders
+        );
+        let mut query = sqlx::query_as::<_, ObjectRecord>(&sql);
+        for key in keys {
+            query = query.bind(key);
+        }
+        query.fetch_all(&self.pool).await.map_err(Into::into)
     }
 
     /// Get the total count of objects in the store.
