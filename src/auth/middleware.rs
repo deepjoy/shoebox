@@ -151,6 +151,9 @@ fn determine_operation(request: &Request<axum::body::Body>) -> String {
 
     match (method, has_key) {
         ("GET", false) if path == "/" => "ListBuckets",
+        ("GET", false) if query.contains("cors") => "GetBucketCors",
+        ("PUT", false) if query.contains("cors") => "PutBucketCors",
+        ("DELETE", false) if query.contains("cors") => "DeleteBucketCors",
         ("GET", false) if query.contains("location") => "GetBucketLocation",
         ("GET", false) if query.contains("versioning") => "GetBucketVersioning",
         ("GET", false) if query.contains("uploads") => "ListMultipartUploads",

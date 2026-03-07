@@ -127,6 +127,14 @@ pub async fn bucket_or_list(
         return super::integrity::get_integrity_status(State(state), Path(bucket), Query(params))
             .await;
     }
+    // Phase 9: CORS configuration
+    if params.contains_key("cors") {
+        return super::cors::get_bucket_cors(State(state), Path(bucket)).await;
+    }
+    // Phase 9: Notification configuration
+    if params.contains_key("notification") {
+        return super::notification::get_bucket_notification(State(state), Path(bucket)).await;
+    }
     // Default: ListObjectsV2 — re-parse with the typed query struct.
     list_objects_v2(State(state), Path(bucket), Query(params))
         .await
@@ -174,6 +182,40 @@ pub async fn post_bucket_dispatcher(
     }
     if params.contains_key("merge") {
         return super::duplicates::merge_duplicates(State(state), Path(bucket), body).await;
+    }
+    Err(S3Error::MethodNotAllowed)
+}
+
+/// PUT /{bucket} dispatcher — routes on query string.
+pub async fn put_bucket_dispatcher(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: axum::body::Bytes,
+) -> Result<Response, S3Error> {
+    if params.contains_key("cors") {
+        return super::cors::put_bucket_cors(State(state), Path(bucket), body)
+            .await
+            .map(IntoResponse::into_response);
+    }
+    if params.contains_key("notification") {
+        return super::notification::put_bucket_notification(State(state), Path(bucket), body)
+            .await
+            .map(IntoResponse::into_response);
+    }
+    Err(S3Error::MethodNotAllowed)
+}
+
+/// DELETE /{bucket} dispatcher — routes on query string.
+pub async fn delete_bucket_dispatcher(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, S3Error> {
+    if params.contains_key("cors") {
+        return super::cors::delete_bucket_cors(State(state), Path(bucket))
+            .await
+            .map(IntoResponse::into_response);
     }
     Err(S3Error::MethodNotAllowed)
 }

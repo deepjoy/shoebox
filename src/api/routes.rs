@@ -14,6 +14,7 @@ use crate::services::AppState;
 pub fn create_router(state: AppState) -> Router {
     let credential_provider = state.credential_provider.clone();
     let bucket_names = state.bucket_names.clone();
+    let cors_state = state.clone();
 
     Router::new()
         // Service-level: GET / → ListBuckets (or cross-bucket queries)
@@ -37,6 +38,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{bucket}", head(handlers::bucket::head_bucket))
         .route("/{bucket}", get(handlers::bucket::bucket_or_list))
         .route("/{bucket}", post(handlers::bucket::post_bucket_dispatcher))
+        .route(
+            "/{bucket}",
+            put(handlers::bucket::put_bucket_dispatcher)
+                .delete(handlers::bucket::delete_bucket_dispatcher),
+        )
         // Object-level
         .route("/{bucket}/{*key}", get(handlers::object::get_object))
         .route("/{bucket}/{*key}", put(handlers::object::put_object))
@@ -55,5 +61,10 @@ pub fn create_router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(
             bucket_names,
             auth::virtual_host_middleware,
+        ))
+        // CORS middleware — outermost so that unauthenticated OPTIONS requests work
+        .layer(middleware::from_fn_with_state(
+            cors_state,
+            auth::cors::cors_middleware,
         ))
 }

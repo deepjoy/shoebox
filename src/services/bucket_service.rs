@@ -7,6 +7,8 @@ use crate::error::S3Error;
 use crate::metadata::MetadataStore;
 use crate::scanner::watcher::FilesystemWatcher;
 use crate::storage::FilesystemStorage;
+use crate::types::cors::CorsRule;
+use crate::types::notification::EventBus;
 
 /// Runtime state for a single loaded bucket.
 ///
@@ -27,6 +29,12 @@ pub struct LoadedBucket {
     pub scheduler: taskmill::Scheduler,
     /// True when this bucket's config was generated for the first time during build.
     pub freshly_created: bool,
+    /// In-memory cache for CORS rules. Populated on first request, invalidated
+    /// on PutBucketCors / DeleteBucketCors.
+    pub cors_cache: Arc<tokio::sync::RwLock<Option<Vec<CorsRule>>>>,
+    /// Per-bucket event bus for S3 events (object created, deleted, etc.).
+    /// Dropping this causes all subscribers (NotificationService::listen) to exit.
+    pub event_bus: EventBus,
 }
 
 /// Shared storage for async integrity check results.

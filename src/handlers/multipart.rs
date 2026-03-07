@@ -178,6 +178,20 @@ pub async fn complete_multipart_upload(
     )
     .await?;
 
+    // Emit event after successful multipart completion
+    bucket.event_bus.emit(crate::types::notification::S3Event {
+        event_name: "s3:ObjectCreated:CompleteMultipartUpload".to_string(),
+        event_time: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        bucket: bucket_name.to_string(),
+        object_id: String::new(),
+        object_key: result.key.clone(),
+        size: None,
+        etag: Some(result.etag.clone()),
+        source_object_id: None,
+    });
+
     #[derive(serde::Serialize)]
     struct CompleteMultipartUploadResult {
         #[serde(rename = "Location")]

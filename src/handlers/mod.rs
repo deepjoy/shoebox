@@ -1,8 +1,10 @@
 pub mod bucket;
+pub mod cors;
 pub mod duplicates;
 pub mod integrity;
 pub mod list;
 pub mod multipart;
+pub mod notification;
 pub mod object;
 pub mod sync;
 pub mod tagging;
