@@ -350,73 +350,84 @@ pub async fn find_cross_bucket_duplicates(
 
 // ── Directory Hashing (8.8) ─────────────────────────────────────────
 
-/// Compute directory hashes for parent directories that are missing or stale.
-pub async fn compute_directory_hashes(metadata: &MetadataStore) -> Result<(), S3Error> {
+/// Compute and upsert the directory hash for a single parent directory.
+/// Returns `Ok(true)` if the hash was computed, `Ok(false)` if skipped
+/// (e.g. no direct children or not all children have checksums yet).
+pub async fn compute_single_directory_hash(
+    metadata: &MetadataStore,
+    parent_dir: &str,
+) -> Result<bool, S3Error> {
+    let prefix = if parent_dir.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", parent_dir)
+    };
+
+    let files = metadata.get_objects_with_prefix(&prefix).await?;
+    // Only include direct children (not nested)
+    let direct_children: Vec<&ObjectRecord> = files
+        .iter()
+        .filter(|f| {
+            let suffix = f.key.strip_prefix(&prefix).unwrap_or(&f.key);
+            !suffix.contains('/')
+        })
+        .collect();
+
+    if direct_children.is_empty() {
+        return Ok(false);
+    }
+
+    // Build sorted list of (relative_key, checksum_sha256) for hashing
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    let mut all_hashed = true;
+    for f in &direct_children {
+        let rel_key = f.key.strip_prefix(&prefix).unwrap_or(&f.key);
+        if let Some(ref hash) = f.checksum_sha256 {
+            pairs.push((rel_key, hash.as_str()));
+        } else {
+            all_hashed = false;
+        }
+    }
+
+    if !all_hashed || pairs.is_empty() {
+        return Ok(false);
+    }
+
+    pairs.sort_by_key(|(k, _)| *k);
+
+    let mut hasher = Sha256::new();
+    for (key, hash) in &pairs {
+        hasher.update(key.as_bytes());
+        hasher.update(b":");
+        hasher.update(hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    let dir_hash = hex::encode(hasher.finalize());
+
+    let total_size: i64 = direct_children.iter().map(|f| f.size.unwrap_or(0)).sum();
+
+    let record = DirectoryHashRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        prefix: prefix.clone(),
+        dir_hash,
+        file_count: direct_children.len() as i32,
+        total_size,
+        computed_at: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        stale: false,
+    };
+
+    metadata.upsert_directory_hash(&record).await?;
+    Ok(true)
+}
+
+/// Recompute directory hashes for all parent directories that are missing or stale.
+pub async fn recompute_stale_directory_hashes(metadata: &MetadataStore) -> Result<(), S3Error> {
     let parents = metadata.list_unhashed_parent_directories().await?;
 
     for parent in parents {
-        let prefix = if parent.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", parent)
-        };
-
-        let files = metadata.get_objects_with_prefix(&prefix).await?;
-        // Only include direct children (not nested)
-        let direct_children: Vec<&ObjectRecord> = files
-            .iter()
-            .filter(|f| {
-                let suffix = f.key.strip_prefix(&prefix).unwrap_or(&f.key);
-                !suffix.contains('/')
-            })
-            .collect();
-
-        if direct_children.is_empty() {
-            continue;
-        }
-
-        // Build sorted list of (relative_key, checksum_sha256) for hashing
-        let mut pairs: Vec<(&str, &str)> = Vec::new();
-        let mut all_hashed = true;
-        for f in &direct_children {
-            let rel_key = f.key.strip_prefix(&prefix).unwrap_or(&f.key);
-            if let Some(ref hash) = f.checksum_sha256 {
-                pairs.push((rel_key, hash.as_str()));
-            } else {
-                all_hashed = false;
-            }
-        }
-
-        if !all_hashed || pairs.is_empty() {
-            continue;
-        }
-
-        pairs.sort_by_key(|(k, _)| *k);
-
-        let mut hasher = Sha256::new();
-        for (key, hash) in &pairs {
-            hasher.update(key.as_bytes());
-            hasher.update(b":");
-            hasher.update(hash.as_bytes());
-            hasher.update(b"\n");
-        }
-        let dir_hash = hex::encode(hasher.finalize());
-
-        let total_size: i64 = direct_children.iter().map(|f| f.size.unwrap_or(0)).sum();
-
-        let record = DirectoryHashRecord {
-            id: uuid::Uuid::new_v4().to_string(),
-            prefix: prefix.clone(),
-            dir_hash,
-            file_count: direct_children.len() as i32,
-            total_size,
-            computed_at: time::OffsetDateTime::now_utc()
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default(),
-            stale: false,
-        };
-
-        metadata.upsert_directory_hash(&record).await?;
+        compute_single_directory_hash(metadata, &parent).await?;
     }
 
     Ok(())
@@ -431,8 +442,8 @@ pub async fn find_bucket_duplicate_dirs(
     prefix: Option<&str>,
     continuation_token: Option<&str>,
 ) -> Result<DuplicateDirReport, S3Error> {
-    // Recompute stale directory hashes first
-    compute_directory_hashes(metadata).await?;
+    // Recompute stale/missing directory hashes first
+    recompute_stale_directory_hashes(metadata).await?;
 
     let cursor = continuation_token.and_then(decode_dir_cursor);
 

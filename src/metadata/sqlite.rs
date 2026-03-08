@@ -1800,14 +1800,6 @@ impl MetadataStore {
         Ok(rows.into_iter().map(|(p,)| p).collect())
     }
 
-    /// Mark all directory hashes as stale (for rebuild).
-    pub async fn mark_all_dir_hashes_stale(&self) -> Result<(), S3Error> {
-        sqlx::query("UPDATE directory_hashes SET stale = TRUE")
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     /// Find abandoned multipart uploads older than cutoff time.
     pub async fn find_abandoned_uploads(
         &self,

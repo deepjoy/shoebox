@@ -1846,7 +1846,7 @@ mod tests {
 
         // Compute directory hashes
         let bucket = shoebox.get_bucket("photos").unwrap();
-        services::duplicates_service::compute_directory_hashes(&bucket.metadata)
+        services::duplicates_service::recompute_stale_directory_hashes(&bucket.metadata)
             .await
             .unwrap();
 
