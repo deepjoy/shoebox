@@ -100,6 +100,34 @@ impl Default for ObjectRecord {
     }
 }
 
+/// Compute the exclusive upper-bound key for a prefix range scan.
+///
+/// For a prefix like `"photos/"`, returns `Some("photos0")` — where `0` is
+/// the character after `/` in ASCII (0x30 vs 0x2F). The caller can then use
+/// `key >= prefix AND key < upper` instead of `key LIKE 'photos/%' ESCAPE '\'`,
+/// which lets SQLite use a B-tree range seek on the `key` unique index.
+///
+/// Returns `None` for an empty prefix (meaning "match all keys").
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut bytes = prefix.as_bytes().to_vec();
+    // Walk backwards to find a byte we can increment without overflow.
+    while let Some(last) = bytes.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            // Safety: incrementing a valid UTF-8 byte may produce a non-UTF-8
+            // sequence, but SQLite compares as raw bytes so this is fine for
+            // the range bound. We use from_utf8_lossy to get a String.
+            return Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.pop();
+    }
+    // All bytes were 0xFF — no upper bound needed (prefix is the max).
+    None
+}
+
 /// SQLite-backed metadata store for a single bucket.
 #[derive(Clone)]
 pub struct MetadataStore {
@@ -335,18 +363,21 @@ impl MetadataStore {
         prefix: &str,
         max_keys: i32,
     ) -> Result<Vec<ObjectRecord>, S3Error> {
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("{escaped}%");
-        let records = sqlx::query_as::<_, ObjectRecord>(
-            "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key LIMIT ?",
-        )
-        .bind(&pattern)
-        .bind(max_keys)
-        .fetch_all(&self.pool)
-        .await?;
+        let records = if let Some(upper) = prefix_upper_bound(prefix) {
+            sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key >= ? AND key < ? ORDER BY key LIMIT ?",
+            )
+            .bind(prefix)
+            .bind(&upper)
+            .bind(max_keys)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects ORDER BY key LIMIT ?")
+                .bind(max_keys)
+                .fetch_all(&self.pool)
+                .await?
+        };
 
         Ok(records)
     }
@@ -367,31 +398,40 @@ impl MetadataStore {
         delimiter: Option<&str>,
         start_after: Option<&str>,
     ) -> Pin<Box<dyn Stream<Item = Result<ListEntry, S3Error>> + Send + '_>> {
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("{escaped}%");
+        let upper = prefix_upper_bound(prefix);
+        let prefix_owned = prefix.to_string();
+        let after_owned = start_after.map(|s| s.to_string());
 
         let raw_stream: Pin<Box<dyn Stream<Item = Result<ObjectRecord, sqlx::Error>> + Send + '_>> =
-            if let Some(after) = start_after {
-                let after = after.to_string();
-                Box::pin(
+            match (after_owned, upper) {
+                (Some(after), Some(ub)) => Box::pin(
                     sqlx::query_as::<_, ObjectRecord>(
-                        "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' AND key > ? ORDER BY key",
+                        "SELECT * FROM objects WHERE key >= ? AND key < ? AND key > ? ORDER BY key",
                     )
-                    .bind(pattern)
+                    .bind(prefix_owned.clone())
+                    .bind(ub)
                     .bind(after)
                     .fetch(&self.pool),
-                )
-            } else {
-                Box::pin(
+                ),
+                (Some(after), None) => Box::pin(
                     sqlx::query_as::<_, ObjectRecord>(
-                        "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
+                        "SELECT * FROM objects WHERE key > ? ORDER BY key",
                     )
-                    .bind(pattern)
+                    .bind(after)
                     .fetch(&self.pool),
-                )
+                ),
+                (None, Some(ub)) => Box::pin(
+                    sqlx::query_as::<_, ObjectRecord>(
+                        "SELECT * FROM objects WHERE key >= ? AND key < ? ORDER BY key",
+                    )
+                    .bind(prefix_owned.clone())
+                    .bind(ub)
+                    .fetch(&self.pool),
+                ),
+                (None, None) => Box::pin(
+                    sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects ORDER BY key")
+                        .fetch(&self.pool),
+                ),
             };
 
         match delimiter {
@@ -475,17 +515,12 @@ impl MetadataStore {
         max_keys: i32,
         start_after: Option<&str>,
     ) -> Result<(Vec<ObjectRecord>, Vec<String>, bool, Option<String>), S3Error> {
-        let escaped_prefix = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("{escaped_prefix}%");
         let max = max_keys as usize;
 
         // No delimiter: flat list with one extra row for truncation detection.
         let Some(delim) = delimiter else {
             let limit = max_keys as i64 + 1;
-            let records = self.fetch_page(&pattern, start_after, limit).await?;
+            let records = self.fetch_page(prefix, start_after, limit).await?;
             let is_truncated = records.len() > max;
             let mut objects = records;
             if is_truncated {
@@ -508,7 +543,7 @@ impl MetadataStore {
         let mut common_prefixes = std::collections::BTreeSet::new();
         let mut cursor: Option<String> = None;
 
-        let keys = self.fetch_keys(&pattern, start_after).await?;
+        let keys = self.fetch_keys(prefix, start_after).await?;
         for key in keys {
             let count = object_keys.len() + common_prefixes.len();
             if count > max {
@@ -557,53 +592,85 @@ impl MetadataStore {
         Ok((objects, cp_vec, is_truncated, next_token))
     }
 
-    /// Fetch a page of records matching a LIKE pattern, optionally after a cursor key.
+    /// Fetch a page of records matching a prefix range, optionally after a cursor key.
     async fn fetch_page(
         &self,
-        pattern: &str,
+        prefix: &str,
         after: Option<&str>,
         limit: i64,
     ) -> Result<Vec<ObjectRecord>, S3Error> {
-        if let Some(after) = after {
-            sqlx::query_as::<_, ObjectRecord>(
-                "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' AND key > ? ORDER BY key LIMIT ?",
+        let upper = prefix_upper_bound(prefix);
+        match (after, &upper) {
+            (Some(after), Some(ub)) => sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key >= ? AND key < ? AND key > ? ORDER BY key LIMIT ?",
             )
-            .bind(pattern)
+            .bind(prefix)
+            .bind(ub)
             .bind(after)
             .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(Into::into)
-        } else {
-            sqlx::query_as::<_, ObjectRecord>(
-                "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key LIMIT ?",
+            .map_err(Into::into),
+            (Some(after), None) => sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key > ? ORDER BY key LIMIT ?",
             )
-            .bind(pattern)
+            .bind(after)
             .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(Into::into)
+            .map_err(Into::into),
+            (None, Some(ub)) => sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key >= ? AND key < ? ORDER BY key LIMIT ?",
+            )
+            .bind(prefix)
+            .bind(ub)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into),
+            (None, None) => {
+                sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects ORDER BY key LIMIT ?")
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(Into::into)
+            }
         }
     }
 
-    /// Fetch only the `key` column for all objects matching `pattern`, optionally
+    /// Fetch only the `key` column for all objects matching a prefix, optionally
     /// starting after `after`. Uses the covering index on `key` (no row lookup).
-    async fn fetch_keys(&self, pattern: &str, after: Option<&str>) -> Result<Vec<String>, S3Error> {
-        if let Some(after) = after {
-            sqlx::query_scalar(
-                "SELECT key FROM objects WHERE key LIKE ? ESCAPE '\\' AND key > ? ORDER BY key",
+    async fn fetch_keys(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>, S3Error> {
+        let upper = prefix_upper_bound(prefix);
+        match (after, &upper) {
+            (Some(after), Some(ub)) => sqlx::query_scalar(
+                "SELECT key FROM objects WHERE key >= ? AND key < ? AND key > ? ORDER BY key",
             )
-            .bind(pattern)
+            .bind(prefix)
+            .bind(ub)
             .bind(after)
             .fetch_all(&self.pool)
             .await
-            .map_err(Into::into)
-        } else {
-            sqlx::query_scalar("SELECT key FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key")
-                .bind(pattern)
+            .map_err(Into::into),
+            (Some(after), None) => {
+                sqlx::query_scalar("SELECT key FROM objects WHERE key > ? ORDER BY key")
+                    .bind(after)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(Into::into)
+            }
+            (None, Some(ub)) => sqlx::query_scalar(
+                "SELECT key FROM objects WHERE key >= ? AND key < ? ORDER BY key",
+            )
+            .bind(prefix)
+            .bind(ub)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into),
+            (None, None) => sqlx::query_scalar("SELECT key FROM objects ORDER BY key")
                 .fetch_all(&self.pool)
                 .await
-                .map_err(Into::into)
+                .map_err(Into::into),
         }
     }
 
@@ -1393,21 +1460,80 @@ impl MetadataStore {
         })
     }
 
-    /// Find duplicate hash groups, ordered by total wasted size descending.
+    /// Find duplicate hash groups with keyset pagination and optional key filter.
+    ///
+    /// Results are ordered by `total_size DESC, checksum_sha256 ASC`.
+    /// The cursor is `(total_size, checksum_sha256)` from the last row of the
+    /// previous page.  When `key_contains` is set, only groups that contain at
+    /// least one file whose key matches the substring are returned.
     pub async fn find_duplicate_hashes(
         &self,
         max_results: i32,
+        cursor: Option<(i64, &str)>,
+        key_contains: Option<&str>,
     ) -> Result<Vec<DuplicateGroup>, S3Error> {
-        let rows: Vec<DuplicateGroup> = sqlx::query_as(
-            "SELECT checksum_sha256, COUNT(*) as count, SUM(COALESCE(size, 0)) as total_size \
-             FROM objects WHERE checksum_sha256 IS NOT NULL \
-             GROUP BY checksum_sha256 HAVING COUNT(*) > 1 \
-             ORDER BY total_size DESC LIMIT ?",
-        )
-        .bind(max_results)
-        .fetch_all(&self.pool)
-        .await?;
+        let use_filter = key_contains.is_some();
+        let use_cursor = cursor.is_some();
 
+        let mut sql = String::new();
+
+        if use_filter {
+            sql.push_str(
+                "WITH matching AS (\
+                   SELECT DISTINCT checksum_sha256 FROM objects \
+                   WHERE checksum_sha256 IS NOT NULL AND key LIKE '%' || ? || '%'\
+                 ) ",
+            );
+            sql.push_str(
+                "SELECT o.checksum_sha256, COUNT(*) as count, \
+                        SUM(COALESCE(o.size, 0)) as total_size \
+                 FROM objects o \
+                 INNER JOIN matching m ON o.checksum_sha256 = m.checksum_sha256 \
+                 GROUP BY o.checksum_sha256 \
+                 HAVING COUNT(*) > 1",
+            );
+        } else {
+            sql.push_str(
+                "SELECT checksum_sha256, COUNT(*) as count, \
+                        SUM(COALESCE(size, 0)) as total_size \
+                 FROM objects \
+                 WHERE checksum_sha256 IS NOT NULL \
+                 GROUP BY checksum_sha256 \
+                 HAVING COUNT(*) > 1",
+            );
+        }
+
+        if use_cursor {
+            if use_filter {
+                sql.push_str(
+                    " AND (total_size < ? OR (total_size = ? AND \
+                     o.checksum_sha256 > ?))",
+                );
+            } else {
+                sql.push_str(
+                    " AND (total_size < ? OR (total_size = ? AND \
+                     checksum_sha256 > ?))",
+                );
+            }
+        }
+
+        if use_filter {
+            sql.push_str(" ORDER BY total_size DESC, o.checksum_sha256 ASC LIMIT ?");
+        } else {
+            sql.push_str(" ORDER BY total_size DESC, checksum_sha256 ASC LIMIT ?");
+        }
+
+        let mut query = sqlx::query_as::<_, DuplicateGroup>(&sql);
+
+        if let Some(term) = key_contains {
+            query = query.bind(term);
+        }
+        if let Some((size, hash)) = cursor {
+            query = query.bind(size).bind(size).bind(hash);
+        }
+        query = query.bind(max_results);
+
+        let rows = query.fetch_all(&self.pool).await?;
         Ok(rows)
     }
 
@@ -1465,17 +1591,19 @@ impl MetadataStore {
         &self,
         prefix: &str,
     ) -> Result<Vec<ObjectRecord>, S3Error> {
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("{escaped}%");
-        let records = sqlx::query_as::<_, ObjectRecord>(
-            "SELECT * FROM objects WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
-        )
-        .bind(&pattern)
-        .fetch_all(&self.pool)
-        .await?;
+        let records = if let Some(upper) = prefix_upper_bound(prefix) {
+            sqlx::query_as::<_, ObjectRecord>(
+                "SELECT * FROM objects WHERE key >= ? AND key < ? ORDER BY key",
+            )
+            .bind(prefix)
+            .bind(&upper)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects ORDER BY key")
+                .fetch_all(&self.pool)
+                .await?
+        };
 
         Ok(records)
     }
@@ -1544,19 +1672,87 @@ impl MetadataStore {
         &self,
         min_files: i32,
         max_results: i32,
+        prefix: Option<&str>,
+        after_hash: Option<&str>,
     ) -> Result<Vec<DuplicateDirGroup>, S3Error> {
-        let rows: Vec<DuplicateDirGroup> = sqlx::query_as(
-            "SELECT dir_hash, COUNT(*) as count, \
-             MIN(file_count) as file_count, SUM(total_size) as total_size \
-             FROM directory_hashes \
-             WHERE stale = FALSE AND file_count >= ? \
-             GROUP BY dir_hash HAVING COUNT(*) > 1 \
-             ORDER BY total_size DESC LIMIT ?",
-        )
-        .bind(min_files)
-        .bind(max_results)
-        .fetch_all(&self.pool)
-        .await?;
+        // Build the query with optional prefix and cursor filters.
+        // We use a CTE to pre-filter qualifying dir_hashes when prefix is set,
+        // and keyset pagination via the dir_hash cursor.
+        // Ordered by dir_hash for stable, simple keyset pagination.
+        let rows: Vec<DuplicateDirGroup> = match (prefix, after_hash) {
+            (Some(p), Some(ah)) => {
+                let like_pattern = format!("{}%", p);
+                sqlx::query_as(
+                    "SELECT dir_hash, COUNT(*) as count, \
+                     MIN(file_count) as file_count, SUM(total_size) as total_size \
+                     FROM directory_hashes \
+                     WHERE stale = FALSE AND file_count >= ? \
+                       AND dir_hash IN ( \
+                         SELECT dir_hash FROM directory_hashes \
+                         WHERE stale = FALSE AND prefix LIKE ? \
+                       ) \
+                       AND dir_hash > ? \
+                     GROUP BY dir_hash HAVING COUNT(*) > 1 \
+                     ORDER BY dir_hash ASC LIMIT ?",
+                )
+                .bind(min_files)
+                .bind(&like_pattern)
+                .bind(ah)
+                .bind(max_results)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(p), None) => {
+                let like_pattern = format!("{}%", p);
+                sqlx::query_as(
+                    "SELECT dir_hash, COUNT(*) as count, \
+                     MIN(file_count) as file_count, SUM(total_size) as total_size \
+                     FROM directory_hashes \
+                     WHERE stale = FALSE AND file_count >= ? \
+                       AND dir_hash IN ( \
+                         SELECT dir_hash FROM directory_hashes \
+                         WHERE stale = FALSE AND prefix LIKE ? \
+                       ) \
+                     GROUP BY dir_hash HAVING COUNT(*) > 1 \
+                     ORDER BY dir_hash ASC LIMIT ?",
+                )
+                .bind(min_files)
+                .bind(&like_pattern)
+                .bind(max_results)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(ah)) => {
+                sqlx::query_as(
+                    "SELECT dir_hash, COUNT(*) as count, \
+                     MIN(file_count) as file_count, SUM(total_size) as total_size \
+                     FROM directory_hashes \
+                     WHERE stale = FALSE AND file_count >= ? \
+                       AND dir_hash > ? \
+                     GROUP BY dir_hash HAVING COUNT(*) > 1 \
+                     ORDER BY dir_hash ASC LIMIT ?",
+                )
+                .bind(min_files)
+                .bind(ah)
+                .bind(max_results)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query_as(
+                    "SELECT dir_hash, COUNT(*) as count, \
+                     MIN(file_count) as file_count, SUM(total_size) as total_size \
+                     FROM directory_hashes \
+                     WHERE stale = FALSE AND file_count >= ? \
+                     GROUP BY dir_hash HAVING COUNT(*) > 1 \
+                     ORDER BY dir_hash ASC LIMIT ?",
+                )
+                .bind(min_files)
+                .bind(max_results)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
 
         Ok(rows)
     }
@@ -1588,12 +1784,20 @@ impl MetadataStore {
         Ok(rows.into_iter().map(|(p,)| p).collect())
     }
 
-    /// Mark all directory hashes as stale (for rebuild).
-    pub async fn mark_all_dir_hashes_stale(&self) -> Result<(), S3Error> {
-        sqlx::query("UPDATE directory_hashes SET stale = TRUE")
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    /// Get parent directories that need hash (re)computation:
+    /// either missing from directory_hashes or marked stale.
+    pub async fn list_unhashed_parent_directories(&self) -> Result<Vec<String>, S3Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT o.parent_directory FROM objects o \
+             LEFT JOIN directory_hashes dh ON dh.prefix = o.parent_directory || '/' \
+             WHERE o.parent_directory != '' \
+               AND (dh.id IS NULL OR dh.stale = TRUE) \
+             ORDER BY o.parent_directory",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(p,)| p).collect())
     }
 
     /// Find abandoned multipart uploads older than cutoff time.

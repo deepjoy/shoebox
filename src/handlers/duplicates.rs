@@ -18,8 +18,19 @@ struct DuplicateReportXml {
     bucket: String,
     #[serde(rename = "ScanComplete")]
     scan_complete: bool,
+    #[serde(rename = "MaxResults")]
+    max_results: i32,
     #[serde(rename = "IsTruncated")]
     is_truncated: bool,
+    #[serde(rename = "ContinuationToken", skip_serializing_if = "Option::is_none")]
+    continuation_token: Option<String>,
+    #[serde(
+        rename = "NextContinuationToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    next_continuation_token: Option<String>,
+    #[serde(rename = "KeyContains", skip_serializing_if = "Option::is_none")]
+    key_contains: Option<String>,
     #[serde(rename = "DuplicateGroup")]
     groups: Vec<DuplicateGroupXml>,
 }
@@ -74,6 +85,13 @@ struct CrossBucketFileXml {
 struct DuplicateDirReportXml {
     #[serde(rename = "Bucket")]
     bucket: String,
+    #[serde(rename = "IsTruncated")]
+    is_truncated: bool,
+    #[serde(
+        rename = "NextContinuationToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    next_continuation_token: Option<String>,
     #[serde(rename = "DuplicateDirGroup")]
     groups: Vec<DuplicateDirGroupXml>,
 }
@@ -173,24 +191,33 @@ pub async fn find_bucket_duplicates(
     let max_results = params
         .get("max-results")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
+        .unwrap_or(100)
+        .min(1000);
     let allow_partial = params
         .get("allow-partial")
         .map(|v| v == "true")
         .unwrap_or(false);
+    let continuation_token = params.get("continuation-token");
+    let key_contains = params.get("key-contains");
 
     let report = duplicates_service::find_bucket_duplicates(
         &bucket.metadata,
         &bucket_name,
         max_results,
         allow_partial,
+        continuation_token.map(|s| s.as_str()),
+        key_contains.map(|s| s.as_str()),
     )
     .await?;
 
     let xml = DuplicateReportXml {
         bucket: report.bucket,
         scan_complete: report.scan_complete,
+        max_results,
         is_truncated: report.is_truncated,
+        continuation_token: continuation_token.cloned(),
+        next_continuation_token: report.next_continuation_token,
+        key_contains: key_contains.cloned(),
         groups: report
             .duplicates
             .into_iter()
@@ -270,17 +297,23 @@ pub async fn find_bucket_duplicate_dirs(
         .get("max-results")
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
+    let prefix = params.get("prefix");
+    let continuation_token = params.get("continuation-token");
 
     let report = duplicates_service::find_bucket_duplicate_dirs(
         &bucket.metadata,
         &bucket_name,
         min_files,
         max_results,
+        prefix.map(|s| s.as_str()),
+        continuation_token.map(|s| s.as_str()),
     )
     .await?;
 
     let xml = DuplicateDirReportXml {
         bucket: report.bucket,
+        is_truncated: report.is_truncated,
+        next_continuation_token: report.next_continuation_token,
         groups: report
             .duplicate_dirs
             .into_iter()

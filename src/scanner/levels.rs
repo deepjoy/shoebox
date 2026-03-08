@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use async_walkdir::{Filtering, WalkDir};
@@ -14,6 +15,7 @@ use crate::metadata::sqlite::{L3HashUpdate, ObjectMetadataUpdate, ObjectRecord};
 use crate::metadata::MetadataStore;
 use crate::scanner::platform;
 use crate::scanner::scope::ScanScope;
+use crate::services::duplicates_service;
 use crate::types::ChecksumValues;
 
 /// Maximum number of rows per batch transaction.
@@ -540,6 +542,17 @@ pub async fn scan_l3(
             "promoting symlinks to scan_level 3"
         );
         metadata.promote_scan_level_batch(&symlink_keys, 3).await?;
+    }
+
+    // Recompute directory hashes for parent directories of hashed files.
+    let parent_dirs: HashSet<String> = keys
+        .iter()
+        .filter_map(|k| k.rsplit_once('/').map(|(p, _)| p.to_string()))
+        .collect();
+    for parent in &parent_dirs {
+        if let Err(e) = duplicates_service::compute_single_directory_hash(metadata, parent).await {
+            tracing::warn!(parent_dir = %parent, error = %e, "failed to compute directory hash");
+        }
     }
 
     if total > 1 {
