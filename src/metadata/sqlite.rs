@@ -1460,21 +1460,80 @@ impl MetadataStore {
         })
     }
 
-    /// Find duplicate hash groups, ordered by total wasted size descending.
+    /// Find duplicate hash groups with keyset pagination and optional key filter.
+    ///
+    /// Results are ordered by `total_size DESC, checksum_sha256 ASC`.
+    /// The cursor is `(total_size, checksum_sha256)` from the last row of the
+    /// previous page.  When `key_contains` is set, only groups that contain at
+    /// least one file whose key matches the substring are returned.
     pub async fn find_duplicate_hashes(
         &self,
         max_results: i32,
+        cursor: Option<(i64, &str)>,
+        key_contains: Option<&str>,
     ) -> Result<Vec<DuplicateGroup>, S3Error> {
-        let rows: Vec<DuplicateGroup> = sqlx::query_as(
-            "SELECT checksum_sha256, COUNT(*) as count, SUM(COALESCE(size, 0)) as total_size \
-             FROM objects WHERE checksum_sha256 IS NOT NULL \
-             GROUP BY checksum_sha256 HAVING COUNT(*) > 1 \
-             ORDER BY total_size DESC LIMIT ?",
-        )
-        .bind(max_results)
-        .fetch_all(&self.pool)
-        .await?;
+        let use_filter = key_contains.is_some();
+        let use_cursor = cursor.is_some();
 
+        let mut sql = String::new();
+
+        if use_filter {
+            sql.push_str(
+                "WITH matching AS (\
+                   SELECT DISTINCT checksum_sha256 FROM objects \
+                   WHERE checksum_sha256 IS NOT NULL AND key LIKE '%' || ? || '%'\
+                 ) ",
+            );
+            sql.push_str(
+                "SELECT o.checksum_sha256, COUNT(*) as count, \
+                        SUM(COALESCE(o.size, 0)) as total_size \
+                 FROM objects o \
+                 INNER JOIN matching m ON o.checksum_sha256 = m.checksum_sha256 \
+                 GROUP BY o.checksum_sha256 \
+                 HAVING COUNT(*) > 1",
+            );
+        } else {
+            sql.push_str(
+                "SELECT checksum_sha256, COUNT(*) as count, \
+                        SUM(COALESCE(size, 0)) as total_size \
+                 FROM objects \
+                 WHERE checksum_sha256 IS NOT NULL \
+                 GROUP BY checksum_sha256 \
+                 HAVING COUNT(*) > 1",
+            );
+        }
+
+        if use_cursor {
+            if use_filter {
+                sql.push_str(
+                    " AND (total_size < ? OR (total_size = ? AND \
+                     o.checksum_sha256 > ?))",
+                );
+            } else {
+                sql.push_str(
+                    " AND (total_size < ? OR (total_size = ? AND \
+                     checksum_sha256 > ?))",
+                );
+            }
+        }
+
+        if use_filter {
+            sql.push_str(" ORDER BY total_size DESC, o.checksum_sha256 ASC LIMIT ?");
+        } else {
+            sql.push_str(" ORDER BY total_size DESC, checksum_sha256 ASC LIMIT ?");
+        }
+
+        let mut query = sqlx::query_as::<_, DuplicateGroup>(&sql);
+
+        if let Some(term) = key_contains {
+            query = query.bind(term);
+        }
+        if let Some((size, hash)) = cursor {
+            query = query.bind(size).bind(size).bind(hash);
+        }
+        query = query.bind(max_results);
+
+        let rows = query.fetch_all(&self.pool).await?;
         Ok(rows)
     }
 
@@ -1613,19 +1672,87 @@ impl MetadataStore {
         &self,
         min_files: i32,
         max_results: i32,
+        prefix: Option<&str>,
+        after_hash: Option<&str>,
     ) -> Result<Vec<DuplicateDirGroup>, S3Error> {
-        let rows: Vec<DuplicateDirGroup> = sqlx::query_as(
-            "SELECT dir_hash, COUNT(*) as count, \
-             MIN(file_count) as file_count, SUM(total_size) as total_size \
-             FROM directory_hashes \
-             WHERE stale = FALSE AND file_count >= ? \
-             GROUP BY dir_hash HAVING COUNT(*) > 1 \
-             ORDER BY total_size DESC LIMIT ?",
-        )
-        .bind(min_files)
-        .bind(max_results)
-        .fetch_all(&self.pool)
-        .await?;
+        // Build the query with optional prefix and cursor filters.
+        // We use a CTE to pre-filter qualifying dir_hashes when prefix is set,
+        // and keyset pagination via the dir_hash cursor.
+        // Ordered by dir_hash for stable, simple keyset pagination.
+        let rows: Vec<DuplicateDirGroup> = match (prefix, after_hash) {
+            (Some(p), Some(ah)) => {
+                let like_pattern = format!("{}%", p);
+                sqlx::query_as(
+                    "SELECT dir_hash, COUNT(*) as count, \
+                     MIN(file_count) as file_count, SUM(total_size) as total_size \
+                     FROM directory_hashes \
+                     WHERE stale = FALSE AND file_count >= ? \
+                       AND dir_hash IN ( \
+                         SELECT dir_hash FROM directory_hashes \
+                         WHERE stale = FALSE AND prefix LIKE ? \
+                       ) \
+                       AND dir_hash > ? \
+                     GROUP BY dir_hash HAVING COUNT(*) > 1 \
+                     ORDER BY dir_hash ASC LIMIT ?",
+                )
+                .bind(min_files)
+                .bind(&like_pattern)
+                .bind(ah)
+                .bind(max_results)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(p), None) => {
+                let like_pattern = format!("{}%", p);
+                sqlx::query_as(
+                    "SELECT dir_hash, COUNT(*) as count, \
+                     MIN(file_count) as file_count, SUM(total_size) as total_size \
+                     FROM directory_hashes \
+                     WHERE stale = FALSE AND file_count >= ? \
+                       AND dir_hash IN ( \
+                         SELECT dir_hash FROM directory_hashes \
+                         WHERE stale = FALSE AND prefix LIKE ? \
+                       ) \
+                     GROUP BY dir_hash HAVING COUNT(*) > 1 \
+                     ORDER BY dir_hash ASC LIMIT ?",
+                )
+                .bind(min_files)
+                .bind(&like_pattern)
+                .bind(max_results)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(ah)) => {
+                sqlx::query_as(
+                    "SELECT dir_hash, COUNT(*) as count, \
+                     MIN(file_count) as file_count, SUM(total_size) as total_size \
+                     FROM directory_hashes \
+                     WHERE stale = FALSE AND file_count >= ? \
+                       AND dir_hash > ? \
+                     GROUP BY dir_hash HAVING COUNT(*) > 1 \
+                     ORDER BY dir_hash ASC LIMIT ?",
+                )
+                .bind(min_files)
+                .bind(ah)
+                .bind(max_results)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query_as(
+                    "SELECT dir_hash, COUNT(*) as count, \
+                     MIN(file_count) as file_count, SUM(total_size) as total_size \
+                     FROM directory_hashes \
+                     WHERE stale = FALSE AND file_count >= ? \
+                     GROUP BY dir_hash HAVING COUNT(*) > 1 \
+                     ORDER BY dir_hash ASC LIMIT ?",
+                )
+                .bind(min_files)
+                .bind(max_results)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
 
         Ok(rows)
     }
@@ -1650,6 +1777,22 @@ impl MetadataStore {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT DISTINCT parent_directory FROM objects \
              WHERE parent_directory != '' ORDER BY parent_directory",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(p,)| p).collect())
+    }
+
+    /// Get parent directories that need hash (re)computation:
+    /// either missing from directory_hashes or marked stale.
+    pub async fn list_unhashed_parent_directories(&self) -> Result<Vec<String>, S3Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT o.parent_directory FROM objects o \
+             LEFT JOIN directory_hashes dh ON dh.prefix = o.parent_directory || '/' \
+             WHERE o.parent_directory != '' \
+               AND (dh.id IS NULL OR dh.stale = TRUE) \
+             ORDER BY o.parent_directory",
         )
         .fetch_all(&self.pool)
         .await?;

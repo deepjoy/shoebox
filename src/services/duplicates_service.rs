@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
+use base64::Engine;
 use sha2::{Digest, Sha256};
 
 use crate::error::S3Error;
@@ -27,6 +28,7 @@ pub struct DuplicateReport {
     pub bucket: String,
     pub duplicates: Vec<DuplicateFileGroup>,
     pub is_truncated: bool,
+    pub next_continuation_token: Option<String>,
     pub scan_complete: bool,
 }
 
@@ -66,6 +68,8 @@ pub struct DuplicateDirGroup {
 pub struct DuplicateDirReport {
     pub bucket: String,
     pub duplicate_dirs: Vec<DuplicateDirGroup>,
+    pub is_truncated: bool,
+    pub next_continuation_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -101,12 +105,15 @@ pub struct DirComparison {
 
 // ── Per-Bucket Duplicates (8.1) ─────────────────────────────────────
 
-/// Find duplicates within a single bucket (simple GROUP BY).
+/// Find duplicates within a single bucket with keyset pagination and optional
+/// key-contains filter.
 pub async fn find_bucket_duplicates(
     metadata: &MetadataStore,
     bucket: &str,
     max_results: i32,
     allow_partial: bool,
+    continuation_token: Option<&str>,
+    key_contains: Option<&str>,
 ) -> Result<DuplicateReport, S3Error> {
     let status = metadata.get_scan_status().await?;
     let scan_complete = status.total_files == 0 || status.files_at_level_3 >= status.total_files;
@@ -123,8 +130,29 @@ pub async fn find_bucket_duplicates(
         });
     }
 
-    let duplicates = metadata.find_duplicate_hashes(max_results).await?;
-    let num_duplicates = duplicates.len();
+    let cursor = continuation_token.and_then(decode_duplicate_cursor);
+
+    // Fetch one extra row to detect truncation.
+    let mut duplicates = metadata
+        .find_duplicate_hashes(
+            max_results + 1,
+            cursor.as_ref().map(|(s, h)| (*s, h.as_str())),
+            key_contains,
+        )
+        .await?;
+
+    let is_truncated = duplicates.len() as i32 > max_results;
+    if is_truncated {
+        duplicates.truncate(max_results as usize);
+    }
+
+    let next_continuation_token = if is_truncated {
+        duplicates
+            .last()
+            .map(|d| encode_duplicate_cursor(d.total_size, &d.checksum_sha256))
+    } else {
+        None
+    };
 
     let mut groups = Vec::new();
     for dup in duplicates {
@@ -145,9 +173,23 @@ pub async fn find_bucket_duplicates(
     Ok(DuplicateReport {
         bucket: bucket.to_string(),
         duplicates: groups,
-        is_truncated: num_duplicates as i32 >= max_results,
+        is_truncated,
+        next_continuation_token,
         scan_complete,
     })
+}
+
+fn encode_duplicate_cursor(total_size: i64, checksum: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", total_size, checksum))
+}
+
+fn decode_duplicate_cursor(token: &str) -> Option<(i64, String)> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .ok()?;
+    let s = String::from_utf8(decoded).ok()?;
+    let (size_str, hash) = s.split_once(':')?;
+    Some((size_str.parse().ok()?, hash.to_string()))
 }
 
 // ── Cross-Bucket Duplicates (8.2) ───────────────────────────────────
@@ -308,10 +350,9 @@ pub async fn find_cross_bucket_duplicates(
 
 // ── Directory Hashing (8.8) ─────────────────────────────────────────
 
-/// Compute directory hashes for all parent directories in a bucket.
-/// This rebuilds all stale or missing directory hashes.
+/// Compute directory hashes for parent directories that are missing or stale.
 pub async fn compute_directory_hashes(metadata: &MetadataStore) -> Result<(), S3Error> {
-    let parents = metadata.list_parent_directories().await?;
+    let parents = metadata.list_unhashed_parent_directories().await?;
 
     for parent in parents {
         let prefix = if parent.is_empty() {
@@ -387,13 +428,29 @@ pub async fn find_bucket_duplicate_dirs(
     bucket: &str,
     min_files: i32,
     max_results: i32,
+    prefix: Option<&str>,
+    continuation_token: Option<&str>,
 ) -> Result<DuplicateDirReport, S3Error> {
     // Recompute stale directory hashes first
     compute_directory_hashes(metadata).await?;
 
-    let dup_groups = metadata
-        .find_duplicate_dir_hashes(min_files, max_results)
+    let cursor = continuation_token.and_then(decode_dir_cursor);
+
+    // Fetch one extra to detect truncation.
+    let mut dup_groups = metadata
+        .find_duplicate_dir_hashes(min_files, max_results + 1, prefix, cursor.as_deref())
         .await?;
+
+    let is_truncated = dup_groups.len() as i32 > max_results;
+    if is_truncated {
+        dup_groups.truncate(max_results as usize);
+    }
+
+    let next_continuation_token = if is_truncated {
+        dup_groups.last().map(|g| encode_dir_cursor(&g.dir_hash))
+    } else {
+        None
+    };
 
     let mut groups = Vec::new();
     for dg in dup_groups {
@@ -414,7 +471,20 @@ pub async fn find_bucket_duplicate_dirs(
     Ok(DuplicateDirReport {
         bucket: bucket.to_string(),
         duplicate_dirs: groups,
+        is_truncated,
+        next_continuation_token,
     })
+}
+
+fn encode_dir_cursor(dir_hash: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(dir_hash)
+}
+
+fn decode_dir_cursor(token: &str) -> Option<String> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .ok()?;
+    String::from_utf8(decoded).ok()
 }
 
 // ── Compare Directories (8.7) ───────────────────────────────────────
