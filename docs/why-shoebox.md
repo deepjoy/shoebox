@@ -133,6 +133,7 @@ Access your files via the filesystem *and* S3 API, interchangeably. Copy files i
 | Credentials | IAM | Configured | Configured | Configured | Auto-generated |
 | Per-directory isolation | No | Manual | No | No | Automatic |
 | Duplicate detection | No | No | No | No | Built-in |
+| Integrity checks | No | Yes (bitrot healing) | No | Yes (scrub) | Built-in (scheduled) |
 | Max recommended scale | Unlimited | Petabytes | Petabytes | Petabytes | ~10TB |
 
 ---
@@ -150,7 +151,7 @@ Access your files via the filesystem *and* S3 API, interchangeably. Copy files i
 - You need distributed storage across multiple machines
 - You have more than 10TB of data
 - You need strong consistency (file exists on disk = immediately visible via API)
-- You need enterprise S3 features (object lock, lifecycle policies, event notifications)
+- You need enterprise S3 features (object lock, lifecycle policies, SNS/SQS notifications)
 - You need the full AWS ecosystem (Lambda triggers, etc.)
 
 See [When Not to Use Shoebox](when-not-to-use-shoebox.md) for details.
@@ -166,7 +167,7 @@ shoebox ~/Photos
 
 **Docker:**
 ```bash
-docker run -v ~/Photos:/data -p 9000:9000 shoebox/shoebox /data
+docker run -v ~/Photos:/data -p 9000:9000 deeppjoymajumdar/shoebox /data
 ```
 
 Pick whichever fits your workflow.
@@ -179,7 +180,7 @@ Pick whichever fits your workflow.
 ```yaml
 services:
   shoebox:
-    image: shoebox/shoebox
+    image: deeppjoymajumdar/shoebox
     volumes:
       - ./test-fixtures:/data
 steps:

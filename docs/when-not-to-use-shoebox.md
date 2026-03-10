@@ -70,7 +70,7 @@ Shoebox implements the core S3 API—enough for uploads, downloads, multipart tr
 - **Object Lock / WORM**: Compliance requirements for immutable storage
 - **Lifecycle policies**: Automatic expiration, transition to cold storage
 - **Server-side encryption**: Encryption at rest (use filesystem encryption instead)
-- **Event notifications**: SNS/SQS triggers on object changes
+- **SNS/SQS event notifications**: AWS-style triggers (Shoebox supports [webhook notifications](../README.md#current-status--v030) instead)
 - **Bucket policies / ACLs**: Complex permission models (use credential-based access instead)
 - **Replication rules**: Cross-region or cross-bucket replication
 
