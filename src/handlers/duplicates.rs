@@ -199,6 +199,7 @@ pub async fn find_bucket_duplicates(
         .unwrap_or(false);
     let continuation_token = params.get("continuation-token");
     let key_contains = params.get("key-contains");
+    let max_depth = params.get("max-depth").and_then(|s| s.parse().ok());
 
     let report = duplicates_service::find_bucket_duplicates(
         &bucket.metadata,
@@ -207,6 +208,7 @@ pub async fn find_bucket_duplicates(
         allow_partial,
         continuation_token.map(|s| s.as_str()),
         key_contains.map(|s| s.as_str()),
+        max_depth,
     )
     .await?;
 
@@ -299,6 +301,7 @@ pub async fn find_bucket_duplicate_dirs(
         .unwrap_or(100);
     let prefix = params.get("prefix");
     let continuation_token = params.get("continuation-token");
+    let max_depth = params.get("max-depth").and_then(|s| s.parse().ok());
 
     let report = duplicates_service::find_bucket_duplicate_dirs(
         &bucket.metadata,
@@ -307,6 +310,7 @@ pub async fn find_bucket_duplicate_dirs(
         max_results,
         prefix.map(|s| s.as_str()),
         continuation_token.map(|s| s.as_str()),
+        max_depth,
     )
     .await?;
 

@@ -392,6 +392,7 @@ impl Shoebox {
         allow_partial: bool,
         continuation_token: Option<&str>,
         key_contains: Option<&str>,
+        max_depth: Option<i32>,
     ) -> Result<duplicates_service::DuplicateReport, S3Error> {
         let b = self.get_bucket(bucket)?;
         duplicates_service::find_bucket_duplicates(
@@ -401,6 +402,7 @@ impl Shoebox {
             allow_partial,
             continuation_token,
             key_contains,
+            max_depth,
         )
         .await
     }
@@ -426,6 +428,7 @@ impl Shoebox {
         max_results: i32,
         prefix: Option<&str>,
         continuation_token: Option<&str>,
+        max_depth: Option<i32>,
     ) -> Result<duplicates_service::DuplicateDirReport, S3Error> {
         let b = self.get_bucket(bucket)?;
         duplicates_service::find_bucket_duplicate_dirs(
@@ -435,6 +438,7 @@ impl Shoebox {
             max_results,
             prefix,
             continuation_token,
+            max_depth,
         )
         .await
     }
@@ -1852,7 +1856,7 @@ mod tests {
 
         // Find duplicate directories — dir_a and dir_b should match
         let report = shoebox
-            .find_bucket_duplicate_dirs("photos", 1, 100, None, None)
+            .find_bucket_duplicate_dirs("photos", 1, 100, None, None, None)
             .await
             .unwrap();
 
@@ -1958,7 +1962,7 @@ mod tests {
         put_file(&shoebox, "photos", "unique.txt", b"unique content").await;
 
         let report = shoebox
-            .find_bucket_duplicates("photos", 100, false, None, None)
+            .find_bucket_duplicates("photos", 100, false, None, None, None)
             .await
             .unwrap();
 
@@ -2002,7 +2006,7 @@ mod tests {
 
         // Files are at L1, not L3 — FindBucketDuplicates should fail with ScanPending
         let err = shoebox
-            .find_bucket_duplicates("pending", 100, false, None, None)
+            .find_bucket_duplicates("pending", 100, false, None, None, None)
             .await;
 
         assert!(
@@ -2033,13 +2037,13 @@ mod tests {
 
         // Without allow-partial, should fail
         let err = shoebox
-            .find_bucket_duplicates("partial", 100, false, None, None)
+            .find_bucket_duplicates("partial", 100, false, None, None, None)
             .await;
         assert!(matches!(err, Err(S3Error::ScanPending { .. })));
 
         // With allow-partial, should succeed and return partial results
         let report = shoebox
-            .find_bucket_duplicates("partial", 100, true, None, None)
+            .find_bucket_duplicates("partial", 100, true, None, None, None)
             .await
             .unwrap();
 

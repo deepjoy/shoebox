@@ -476,7 +476,7 @@ async fn handle_command(command: Commands) -> Result<(), Box<dyn std::error::Err
                 .ok_or("Invalid bucket path")?;
 
             let report = shoebox
-                .find_bucket_duplicates(bucket_name, max_results, allow_partial, None, None)
+                .find_bucket_duplicates(bucket_name, max_results, allow_partial, None, None, None)
                 .await
                 .map_err(|e| format!("Duplicate search failed: {}", e))?;
 

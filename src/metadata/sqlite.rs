@@ -1471,9 +1471,11 @@ impl MetadataStore {
         max_results: i32,
         cursor: Option<(i64, &str)>,
         key_contains: Option<&str>,
+        max_depth: Option<i32>,
     ) -> Result<Vec<DuplicateGroup>, S3Error> {
         let use_filter = key_contains.is_some();
         let use_cursor = cursor.is_some();
+        let use_depth = max_depth.is_some() && key_contains.is_some();
 
         let mut sql = String::new();
 
@@ -1481,9 +1483,12 @@ impl MetadataStore {
             sql.push_str(
                 "WITH matching AS (\
                    SELECT DISTINCT checksum_sha256 FROM objects \
-                   WHERE checksum_sha256 IS NOT NULL AND key LIKE '%' || ? || '%'\
-                 ) ",
+                   WHERE checksum_sha256 IS NOT NULL AND key LIKE '%' || ? || '%'",
             );
+            if use_depth {
+                sql.push_str(" AND (LENGTH(key) - LENGTH(REPLACE(key, '/', ''))) <= ?");
+            }
+            sql.push_str(") ");
             sql.push_str(
                 "SELECT o.checksum_sha256, COUNT(*) as count, \
                         SUM(COALESCE(o.size, 0)) as total_size \
@@ -1523,10 +1528,17 @@ impl MetadataStore {
             sql.push_str(" ORDER BY total_size DESC, checksum_sha256 ASC LIMIT ?");
         }
 
+        // Bind parameters in the same order as placeholders above.
+        let max_slash_count =
+            max_depth.and_then(|d| key_contains.map(|kc| kc.matches('/').count() as i32 + d));
+
         let mut query = sqlx::query_as::<_, DuplicateGroup>(&sql);
 
         if let Some(term) = key_contains {
             query = query.bind(term);
+        }
+        if let Some(ms) = max_slash_count {
+            query = query.bind(ms);
         }
         if let Some((size, hash)) = cursor {
             query = query.bind(size).bind(size).bind(hash);
@@ -1674,86 +1686,61 @@ impl MetadataStore {
         max_results: i32,
         prefix: Option<&str>,
         after_hash: Option<&str>,
+        max_depth: Option<i32>,
     ) -> Result<Vec<DuplicateDirGroup>, S3Error> {
-        // Build the query with optional prefix and cursor filters.
-        // We use a CTE to pre-filter qualifying dir_hashes when prefix is set,
+        // Build the query dynamically to handle optional prefix, cursor, and depth filters.
+        // Uses a subquery to pre-filter qualifying dir_hashes when prefix/depth is set,
         // and keyset pagination via the dir_hash cursor.
         // Ordered by dir_hash for stable, simple keyset pagination.
-        let rows: Vec<DuplicateDirGroup> = match (prefix, after_hash) {
-            (Some(p), Some(ah)) => {
-                let like_pattern = format!("{}%", p);
-                sqlx::query_as(
-                    "SELECT dir_hash, COUNT(*) as count, \
-                     MIN(file_count) as file_count, SUM(total_size) as total_size \
-                     FROM directory_hashes \
-                     WHERE stale = FALSE AND file_count >= ? \
-                       AND dir_hash IN ( \
-                         SELECT dir_hash FROM directory_hashes \
-                         WHERE stale = FALSE AND prefix LIKE ? \
-                       ) \
-                       AND dir_hash > ? \
-                     GROUP BY dir_hash HAVING COUNT(*) > 1 \
-                     ORDER BY dir_hash ASC LIMIT ?",
-                )
-                .bind(min_files)
-                .bind(&like_pattern)
-                .bind(ah)
-                .bind(max_results)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            (Some(p), None) => {
-                let like_pattern = format!("{}%", p);
-                sqlx::query_as(
-                    "SELECT dir_hash, COUNT(*) as count, \
-                     MIN(file_count) as file_count, SUM(total_size) as total_size \
-                     FROM directory_hashes \
-                     WHERE stale = FALSE AND file_count >= ? \
-                       AND dir_hash IN ( \
-                         SELECT dir_hash FROM directory_hashes \
-                         WHERE stale = FALSE AND prefix LIKE ? \
-                       ) \
-                     GROUP BY dir_hash HAVING COUNT(*) > 1 \
-                     ORDER BY dir_hash ASC LIMIT ?",
-                )
-                .bind(min_files)
-                .bind(&like_pattern)
-                .bind(max_results)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            (None, Some(ah)) => {
-                sqlx::query_as(
-                    "SELECT dir_hash, COUNT(*) as count, \
-                     MIN(file_count) as file_count, SUM(total_size) as total_size \
-                     FROM directory_hashes \
-                     WHERE stale = FALSE AND file_count >= ? \
-                       AND dir_hash > ? \
-                     GROUP BY dir_hash HAVING COUNT(*) > 1 \
-                     ORDER BY dir_hash ASC LIMIT ?",
-                )
-                .bind(min_files)
-                .bind(ah)
-                .bind(max_results)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            (None, None) => {
-                sqlx::query_as(
-                    "SELECT dir_hash, COUNT(*) as count, \
-                     MIN(file_count) as file_count, SUM(total_size) as total_size \
-                     FROM directory_hashes \
-                     WHERE stale = FALSE AND file_count >= ? \
-                     GROUP BY dir_hash HAVING COUNT(*) > 1 \
-                     ORDER BY dir_hash ASC LIMIT ?",
-                )
-                .bind(min_files)
-                .bind(max_results)
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
+        let mut sql = String::from(
+            "SELECT dir_hash, COUNT(*) as count, \
+             MIN(file_count) as file_count, SUM(total_size) as total_size \
+             FROM directory_hashes \
+             WHERE stale = FALSE AND file_count >= ?",
+        );
 
+        if prefix.is_some() || max_depth.is_some() {
+            let mut sub_conditions = vec!["stale = FALSE".to_string()];
+            if prefix.is_some() {
+                sub_conditions.push("prefix LIKE ?".to_string());
+            }
+            if max_depth.is_some() {
+                sub_conditions
+                    .push("(LENGTH(prefix) - LENGTH(REPLACE(prefix, '/', ''))) <= ?".to_string());
+            }
+            sql.push_str(&format!(
+                " AND dir_hash IN (SELECT dir_hash FROM directory_hashes WHERE {})",
+                sub_conditions.join(" AND ")
+            ));
+        }
+
+        if after_hash.is_some() {
+            sql.push_str(" AND dir_hash > ?");
+        }
+
+        sql.push_str(" GROUP BY dir_hash HAVING COUNT(*) > 1 ORDER BY dir_hash ASC LIMIT ?");
+
+        // Bind parameters in the same order as placeholders above.
+        let like_pattern = prefix.map(|p| format!("{}%", p));
+        let max_slash_count = max_depth.map(|d| {
+            let base_slashes = prefix.map_or(0, |p| p.matches('/').count() as i32);
+            base_slashes + d
+        });
+
+        let mut query = sqlx::query_as::<_, DuplicateDirGroup>(&sql);
+        query = query.bind(min_files);
+        if let Some(ref lp) = like_pattern {
+            query = query.bind(lp.as_str());
+        }
+        if let Some(ms) = max_slash_count {
+            query = query.bind(ms);
+        }
+        if let Some(ah) = after_hash {
+            query = query.bind(ah);
+        }
+        query = query.bind(max_results);
+
+        let rows = query.fetch_all(&self.pool).await?;
         Ok(rows)
     }
 
