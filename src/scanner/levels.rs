@@ -180,10 +180,12 @@ pub async fn scan_l1(
         let ct_id = metadata
             .get_or_create_content_type_id(&content_type)
             .await?;
+        let (_, filename) = crate::metadata::sqlite::split_key(&key);
         let obj = ObjectRecord {
             id: uuid::Uuid::new_v4().to_string(),
-            key: key.clone(),
+            name: filename.to_string(),
             parent_dir_id: dir_id,
+            key: key.clone(),
             is_symlink,
             symlink_target,
             size,
