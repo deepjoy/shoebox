@@ -33,12 +33,12 @@ struct ServeArgs {
     paths: Vec<PathBuf>,
 
     /// Listen address.
-    #[arg(long, default_value = "0.0.0.0", env = "SHOEBOX_HOST")]
-    host: String,
+    #[arg(long, env = "SHOEBOX_HOST")]
+    host: Option<String>,
 
     /// Listen port.
-    #[arg(long, default_value_t = 9000, env = "SHOEBOX_PORT")]
-    port: u16,
+    #[arg(long, env = "SHOEBOX_PORT")]
+    port: Option<u16>,
 
     /// Print secret access keys on startup.
     #[arg(long, default_value_t = false)]
@@ -196,9 +196,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let serve = cli.serve;
 
     // Build Shoebox via the library API
-    let mut builder = shoebox::Shoebox::builder()
-        .host(&serve.host)
-        .port(serve.port);
+    let mut builder = shoebox::Shoebox::builder();
+
+    if let Some(ref host) = serve.host {
+        builder = builder.host(host);
+    }
+    if let Some(port) = serve.port {
+        builder = builder.port(port);
+    }
 
     if let Some(ref data_dir) = serve.data_dir {
         builder = builder.data_dir(data_dir);
@@ -236,7 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if show {
             if let Some(first_cred) = bucket.config.credentials.first() {
-                let endpoint = format!("http://{}:{}", serve.host, serve.port);
+                let endpoint = format!("http://{}:{}", shoebox.host(), shoebox.port());
                 print_cors_hint(
                     &endpoint,
                     &bucket.name,

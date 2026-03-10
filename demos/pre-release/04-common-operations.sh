@@ -33,7 +33,7 @@ mkdir -p "$BUCKET_A" "$BUCKET_B"
 
 require_shoebox
 
-PORT=9877
+PORT=9882
 ENDPOINT="${SHOEBOX_ENDPOINT:-http://127.0.0.1:$PORT}"
 
 # --- Parts ------------------------------------------------------------------

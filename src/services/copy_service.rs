@@ -55,23 +55,25 @@ pub async fn copy_object(
     // Kernel-level copy (efficient, no app memory buffering)
     tokio::fs::copy(&src_path, &dst_path).await?;
 
-    let now = OffsetDateTime::now_utc();
+    let now = crate::metadata::sqlite::SqliteTimestamp::now();
+    let parent = dst_key
+        .rsplit_once('/')
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_default();
+    let dir_id = dst_metadata.get_or_create_dir_id(&parent).await?;
 
     // Copy metadata to destination
     let dst_record = ObjectRecord {
         id: uuid::Uuid::new_v4().to_string(),
         key: dst_key.to_string(),
-        parent_directory: dst_key
-            .rsplit_once('/')
-            .map(|(p, _)| p.to_string())
-            .unwrap_or_default(),
+        parent_dir_id: dir_id,
         size: src_record.size,
         etag: src_record.etag.clone(),
         checksum_sha256: src_record.checksum_sha256.clone(),
         checksum_sha1: src_record.checksum_sha1.clone(),
         checksum_crc32: src_record.checksum_crc32.clone(),
         checksum_crc32c: src_record.checksum_crc32c.clone(),
-        content_type: src_record.content_type.clone(),
+        content_type_id: src_record.content_type_id,
         last_modified: now,
         created_at: now,
         metadata: src_record.metadata.clone(),
@@ -85,7 +87,7 @@ pub async fn copy_object(
         object_id,
         size: src_record.size.unwrap_or(0),
         etag: src_record.etag.unwrap_or_default(),
-        last_modified: dst_record.last_modified,
+        last_modified: *dst_record.last_modified,
     })
 }
 
@@ -142,13 +144,14 @@ fn check_copy_conditions(
     }
 
     if let Some(if_modified_since) = conditions.if_modified_since {
-        if src_record.last_modified <= if_modified_since {
+        if src_record.last_modified <= crate::metadata::sqlite::SqliteTimestamp(if_modified_since) {
             return Err(S3Error::PreconditionFailed);
         }
     }
 
     if let Some(if_unmodified_since) = conditions.if_unmodified_since {
-        if src_record.last_modified > if_unmodified_since {
+        if src_record.last_modified > crate::metadata::sqlite::SqliteTimestamp(if_unmodified_since)
+        {
             return Err(S3Error::PreconditionFailed);
         }
     }

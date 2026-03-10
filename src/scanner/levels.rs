@@ -175,17 +175,21 @@ pub async fn scan_l1(
             .map(platform::file_identity)
             .unwrap_or((None, None));
 
-        let now = time::OffsetDateTime::now_utc();
+        let now = crate::metadata::sqlite::SqliteTimestamp::now();
+        let dir_id = metadata.get_or_create_dir_id(&parent).await?;
+        let ct_id = metadata
+            .get_or_create_content_type_id(&content_type)
+            .await?;
         let obj = ObjectRecord {
             id: uuid::Uuid::new_v4().to_string(),
             key: key.clone(),
-            parent_directory: parent,
+            parent_dir_id: dir_id,
             is_symlink,
             symlink_target,
             size,
             inode: inode.map(|v| v as i64),
             device_id: device_id.map(|v| v as i64),
-            content_type: Some(content_type),
+            content_type_id: Some(ct_id),
             scan_level: 1,
             last_modified: now,
             created_at: now,
@@ -621,14 +625,21 @@ mod tests {
         let obj = store.get_object("hello.txt").await.unwrap().unwrap();
         assert_eq!(obj.scan_level, 1);
         assert_eq!(obj.size, Some(5)); // "hello" = 5 bytes
-        assert_eq!(obj.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(
+            store.resolve_content_type(obj.content_type_id).await,
+            "text/plain"
+        );
 
         let nested = store
             .get_object("subdir/nested.txt")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(nested.parent_directory, "subdir");
+        let nested_dir_prefix = store
+            .get_directory_prefix(nested.parent_dir_id)
+            .await
+            .unwrap();
+        assert_eq!(nested_dir_prefix, "subdir/");
     }
 
     #[tokio::test]

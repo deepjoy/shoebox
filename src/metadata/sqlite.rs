@@ -1,14 +1,82 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::stream::TryStreamExt;
 use futures::Stream;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use tokio::sync::RwLock;
 
 use crate::error::S3Error;
 use crate::types::ChecksumValues;
+
+// ---------------------------------------------------------------------------
+// SqliteTimestamp — newtype for storing OffsetDateTime as INTEGER (epoch nanos)
+// ---------------------------------------------------------------------------
+
+/// Wrapper that stores `time::OffsetDateTime` as an `i64` (Unix epoch
+/// nanoseconds) in SQLite.  Implements the sqlx encode/decode traits so
+/// `sqlx::FromRow` derive works transparently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SqliteTimestamp(pub time::OffsetDateTime);
+
+impl SqliteTimestamp {
+    pub fn now() -> Self {
+        Self(time::OffsetDateTime::now_utc())
+    }
+
+    fn to_nanos(self) -> i64 {
+        self.0.unix_timestamp_nanos() as i64
+    }
+
+    fn from_nanos(ns: i64) -> Self {
+        Self(
+            time::OffsetDateTime::from_unix_timestamp_nanos(ns as i128)
+                .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
+        )
+    }
+}
+
+impl std::ops::Deref for SqliteTimestamp {
+    type Target = time::OffsetDateTime;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<time::OffsetDateTime> for SqliteTimestamp {
+    fn from(dt: time::OffsetDateTime) -> Self {
+        Self(dt)
+    }
+}
+
+impl sqlx::Type<sqlx::Sqlite> for SqliteTimestamp {
+    fn type_info() -> sqlx::sqlite::SqliteTypeInfo {
+        <i64 as sqlx::Type<sqlx::Sqlite>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::sqlite::SqliteTypeInfo) -> bool {
+        <i64 as sqlx::Type<sqlx::Sqlite>>::compatible(ty)
+    }
+}
+
+impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for SqliteTimestamp {
+    fn encode_by_ref(
+        &self,
+        args: &mut Vec<sqlx::sqlite::SqliteArgumentValue<'q>>,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        <i64 as sqlx::Encode<'q, sqlx::Sqlite>>::encode_by_ref(&self.to_nanos(), args)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for SqliteTimestamp {
+    fn decode(value: sqlx::sqlite::SqliteValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+        let nanos = <i64 as sqlx::Decode<'r, sqlx::Sqlite>>::decode(value)?;
+        Ok(Self::from_nanos(nanos))
+    }
+}
 
 /// Batch update entry for L3 content hashes.
 pub struct L3HashUpdate {
@@ -29,9 +97,8 @@ pub enum ListEntry {
 
 /// Object metadata record, matching the `objects` table schema.
 ///
-/// Timestamp fields use `time::OffsetDateTime`. The sqlx `time` feature
-/// serialises these as RFC 3339 TEXT in SQLite, giving direct comparisons
-/// without runtime parsing and human-readable storage.
+/// Timestamp fields use [`SqliteTimestamp`] which wraps `time::OffsetDateTime`
+/// and stores as INTEGER (Unix epoch nanoseconds) in SQLite.
 ///
 /// ## ETag Convention
 /// The `etag` field stores values WITH surrounding double-quote characters,
@@ -42,15 +109,14 @@ pub enum ListEntry {
 pub struct ObjectRecord {
     pub id: String,
     pub key: String,
-    pub parent_directory: String,
-    pub is_directory: bool,
+    pub parent_dir_id: i64,
     pub is_symlink: bool,
     pub symlink_target: Option<String>,
 
     // L2 metadata (None until scanned)
     pub size: Option<i64>,
-    pub file_mtime: Option<time::OffsetDateTime>,
-    pub file_ctime: Option<time::OffsetDateTime>,
+    pub file_mtime: Option<SqliteTimestamp>,
+    pub file_ctime: Option<SqliteTimestamp>,
     pub inode: Option<i64>,
     pub device_id: Option<i64>,
 
@@ -63,10 +129,10 @@ pub struct ObjectRecord {
     pub checksum_crc32: Option<String>,
     pub checksum_crc32c: Option<String>,
 
-    // S3 metadata
-    pub content_type: Option<String>,
-    pub last_modified: time::OffsetDateTime,
-    pub created_at: time::OffsetDateTime,
+    // S3 metadata (interned FK into content_types table)
+    pub content_type_id: Option<i64>,
+    pub last_modified: SqliteTimestamp,
+    pub created_at: SqliteTimestamp,
     pub metadata: Option<String>,
 
     pub scan_level: i32,
@@ -77,8 +143,7 @@ impl Default for ObjectRecord {
         Self {
             id: String::new(),
             key: String::new(),
-            parent_directory: String::new(),
-            is_directory: false,
+            parent_dir_id: 0,
             is_symlink: false,
             symlink_target: None,
             size: None,
@@ -91,9 +156,9 @@ impl Default for ObjectRecord {
             checksum_sha1: None,
             checksum_crc32: None,
             checksum_crc32c: None,
-            content_type: None,
-            last_modified: time::OffsetDateTime::UNIX_EPOCH,
-            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            content_type_id: None,
+            last_modified: SqliteTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+            created_at: SqliteTimestamp(time::OffsetDateTime::UNIX_EPOCH),
             metadata: None,
             scan_level: 0,
         }
@@ -132,6 +197,8 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
 #[derive(Clone)]
 pub struct MetadataStore {
     pool: SqlitePool,
+    /// In-memory cache: content_type_id → MIME string.
+    content_types: Arc<RwLock<HashMap<i64, String>>>,
 }
 
 impl MetadataStore {
@@ -167,7 +234,97 @@ impl MetadataStore {
                 S3Error::InternalError
             })?;
 
-        Ok(Self { pool })
+        // Seed the content_type cache from existing rows.
+        let ct_rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, mime FROM content_types")
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
+        let content_types: HashMap<i64, String> = ct_rows.into_iter().collect();
+
+        Ok(Self {
+            pool,
+            content_types: Arc::new(RwLock::new(content_types)),
+        })
+    }
+
+    // ----- directory helpers -----
+
+    /// Resolve a parent-directory path to its `directories.id`, inserting if needed.
+    pub async fn get_or_create_dir_id(&self, parent_dir_id: &str) -> Result<i64, S3Error> {
+        let prefix = if parent_dir_id.is_empty() {
+            String::new()
+        } else {
+            format!("{parent_dir_id}/")
+        };
+        // Try lookup first (fast path — no write lock).
+        let existing: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM directories WHERE prefix = ?")
+                .bind(&prefix)
+                .fetch_optional(&self.pool)
+                .await?;
+        if let Some((id,)) = existing {
+            return Ok(id);
+        }
+        // Insert (race-safe via ON CONFLICT).
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO directories (prefix) VALUES (?) \
+             ON CONFLICT(prefix) DO UPDATE SET prefix = excluded.prefix \
+             RETURNING id",
+        )
+        .bind(&prefix)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Look up the prefix string for a directory id.
+    pub async fn get_directory_prefix(&self, id: i64) -> Result<String, S3Error> {
+        let row: (String,) = sqlx::query_as("SELECT prefix FROM directories WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
+    // ----- content-type helpers -----
+
+    /// Resolve a MIME string to its `content_types.id`, inserting if needed.
+    pub async fn get_or_create_content_type_id(&self, mime: &str) -> Result<i64, S3Error> {
+        // Fast path: check cache.
+        {
+            let cache = self.content_types.read().await;
+            for (&id, m) in cache.iter() {
+                if m == mime {
+                    return Ok(id);
+                }
+            }
+        }
+        // Slow path: insert then update cache.
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO content_types (mime) VALUES (?) \
+             ON CONFLICT(mime) DO UPDATE SET mime = excluded.mime \
+             RETURNING id",
+        )
+        .bind(mime)
+        .fetch_one(&self.pool)
+        .await?;
+        self.content_types
+            .write()
+            .await
+            .insert(row.0, mime.to_string());
+        Ok(row.0)
+    }
+
+    /// Resolve a `content_type_id` back to its MIME string.
+    pub async fn resolve_content_type(&self, id: Option<i64>) -> String {
+        let Some(id) = id else {
+            return "application/octet-stream".to_string();
+        };
+        let cache = self.content_types.read().await;
+        cache
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| "application/octet-stream".to_string())
     }
 
     // TODO(#5): Replace `SELECT *` with explicit column lists in get/list queries
@@ -188,16 +345,15 @@ impl MetadataStore {
     pub async fn insert_object(&self, obj: &ObjectRecord) -> Result<(), S3Error> {
         sqlx::query(
             r#"INSERT INTO objects (
-                id, key, parent_directory, is_directory, is_symlink, symlink_target,
+                id, key, parent_dir_id, is_symlink, symlink_target,
                 size, file_mtime, file_ctime, inode, device_id,
                 etag, checksum_sha256, checksum_sha1, checksum_crc32, checksum_crc32c,
-                content_type, last_modified, created_at, metadata, scan_level
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                content_type_id, last_modified, created_at, metadata, scan_level
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&obj.id)
         .bind(&obj.key)
-        .bind(&obj.parent_directory)
-        .bind(obj.is_directory)
+        .bind(obj.parent_dir_id)
         .bind(obj.is_symlink)
         .bind(&obj.symlink_target)
         .bind(obj.size)
@@ -210,7 +366,7 @@ impl MetadataStore {
         .bind(&obj.checksum_sha1)
         .bind(&obj.checksum_crc32)
         .bind(&obj.checksum_crc32c)
-        .bind(&obj.content_type)
+        .bind(obj.content_type_id)
         .bind(obj.last_modified)
         .bind(obj.created_at)
         .bind(&obj.metadata)
@@ -230,16 +386,15 @@ impl MetadataStore {
         for obj in objects {
             sqlx::query(
                 r#"INSERT INTO objects (
-                    id, key, parent_directory, is_directory, is_symlink, symlink_target,
+                    id, key, parent_dir_id, is_symlink, symlink_target,
                     size, file_mtime, file_ctime, inode, device_id,
                     etag, checksum_sha256, checksum_sha1, checksum_crc32, checksum_crc32c,
-                    content_type, last_modified, created_at, metadata, scan_level
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                    content_type_id, last_modified, created_at, metadata, scan_level
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(&obj.id)
             .bind(&obj.key)
-            .bind(&obj.parent_directory)
-            .bind(obj.is_directory)
+            .bind(obj.parent_dir_id)
             .bind(obj.is_symlink)
             .bind(&obj.symlink_target)
             .bind(obj.size)
@@ -252,7 +407,7 @@ impl MetadataStore {
             .bind(&obj.checksum_sha1)
             .bind(&obj.checksum_crc32)
             .bind(&obj.checksum_crc32c)
-            .bind(&obj.content_type)
+            .bind(obj.content_type_id)
             .bind(obj.last_modified)
             .bind(obj.created_at)
             .bind(&obj.metadata)
@@ -275,14 +430,13 @@ impl MetadataStore {
     pub async fn upsert_object(&self, obj: &ObjectRecord) -> Result<String, S3Error> {
         let row: (String,) = sqlx::query_as(
             r#"INSERT INTO objects (
-                id, key, parent_directory, is_directory, is_symlink, symlink_target,
+                id, key, parent_dir_id, is_symlink, symlink_target,
                 size, file_mtime, file_ctime, inode, device_id,
                 etag, checksum_sha256, checksum_sha1, checksum_crc32, checksum_crc32c,
-                content_type, last_modified, created_at, metadata, scan_level
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                content_type_id, last_modified, created_at, metadata, scan_level
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET
-                parent_directory = excluded.parent_directory,
-                is_directory = excluded.is_directory,
+                parent_dir_id = excluded.parent_dir_id,
                 is_symlink = excluded.is_symlink,
                 symlink_target = excluded.symlink_target,
                 size = excluded.size,
@@ -295,7 +449,7 @@ impl MetadataStore {
                 checksum_sha1 = excluded.checksum_sha1,
                 checksum_crc32 = excluded.checksum_crc32,
                 checksum_crc32c = excluded.checksum_crc32c,
-                content_type = excluded.content_type,
+                content_type_id = excluded.content_type_id,
                 last_modified = excluded.last_modified,
                 metadata = excluded.metadata,
                 scan_level = excluded.scan_level
@@ -303,8 +457,7 @@ impl MetadataStore {
         )
         .bind(&obj.id)
         .bind(&obj.key)
-        .bind(&obj.parent_directory)
-        .bind(obj.is_directory)
+        .bind(obj.parent_dir_id)
         .bind(obj.is_symlink)
         .bind(&obj.symlink_target)
         .bind(obj.size)
@@ -317,7 +470,7 @@ impl MetadataStore {
         .bind(&obj.checksum_sha1)
         .bind(&obj.checksum_crc32)
         .bind(&obj.checksum_crc32c)
-        .bind(&obj.content_type)
+        .bind(obj.content_type_id)
         .bind(obj.last_modified)
         .bind(obj.created_at)
         .bind(&obj.metadata)
@@ -490,10 +643,22 @@ impl MetadataStore {
 
     /// List objects within a specific parent directory.
     pub async fn list_by_parent(&self, parent: &str) -> Result<Vec<ObjectRecord>, S3Error> {
+        let prefix = if parent.is_empty() {
+            String::new()
+        } else {
+            format!("{parent}/")
+        };
+        let dir_id: Option<(i64,)> = sqlx::query_as("SELECT id FROM directories WHERE prefix = ?")
+            .bind(&prefix)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some((dir_id,)) = dir_id else {
+            return Ok(Vec::new());
+        };
         let records = sqlx::query_as::<_, ObjectRecord>(
-            "SELECT * FROM objects WHERE parent_directory = ? ORDER BY key",
+            "SELECT * FROM objects WHERE parent_dir_id = ? ORDER BY key",
         )
-        .bind(parent)
+        .bind(dir_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -706,12 +871,13 @@ impl MetadataStore {
             .rsplit_once('/')
             .map(|(p, _)| p.to_string())
             .unwrap_or_default();
-        let now = time::OffsetDateTime::now_utc();
+        let dir_id = self.get_or_create_dir_id(&parent).await?;
+        let now = SqliteTimestamp::now();
         let result = sqlx::query(
-            "UPDATE objects SET key = ?, parent_directory = ?, last_modified = ? WHERE key = ?",
+            "UPDATE objects SET key = ?, parent_dir_id = ?, last_modified = ? WHERE key = ?",
         )
         .bind(dst_key)
-        .bind(&parent)
+        .bind(dir_id)
         .bind(now)
         .bind(src_key)
         .execute(&self.pool)
@@ -921,15 +1087,15 @@ impl MetadataStore {
             "CREATE TEMP TABLE l1_disk (
                 key TEXT NOT NULL PRIMARY KEY,
                 id TEXT NOT NULL,
-                parent_directory TEXT NOT NULL,
+                parent_dir_id INTEGER NOT NULL,
                 is_symlink BOOLEAN NOT NULL DEFAULT FALSE,
                 symlink_target TEXT,
                 size INTEGER,
                 inode INTEGER,
                 device_id INTEGER,
-                content_type TEXT,
-                last_modified TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                content_type_id INTEGER,
+                last_modified INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
             )",
         )
         .execute(&mut *conn)
@@ -949,19 +1115,19 @@ impl MetadataStore {
         for obj in records {
             sqlx::query(
                 "INSERT OR IGNORE INTO l1_disk (
-                    key, id, parent_directory, is_symlink, symlink_target,
-                    size, inode, device_id, content_type, last_modified, created_at
+                    key, id, parent_dir_id, is_symlink, symlink_target,
+                    size, inode, device_id, content_type_id, last_modified, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&obj.key)
             .bind(&obj.id)
-            .bind(&obj.parent_directory)
+            .bind(obj.parent_dir_id)
             .bind(obj.is_symlink)
             .bind(&obj.symlink_target)
             .bind(obj.size)
             .bind(obj.inode)
             .bind(obj.device_id)
-            .bind(&obj.content_type)
+            .bind(obj.content_type_id)
             .bind(obj.last_modified)
             .bind(obj.created_at)
             .execute(&mut *tx)
@@ -997,19 +1163,33 @@ impl MetadataStore {
         .await?;
 
         let mut moved: u64 = 0;
+        let now = SqliteTimestamp::now();
         for (new_key, _old_key, _object_id) in &moves {
             // Update the existing object's key to the new location
             let parent = new_key
                 .rsplit_once('/')
                 .map(|(p, _)| p.to_string())
                 .unwrap_or_default();
+            let prefix = if parent.is_empty() {
+                String::new()
+            } else {
+                format!("{parent}/")
+            };
+            let dir_row: (i64,) = sqlx::query_as(
+                "INSERT INTO directories (prefix) VALUES (?) \
+                 ON CONFLICT(prefix) DO UPDATE SET prefix = excluded.prefix \
+                 RETURNING id",
+            )
+            .bind(&prefix)
+            .fetch_one(&mut *conn)
+            .await?;
             sqlx::query(
-                "UPDATE objects SET key = ?, parent_directory = ?, last_modified = ?
+                "UPDATE objects SET key = ?, parent_dir_id = ?, last_modified = ?
                  WHERE id = ?",
             )
             .bind(new_key)
-            .bind(&parent)
-            .bind(time::OffsetDateTime::now_utc())
+            .bind(dir_row.0)
+            .bind(now)
             .bind(_object_id)
             .execute(&mut *conn)
             .await?;
@@ -1025,12 +1205,12 @@ impl MetadataStore {
         // Step 2: Insert truly new objects (not in catalog AND not a move)
         let inserted = sqlx::query(
             "INSERT INTO objects (
-                id, key, parent_directory, is_directory, is_symlink, symlink_target,
-                size, inode, device_id, content_type, last_modified, created_at, scan_level
+                id, key, parent_dir_id, is_symlink, symlink_target,
+                size, inode, device_id, content_type_id, last_modified, created_at, scan_level
             )
             SELECT
-                d.id, d.key, d.parent_directory, FALSE, d.is_symlink, d.symlink_target,
-                d.size, d.inode, d.device_id, d.content_type, d.last_modified, d.created_at, 1
+                d.id, d.key, d.parent_dir_id, d.is_symlink, d.symlink_target,
+                d.size, d.inode, d.device_id, d.content_type_id, d.last_modified, d.created_at, 1
             FROM l1_disk d
             WHERE d.key NOT IN (SELECT key FROM objects)",
         )
@@ -1081,12 +1261,12 @@ impl MetadataStore {
              WHERE key = ? AND scan_level < ?",
         )
         .bind(update.size)
-        .bind(update.file_mtime)
-        .bind(update.file_ctime)
+        .bind(update.file_mtime.map(SqliteTimestamp::from))
+        .bind(update.file_ctime.map(SqliteTimestamp::from))
         .bind(update.inode.map(|v| v as i64))
         .bind(update.device_id.map(|v| v as i64))
         .bind(update.scan_level)
-        .bind(time::OffsetDateTime::now_utc())
+        .bind(SqliteTimestamp::now())
         .bind(key)
         .bind(update.scan_level)
         .execute(&self.pool)
@@ -1110,7 +1290,7 @@ impl MetadataStore {
             return Ok(());
         }
         let mut tx = self.pool.begin().await?;
-        let now = time::OffsetDateTime::now_utc();
+        let now = SqliteTimestamp::now();
         for (key, update) in updates {
             sqlx::query(
                 "UPDATE objects SET size = ?, file_mtime = ?, file_ctime = ?, \
@@ -1118,8 +1298,8 @@ impl MetadataStore {
                  WHERE key = ? AND scan_level < ?",
             )
             .bind(update.size)
-            .bind(update.file_mtime)
-            .bind(update.file_ctime)
+            .bind(update.file_mtime.map(SqliteTimestamp::from))
+            .bind(update.file_ctime.map(SqliteTimestamp::from))
             .bind(update.inode.map(|v| v as i64))
             .bind(update.device_id.map(|v| v as i64))
             .bind(update.scan_level)
@@ -1153,7 +1333,7 @@ impl MetadataStore {
         .bind(&checksums.crc32)
         .bind(&checksums.crc32c)
         .bind(scan_level)
-        .bind(time::OffsetDateTime::now_utc())
+        .bind(SqliteTimestamp::now())
         .bind(key)
         .bind(scan_level)
         .execute(&self.pool)
@@ -1178,7 +1358,7 @@ impl MetadataStore {
             return Ok(());
         }
         let mut tx = self.pool.begin().await?;
-        let now = time::OffsetDateTime::now_utc();
+        let now = SqliteTimestamp::now();
         for key in keys {
             sqlx::query(
                 "UPDATE objects SET scan_level = ?, last_modified = ? \
@@ -1204,7 +1384,7 @@ impl MetadataStore {
             return Ok(());
         }
         let mut tx = self.pool.begin().await?;
-        let now = time::OffsetDateTime::now_utc();
+        let now = SqliteTimestamp::now();
         for update in updates {
             sqlx::query(
                 "UPDATE objects SET etag = ?, \
@@ -1598,6 +1778,35 @@ impl MetadataStore {
         Ok(records)
     }
 
+    /// Lightweight query for directory hash computation: returns only
+    /// (key, checksum_sha256, size) for direct children of a directory.
+    /// Uses `parent_dir_id` FK instead of a prefix range scan.
+    pub async fn get_dir_children_for_hashing(
+        &self,
+        parent_dir: &str,
+    ) -> Result<Vec<(String, Option<String>, Option<i64>)>, S3Error> {
+        let prefix = if parent_dir.is_empty() {
+            String::new()
+        } else {
+            format!("{parent_dir}/")
+        };
+        let dir_id: Option<(i64,)> = sqlx::query_as("SELECT id FROM directories WHERE prefix = ?")
+            .bind(&prefix)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some((dir_id,)) = dir_id else {
+            return Ok(Vec::new());
+        };
+        let rows: Vec<(String, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT key, checksum_sha256, size FROM objects \
+             WHERE parent_dir_id = ? ORDER BY key",
+        )
+        .bind(dir_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Get all objects with a given key prefix.
     pub async fn get_objects_with_prefix(
         &self,
@@ -1652,27 +1861,25 @@ impl MetadataStore {
     }
 
     // -------------------------------------------------------------------------
-    // Phase 8: Directory Hash Methods
+    // Phase 8: Directory Methods
     // -------------------------------------------------------------------------
 
-    /// Insert or update a directory hash record.
-    pub async fn upsert_directory_hash(&self, record: &DirectoryHashRecord) -> Result<(), S3Error> {
+    /// Update hash data for an existing directory row.
+    pub async fn upsert_directory_hash(&self, record: &DirectoryRecord) -> Result<(), S3Error> {
         sqlx::query(
-            "INSERT INTO directory_hashes (id, prefix, dir_hash, file_count, total_size, computed_at, stale) \
-             VALUES (?, ?, ?, ?, ?, ?, FALSE) \
-             ON CONFLICT(prefix) DO UPDATE SET \
-                dir_hash = excluded.dir_hash, \
-                file_count = excluded.file_count, \
-                total_size = excluded.total_size, \
-                computed_at = excluded.computed_at, \
-                stale = FALSE",
+            "UPDATE directories SET \
+                dir_hash = ?, \
+                file_count = ?, \
+                total_size = ?, \
+                computed_at = ?, \
+                stale = FALSE \
+             WHERE prefix = ?",
         )
-        .bind(&record.id)
-        .bind(&record.prefix)
         .bind(&record.dir_hash)
         .bind(record.file_count)
         .bind(record.total_size)
-        .bind(&record.computed_at)
+        .bind(record.computed_at)
+        .bind(&record.prefix)
         .execute(&self.pool)
         .await?;
 
@@ -1688,14 +1895,10 @@ impl MetadataStore {
         after_hash: Option<&str>,
         max_depth: Option<i32>,
     ) -> Result<Vec<DuplicateDirGroup>, S3Error> {
-        // Build the query dynamically to handle optional prefix, cursor, and depth filters.
-        // Uses a subquery to pre-filter qualifying dir_hashes when prefix/depth is set,
-        // and keyset pagination via the dir_hash cursor.
-        // Ordered by dir_hash for stable, simple keyset pagination.
         let mut sql = String::from(
             "SELECT dir_hash, COUNT(*) as count, \
              MIN(file_count) as file_count, SUM(total_size) as total_size \
-             FROM directory_hashes \
+             FROM directories \
              WHERE stale = FALSE AND file_count >= ?",
         );
 
@@ -1709,7 +1912,7 @@ impl MetadataStore {
                     .push("(LENGTH(prefix) - LENGTH(REPLACE(prefix, '/', ''))) <= ?".to_string());
             }
             sql.push_str(&format!(
-                " AND dir_hash IN (SELECT dir_hash FROM directory_hashes WHERE {})",
+                " AND dir_hash IN (SELECT dir_hash FROM directories WHERE {})",
                 sub_conditions.join(" AND ")
             ));
         }
@@ -1720,7 +1923,6 @@ impl MetadataStore {
 
         sql.push_str(" GROUP BY dir_hash HAVING COUNT(*) > 1 ORDER BY dir_hash ASC LIMIT ?");
 
-        // Bind parameters in the same order as placeholders above.
         let like_pattern = prefix.map(|p| format!("{}%", p));
         let max_slash_count = max_depth.map(|d| {
             let base_slashes = prefix.map_or(0, |p| p.matches('/').count() as i32);
@@ -1744,13 +1946,10 @@ impl MetadataStore {
         Ok(rows)
     }
 
-    /// Get all directory hash records with a specific dir_hash.
-    pub async fn get_dirs_by_hash(
-        &self,
-        dir_hash: &str,
-    ) -> Result<Vec<DirectoryHashRecord>, S3Error> {
-        let records = sqlx::query_as::<_, DirectoryHashRecord>(
-            "SELECT * FROM directory_hashes WHERE dir_hash = ? ORDER BY prefix",
+    /// Get all directory records with a specific dir_hash.
+    pub async fn get_dirs_by_hash(&self, dir_hash: &str) -> Result<Vec<DirectoryRecord>, S3Error> {
+        let records = sqlx::query_as::<_, DirectoryRecord>(
+            "SELECT * FROM directories WHERE dir_hash = ? ORDER BY prefix",
         )
         .bind(dir_hash)
         .fetch_all(&self.pool)
@@ -1759,11 +1958,11 @@ impl MetadataStore {
         Ok(records)
     }
 
-    /// Get all distinct parent_directory values (immediate directories).
+    /// Get all distinct parent directory prefixes.
     pub async fn list_parent_directories(&self) -> Result<Vec<String>, S3Error> {
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT parent_directory FROM objects \
-             WHERE parent_directory != '' ORDER BY parent_directory",
+            "SELECT prefix FROM directories \
+             WHERE prefix != '' ORDER BY prefix",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1772,19 +1971,20 @@ impl MetadataStore {
     }
 
     /// Get parent directories that need hash (re)computation:
-    /// either missing from directory_hashes or marked stale.
+    /// either not yet computed or marked stale.
     pub async fn list_unhashed_parent_directories(&self) -> Result<Vec<String>, S3Error> {
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT o.parent_directory FROM objects o \
-             LEFT JOIN directory_hashes dh ON dh.prefix = o.parent_directory || '/' \
-             WHERE o.parent_directory != '' \
-               AND (dh.id IS NULL OR dh.stale = TRUE) \
-             ORDER BY o.parent_directory",
+            "SELECT prefix FROM directories \
+             WHERE prefix != '' AND stale = TRUE \
+             ORDER BY prefix",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|(p,)| p).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(p,)| p.strip_suffix('/').unwrap_or(&p).to_string())
+            .collect())
     }
 
     /// Find abandoned multipart uploads older than cutoff time.
@@ -1944,15 +2144,15 @@ pub struct DuplicateDirGroup {
     pub total_size: i64,
 }
 
-/// A directory hash record from the directory_hashes table.
+/// A directory record from the `directories` table.
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct DirectoryHashRecord {
-    pub id: String,
+pub struct DirectoryRecord {
+    pub id: i64,
     pub prefix: String,
-    pub dir_hash: String,
-    pub file_count: i32,
-    pub total_size: i64,
-    pub computed_at: String,
+    pub dir_hash: Option<String>,
+    pub file_count: Option<i32>,
+    pub total_size: Option<i64>,
+    pub computed_at: Option<SqliteTimestamp>,
     pub stale: bool,
 }
 
@@ -1977,27 +2177,31 @@ pub struct Tag {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use time::OffsetDateTime;
 
     async fn make_store(tmp: &TempDir) -> MetadataStore {
         let db_path = tmp.path().join("test.db");
         MetadataStore::new(&db_path).await.unwrap()
     }
 
-    fn make_record(key: &str) -> ObjectRecord {
-        let now = OffsetDateTime::now_utc();
+    async fn make_record(store: &MetadataStore, key: &str) -> ObjectRecord {
+        let now = SqliteTimestamp::now();
         let parent = key
             .rsplit_once('/')
             .map(|(p, _)| p.to_string())
             .unwrap_or_default();
+        let dir_id = store.get_or_create_dir_id(&parent).await.unwrap();
+        let ct_id = store
+            .get_or_create_content_type_id("application/octet-stream")
+            .await
+            .unwrap();
 
         ObjectRecord {
             id: uuid::Uuid::new_v4().to_string(),
             key: key.to_string(),
-            parent_directory: parent,
+            parent_dir_id: dir_id,
             size: Some(1024),
             file_mtime: Some(now),
-            content_type: Some("application/octet-stream".to_string()),
+            content_type_id: Some(ct_id),
             last_modified: now,
             created_at: now,
             scan_level: 1,
@@ -2010,7 +2214,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp).await;
 
-        let obj = make_record("photos/cat.jpg");
+        let obj = make_record(&store, "photos/cat.jpg").await;
         store.insert_object(&obj).await.unwrap();
 
         let fetched = store.get_object("photos/cat.jpg").await.unwrap().unwrap();
@@ -2033,7 +2237,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp).await;
 
-        let obj = make_record("to-delete.txt");
+        let obj = make_record(&store, "to-delete.txt").await;
         store.insert_object(&obj).await.unwrap();
 
         let deleted = store.delete_object("to-delete.txt").await.unwrap();
@@ -2057,18 +2261,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp).await;
 
-        store
-            .insert_object(&make_record("photos/a.jpg"))
-            .await
-            .unwrap();
-        store
-            .insert_object(&make_record("photos/b.jpg"))
-            .await
-            .unwrap();
-        store
-            .insert_object(&make_record("docs/readme.md"))
-            .await
-            .unwrap();
+        let r = make_record(&store, "photos/a.jpg").await;
+        store.insert_object(&r).await.unwrap();
+        let r = make_record(&store, "photos/b.jpg").await;
+        store.insert_object(&r).await.unwrap();
+        let r = make_record(&store, "docs/readme.md").await;
+        store.insert_object(&r).await.unwrap();
 
         let photos = store.list_objects("photos/", 100).await.unwrap();
         assert_eq!(photos.len(), 2);
@@ -2085,9 +2283,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp).await;
 
-        store.insert_object(&make_record("a.txt")).await.unwrap();
-        store.insert_object(&make_record("b.txt")).await.unwrap();
-        store.insert_object(&make_record("c.txt")).await.unwrap();
+        let r = make_record(&store, "a.txt").await;
+        store.insert_object(&r).await.unwrap();
+        let r = make_record(&store, "b.txt").await;
+        store.insert_object(&r).await.unwrap();
+        let r = make_record(&store, "c.txt").await;
+        store.insert_object(&r).await.unwrap();
 
         let limited = store.list_objects("", 2).await.unwrap();
         assert_eq!(limited.len(), 2);
@@ -2098,7 +2299,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp).await;
 
-        let mut obj = make_record("test.txt");
+        let mut obj = make_record(&store, "test.txt").await;
         obj.size = Some(100);
         store.upsert_object(&obj).await.unwrap();
 
@@ -2118,18 +2319,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp).await;
 
-        store
-            .insert_object(&make_record("photos/a.jpg"))
-            .await
-            .unwrap();
-        store
-            .insert_object(&make_record("photos/b.jpg"))
-            .await
-            .unwrap();
-        store
-            .insert_object(&make_record("photos/sub/c.jpg"))
-            .await
-            .unwrap();
+        let r = make_record(&store, "photos/a.jpg").await;
+        store.insert_object(&r).await.unwrap();
+        let r = make_record(&store, "photos/b.jpg").await;
+        store.insert_object(&r).await.unwrap();
+        let r = make_record(&store, "photos/sub/c.jpg").await;
+        store.insert_object(&r).await.unwrap();
 
         let photos = store.list_by_parent("photos").await.unwrap();
         assert_eq!(photos.len(), 2);
@@ -2145,8 +2340,10 @@ mod tests {
 
         assert_eq!(store.count_objects().await.unwrap(), 0);
 
-        store.insert_object(&make_record("a.txt")).await.unwrap();
-        store.insert_object(&make_record("b.txt")).await.unwrap();
+        let r = make_record(&store, "a.txt").await;
+        store.insert_object(&r).await.unwrap();
+        let r = make_record(&store, "b.txt").await;
+        store.insert_object(&r).await.unwrap();
 
         assert_eq!(store.count_objects().await.unwrap(), 2);
     }
@@ -2156,13 +2353,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp).await;
 
-        let now = OffsetDateTime::now_utc();
+        let now = SqliteTimestamp::now();
+        let dir_id = store.get_or_create_dir_id("").await.unwrap();
+        let ct_id = store
+            .get_or_create_content_type_id("application/x-symlink")
+            .await
+            .unwrap();
         let obj = ObjectRecord {
             id: uuid::Uuid::new_v4().to_string(),
             key: "my-link".to_string(),
+            parent_dir_id: dir_id,
             is_symlink: true,
             symlink_target: Some("/some/target".to_string()),
-            content_type: Some("application/x-symlink".to_string()),
+            content_type_id: Some(ct_id),
             last_modified: now,
             created_at: now,
             scan_level: 1,

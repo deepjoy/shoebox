@@ -100,7 +100,7 @@ fn check_conditional(
     // If-Modified-Since
     if let Some(ims) = headers.get(header::IF_MODIFIED_SINCE) {
         let since = parse_http_date(ims.to_str().map_err(|_| S3Error::InvalidArgument)?)?;
-        if record.last_modified <= since {
+        if record.last_modified <= crate::metadata::sqlite::SqliteTimestamp(since) {
             return Ok(Some(StatusCode::NOT_MODIFIED.into_response()));
         }
     }
@@ -108,7 +108,7 @@ fn check_conditional(
     // If-Unmodified-Since
     if let Some(ius) = headers.get(header::IF_UNMODIFIED_SINCE) {
         let since = parse_http_date(ius.to_str().map_err(|_| S3Error::InvalidArgument)?)?;
-        if record.last_modified > since {
+        if record.last_modified > crate::metadata::sqlite::SqliteTimestamp(since) {
             return Err(S3Error::PreconditionFailed);
         }
     }
@@ -166,10 +166,10 @@ pub async fn get_object(
     }
 
     let file_size = record.size.unwrap_or(0) as u64;
-    let content_type = record
-        .content_type
-        .clone()
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let content_type = bucket
+        .metadata
+        .resolve_content_type(record.content_type_id)
+        .await;
     let etag = record.etag.clone().unwrap_or_default();
     let last_modified = format_http_date(&record.last_modified);
     let user_meta = parse_metadata_json(&record.metadata);
@@ -210,11 +210,9 @@ pub async fn get_object(
             builder = builder.header(format!("x-amz-meta-{}", k), v);
         }
 
-        let mut checksum_headers = Vec::new();
-        append_checksum_headers(&checksums, &mut checksum_headers);
-        for (k, v) in &checksum_headers {
-            builder = builder.header(k.as_str(), v.as_str());
-        }
+        // Omit checksum headers on partial (206) responses — the stored
+        // checksums cover the full object, and clients (e.g. the AWS CLI)
+        // will validate them against the partial body, causing a mismatch.
 
         return Ok(builder
             .body(body)
@@ -512,9 +510,10 @@ pub async fn head_object(
     let mut resp_headers = vec![
         (
             header::CONTENT_TYPE.to_string(),
-            metadata
-                .content_type
-                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            bucket
+                .metadata
+                .resolve_content_type(metadata.content_type_id)
+                .await,
         ),
         (
             header::CONTENT_LENGTH.to_string(),

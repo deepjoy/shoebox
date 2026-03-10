@@ -5,7 +5,7 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 
 use crate::error::S3Error;
-use crate::metadata::sqlite::{DirectoryHashRecord, ObjectRecord};
+use crate::metadata::sqlite::{DirectoryRecord, ObjectRecord, SqliteTimestamp};
 use crate::metadata::MetadataStore;
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -365,37 +365,25 @@ pub async fn compute_single_directory_hash(
         format!("{}/", parent_dir)
     };
 
-    let files = metadata.get_objects_with_prefix(&prefix).await?;
-    // Only include direct children (not nested)
-    let direct_children: Vec<&ObjectRecord> = files
-        .iter()
-        .filter(|f| {
-            let suffix = f.key.strip_prefix(&prefix).unwrap_or(&f.key);
-            !suffix.contains('/')
-        })
-        .collect();
+    // Lightweight query: only key, checksum_sha256, size for direct children.
+    let children = metadata.get_dir_children_for_hashing(parent_dir).await?;
 
-    if direct_children.is_empty() {
+    if children.is_empty() {
         return Ok(false);
     }
 
-    // Build sorted list of (relative_key, checksum_sha256) for hashing
-    let mut pairs: Vec<(&str, &str)> = Vec::new();
-    let mut all_hashed = true;
-    for f in &direct_children {
-        let rel_key = f.key.strip_prefix(&prefix).unwrap_or(&f.key);
-        if let Some(ref hash) = f.checksum_sha256 {
-            pairs.push((rel_key, hash.as_str()));
-        } else {
-            all_hashed = false;
+    // Build sorted list of (relative_key, checksum_sha256) for hashing.
+    // Already sorted by key from the query.
+    let mut pairs: Vec<(&str, &str)> = Vec::with_capacity(children.len());
+    let mut total_size: i64 = 0;
+    for (key, checksum, size) in &children {
+        let rel_key = key.strip_prefix(&prefix).unwrap_or(key);
+        match checksum {
+            Some(hash) => pairs.push((rel_key, hash.as_str())),
+            None => return Ok(false), // Not all children hashed yet
         }
+        total_size += size.unwrap_or(0);
     }
-
-    if !all_hashed || pairs.is_empty() {
-        return Ok(false);
-    }
-
-    pairs.sort_by_key(|(k, _)| *k);
 
     let mut hasher = Sha256::new();
     for (key, hash) in &pairs {
@@ -406,17 +394,13 @@ pub async fn compute_single_directory_hash(
     }
     let dir_hash = hex::encode(hasher.finalize());
 
-    let total_size: i64 = direct_children.iter().map(|f| f.size.unwrap_or(0)).sum();
-
-    let record = DirectoryHashRecord {
-        id: uuid::Uuid::new_v4().to_string(),
+    let record = DirectoryRecord {
+        id: 0, // Will be resolved by upsert (existing row looked up by prefix)
         prefix: prefix.clone(),
-        dir_hash,
-        file_count: direct_children.len() as i32,
-        total_size,
-        computed_at: time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default(),
+        dir_hash: Some(dir_hash),
+        file_count: Some(children.len() as i32),
+        total_size: Some(total_size),
+        computed_at: Some(SqliteTimestamp::now()),
         stale: false,
     };
 
@@ -481,8 +465,8 @@ pub async fn find_bucket_duplicate_dirs(
                 .into_iter()
                 .map(|d| DuplicateDir {
                     prefix: d.prefix,
-                    file_count: d.file_count,
-                    total_size: d.total_size,
+                    file_count: d.file_count.unwrap_or(0),
+                    total_size: d.total_size.unwrap_or(0),
                 })
                 .collect(),
         });
