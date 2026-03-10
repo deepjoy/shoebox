@@ -596,6 +596,9 @@ impl Scheduler {
                 }
             }
         }
+
+        // Flush WAL and close the database.
+        self.inner.store.close().await;
     }
 
     /// Snapshot of currently active (in-memory) tasks.
