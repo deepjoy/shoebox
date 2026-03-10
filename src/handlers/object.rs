@@ -210,11 +210,9 @@ pub async fn get_object(
             builder = builder.header(format!("x-amz-meta-{}", k), v);
         }
 
-        let mut checksum_headers = Vec::new();
-        append_checksum_headers(&checksums, &mut checksum_headers);
-        for (k, v) in &checksum_headers {
-            builder = builder.header(k.as_str(), v.as_str());
-        }
+        // Omit checksum headers on partial (206) responses — the stored
+        // checksums cover the full object, and clients (e.g. the AWS CLI)
+        // will validate them against the partial body, causing a mismatch.
 
         return Ok(builder
             .body(body)
