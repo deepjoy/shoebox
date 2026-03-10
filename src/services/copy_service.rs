@@ -63,10 +63,12 @@ pub async fn copy_object(
     let dir_id = dst_metadata.get_or_create_dir_id(&parent).await?;
 
     // Copy metadata to destination
+    let (_, filename) = crate::metadata::sqlite::split_key(dst_key);
     let dst_record = ObjectRecord {
         id: uuid::Uuid::new_v4().to_string(),
-        key: dst_key.to_string(),
+        name: filename.to_string(),
         parent_dir_id: dir_id,
+        key: dst_key.to_string(),
         size: src_record.size,
         etag: src_record.etag.clone(),
         checksum_sha256: src_record.checksum_sha256.clone(),

@@ -4,6 +4,7 @@
 CREATE TABLE IF NOT EXISTS directories (
     id INTEGER PRIMARY KEY,
     prefix TEXT NOT NULL UNIQUE,     -- directory prefix (e.g. "photos/2024/")
+    depth INTEGER NOT NULL DEFAULT 0, -- nesting depth from bucket root (root "" = 0)
     dir_hash TEXT,                   -- composite hash (NULL until computed)
     file_count INTEGER,              -- number of direct children (NULL until computed)
     total_size INTEGER,              -- sum of child file sizes (NULL until computed)
@@ -35,7 +36,7 @@ CREATE TRIGGER IF NOT EXISTS trg_objects_update_dir_stale
 AFTER UPDATE ON objects
 WHEN OLD.parent_dir_id != NEW.parent_dir_id
    OR OLD.checksum_sha256 IS NOT NEW.checksum_sha256
-   OR OLD.key != NEW.key
+   OR OLD.name != NEW.name
 BEGIN
     UPDATE directories SET stale = TRUE
     WHERE id IN (OLD.parent_dir_id, NEW.parent_dir_id)

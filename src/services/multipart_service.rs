@@ -169,10 +169,12 @@ pub async fn complete(
         .unwrap_or("application/octet-stream");
     let ct_id = metadata.get_or_create_content_type_id(ct_mime).await?;
     let now = crate::metadata::sqlite::SqliteTimestamp::now();
+    let (_, filename) = crate::metadata::sqlite::split_key(&upload.key);
     let obj = ObjectRecord {
         id: uuid::Uuid::new_v4().to_string(),
-        key: upload.key.clone(),
+        name: filename.to_string(),
         parent_dir_id: dir_id,
+        key: upload.key.clone(),
         size: Some(total_size),
         etag: Some(etag.clone()),
         content_type_id: Some(ct_id),

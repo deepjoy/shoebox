@@ -80,10 +80,28 @@ impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for SqliteTimestamp {
 
 /// Batch update entry for L3 content hashes.
 pub struct L3HashUpdate {
+    /// Full S3 key (e.g. `"photos/2024/vacation.jpg"`).
     pub key: String,
     pub etag: String,
     pub checksums: ChecksumValues,
     pub scan_level: i32,
+}
+
+/// Split a full S3 key into `(directory_prefix, filename)`.
+///
+/// The directory prefix includes a trailing `/` to match the
+/// `directories.prefix` column format. Root-level files return an empty
+/// prefix.
+///
+/// # Examples
+///
+/// - `"photos/2024/vacation.jpg"` → `("photos/2024/", "vacation.jpg")`
+/// - `"file.txt"` → `("", "file.txt")`
+pub(crate) fn split_key(key: &str) -> (String, &str) {
+    match key.rsplit_once('/') {
+        Some((dir, name)) => (format!("{dir}/"), name),
+        None => (String::new(), key),
+    }
 }
 
 /// A single entry from a streaming list operation.
@@ -108,8 +126,13 @@ pub enum ListEntry {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ObjectRecord {
     pub id: String,
-    pub key: String,
+    /// Filename only (e.g. `"vacation.jpg"`), matching the `objects.name` column.
+    pub name: String,
     pub parent_dir_id: i64,
+    /// Full S3 key, reconstructed via `directories.prefix || objects.name` in
+    /// JOINed queries. Empty when loaded via `SELECT * FROM objects` without JOIN.
+    #[sqlx(default)]
+    pub key: String,
     pub is_symlink: bool,
     pub symlink_target: Option<String>,
 
@@ -142,8 +165,9 @@ impl Default for ObjectRecord {
     fn default() -> Self {
         Self {
             id: String::new(),
-            key: String::new(),
+            name: String::new(),
             parent_dir_id: 0,
+            key: String::new(),
             is_symlink: false,
             symlink_target: None,
             size: None,
@@ -165,14 +189,14 @@ impl Default for ObjectRecord {
     }
 }
 
-/// Compute the exclusive upper-bound key for a prefix range scan.
+/// Compute the exclusive upper-bound for a prefix range scan.
 ///
 /// For a prefix like `"photos/"`, returns `Some("photos0")` — where `0` is
 /// the character after `/` in ASCII (0x30 vs 0x2F). The caller can then use
-/// `key >= prefix AND key < upper` instead of `key LIKE 'photos/%' ESCAPE '\'`,
-/// which lets SQLite use a B-tree range seek on the `key` unique index.
+/// `col >= prefix AND col < upper` instead of `col LIKE 'photos/%'`,
+/// which lets SQLite use a B-tree range seek.
 ///
-/// Returns `None` for an empty prefix (meaning "match all keys").
+/// Returns `None` for an empty prefix (meaning "match all rows").
 fn prefix_upper_bound(prefix: &str) -> Option<String> {
     if prefix.is_empty() {
         return None;
@@ -266,12 +290,14 @@ impl MetadataStore {
             return Ok(id);
         }
         // Insert (race-safe via ON CONFLICT).
+        let depth = prefix.matches('/').count() as i32;
         let row: (i64,) = sqlx::query_as(
-            "INSERT INTO directories (prefix) VALUES (?) \
+            "INSERT INTO directories (prefix, depth) VALUES (?, ?) \
              ON CONFLICT(prefix) DO UPDATE SET prefix = excluded.prefix \
              RETURNING id",
         )
         .bind(&prefix)
+        .bind(depth)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
@@ -331,12 +357,19 @@ impl MetadataStore {
     // to avoid loading heavy columns (e.g. `metadata` JSON) when not needed.
     // https://github.com/deepjoy/shoebox/issues/5
 
-    /// Retrieve an object record by key.
+    /// Retrieve an object record by its full S3 key.
     pub async fn get_object(&self, key: &str) -> Result<Option<ObjectRecord>, S3Error> {
-        let record = sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects WHERE key = ?")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await?;
+        let (dir_prefix, filename) = split_key(key);
+        let record = sqlx::query_as::<_, ObjectRecord>(
+            "SELECT o.*, d.prefix || o.name AS key \
+             FROM objects o \
+             JOIN directories d ON o.parent_dir_id = d.id \
+             WHERE d.prefix = ? AND o.name = ?",
+        )
+        .bind(&dir_prefix)
+        .bind(filename)
+        .fetch_optional(&self.pool)
+        .await?;
 
         Ok(record)
     }
@@ -345,14 +378,14 @@ impl MetadataStore {
     pub async fn insert_object(&self, obj: &ObjectRecord) -> Result<(), S3Error> {
         sqlx::query(
             r#"INSERT INTO objects (
-                id, key, parent_dir_id, is_symlink, symlink_target,
+                id, name, parent_dir_id, is_symlink, symlink_target,
                 size, file_mtime, file_ctime, inode, device_id,
                 etag, checksum_sha256, checksum_sha1, checksum_crc32, checksum_crc32c,
                 content_type_id, last_modified, created_at, metadata, scan_level
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&obj.id)
-        .bind(&obj.key)
+        .bind(&obj.name)
         .bind(obj.parent_dir_id)
         .bind(obj.is_symlink)
         .bind(&obj.symlink_target)
@@ -386,14 +419,14 @@ impl MetadataStore {
         for obj in objects {
             sqlx::query(
                 r#"INSERT INTO objects (
-                    id, key, parent_dir_id, is_symlink, symlink_target,
+                    id, name, parent_dir_id, is_symlink, symlink_target,
                     size, file_mtime, file_ctime, inode, device_id,
                     etag, checksum_sha256, checksum_sha1, checksum_crc32, checksum_crc32c,
                     content_type_id, last_modified, created_at, metadata, scan_level
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(&obj.id)
-            .bind(&obj.key)
+            .bind(&obj.name)
             .bind(obj.parent_dir_id)
             .bind(obj.is_symlink)
             .bind(&obj.symlink_target)
@@ -419,7 +452,7 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// Insert or update an object record, keyed by `key`.
+    /// Insert or update an object record, keyed by `(parent_dir_id, name)`.
     ///
     /// On conflict the existing row's `id` and `created_at` are preserved
     /// (i.e. the values in the supplied `ObjectRecord` are ignored for those
@@ -430,13 +463,12 @@ impl MetadataStore {
     pub async fn upsert_object(&self, obj: &ObjectRecord) -> Result<String, S3Error> {
         let row: (String,) = sqlx::query_as(
             r#"INSERT INTO objects (
-                id, key, parent_dir_id, is_symlink, symlink_target,
+                id, name, parent_dir_id, is_symlink, symlink_target,
                 size, file_mtime, file_ctime, inode, device_id,
                 etag, checksum_sha256, checksum_sha1, checksum_crc32, checksum_crc32c,
                 content_type_id, last_modified, created_at, metadata, scan_level
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                parent_dir_id = excluded.parent_dir_id,
+            ON CONFLICT(parent_dir_id, name) DO UPDATE SET
                 is_symlink = excluded.is_symlink,
                 symlink_target = excluded.symlink_target,
                 size = excluded.size,
@@ -456,7 +488,7 @@ impl MetadataStore {
             RETURNING id"#,
         )
         .bind(&obj.id)
-        .bind(&obj.key)
+        .bind(&obj.name)
         .bind(obj.parent_dir_id)
         .bind(obj.is_symlink)
         .bind(&obj.symlink_target)
@@ -483,31 +515,38 @@ impl MetadataStore {
 
     /// Delete an object record by key. Returns true if a row was deleted.
     pub async fn delete_object(&self, key: &str) -> Result<bool, S3Error> {
-        let result = sqlx::query("DELETE FROM objects WHERE key = ?")
-            .bind(key)
-            .execute(&self.pool)
-            .await?;
+        let (dir_prefix, filename) = split_key(key);
+        let result = sqlx::query(
+            "DELETE FROM objects WHERE parent_dir_id = \
+             (SELECT id FROM directories WHERE prefix = ?) AND name = ?",
+        )
+        .bind(&dir_prefix)
+        .bind(filename)
+        .execute(&self.pool)
+        .await?;
 
         Ok(result.rows_affected() > 0)
     }
 
-    /// Bulk-delete object records by key in a single SQL statement.
+    /// Bulk-delete object records by key.
     pub async fn delete_objects(&self, keys: &[String]) -> Result<u64, S3Error> {
         if keys.is_empty() {
             return Ok(0);
         }
-        // Build `DELETE FROM objects WHERE key IN (?, ?, ...)`
-        let placeholders: Vec<&str> = keys.iter().map(|_| "?").collect();
-        let sql = format!(
-            "DELETE FROM objects WHERE key IN ({})",
-            placeholders.join(", ")
-        );
-        let mut query = sqlx::query(&sql);
+        let mut total: u64 = 0;
         for key in keys {
-            query = query.bind(key);
+            let (dir_prefix, filename) = split_key(key);
+            let result = sqlx::query(
+                "DELETE FROM objects WHERE parent_dir_id = \
+                 (SELECT id FROM directories WHERE prefix = ?) AND name = ?",
+            )
+            .bind(&dir_prefix)
+            .bind(filename)
+            .execute(&self.pool)
+            .await?;
+            total += result.rows_affected();
         }
-        let result = query.execute(&self.pool).await?;
-        Ok(result.rows_affected())
+        Ok(total)
     }
 
     /// List objects matching a prefix, up to `max_keys`.
@@ -516,20 +555,55 @@ impl MetadataStore {
         prefix: &str,
         max_keys: i32,
     ) -> Result<Vec<ObjectRecord>, S3Error> {
-        let records = if let Some(upper) = prefix_upper_bound(prefix) {
-            sqlx::query_as::<_, ObjectRecord>(
-                "SELECT * FROM objects WHERE key >= ? AND key < ? ORDER BY key LIMIT ?",
-            )
-            .bind(prefix)
-            .bind(&upper)
-            .bind(max_keys)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects ORDER BY key LIMIT ?")
+        let (dir_prefix, name_prefix) = split_key(prefix);
+        let records = if name_prefix.is_empty() {
+            // Prefix ends with `/` or is empty — match entire directory subtree.
+            if let Some(upper) = prefix_upper_bound(&dir_prefix) {
+                sqlx::query_as::<_, ObjectRecord>(
+                    "SELECT o.*, d.prefix || o.name AS key \
+                     FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE d.prefix >= ? AND d.prefix < ? \
+                     ORDER BY d.prefix, o.name LIMIT ?",
+                )
+                .bind(&dir_prefix)
+                .bind(&upper)
                 .bind(max_keys)
                 .fetch_all(&self.pool)
                 .await?
+            } else {
+                sqlx::query_as::<_, ObjectRecord>(
+                    "SELECT o.*, d.prefix || o.name AS key \
+                     FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                     ORDER BY d.prefix, o.name LIMIT ?",
+                )
+                .bind(max_keys)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        } else {
+            // Partial filename prefix — exact dir + name range, plus subdirectories.
+            let name_upper = prefix_upper_bound(name_prefix);
+            let dir_upper = prefix_upper_bound(prefix);
+            match (name_upper, dir_upper) {
+                (Some(nu), Some(du)) => {
+                    sqlx::query_as::<_, ObjectRecord>(
+                        "SELECT o.*, d.prefix || o.name AS key \
+                         FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                         WHERE (d.prefix = ? AND o.name >= ? AND o.name < ?) \
+                            OR (d.prefix > ? AND d.prefix < ?) \
+                         ORDER BY d.prefix, o.name LIMIT ?",
+                    )
+                    .bind(&dir_prefix)
+                    .bind(name_prefix)
+                    .bind(&nu)
+                    .bind(&dir_prefix)
+                    .bind(&du)
+                    .bind(max_keys)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+                _ => Vec::new(),
+            }
         };
 
         Ok(records)
@@ -551,41 +625,111 @@ impl MetadataStore {
         delimiter: Option<&str>,
         start_after: Option<&str>,
     ) -> Pin<Box<dyn Stream<Item = Result<ListEntry, S3Error>> + Send + '_>> {
-        let upper = prefix_upper_bound(prefix);
-        let prefix_owned = prefix.to_string();
-        let after_owned = start_after.map(|s| s.to_string());
+        // Decompose start_after into (dir_prefix, name) for keyset pagination.
+        let after_parts = start_after.map(|s| {
+            let (dp, n) = split_key(s);
+            (dp, n.to_string())
+        });
+        let (dir_prefix, name_prefix) = split_key(prefix);
+        let name_prefix = name_prefix.to_string();
+        let dir_upper = prefix_upper_bound(prefix);
 
+        // All bind values are passed as owned Strings so the stream owns them.
         let raw_stream: Pin<Box<dyn Stream<Item = Result<ObjectRecord, sqlx::Error>> + Send + '_>> =
-            match (after_owned, upper) {
-                (Some(after), Some(ub)) => Box::pin(
-                    sqlx::query_as::<_, ObjectRecord>(
-                        "SELECT * FROM objects WHERE key >= ? AND key < ? AND key > ? ORDER BY key",
-                    )
-                    .bind(prefix_owned.clone())
-                    .bind(ub)
-                    .bind(after)
-                    .fetch(&self.pool),
-                ),
-                (Some(after), None) => Box::pin(
-                    sqlx::query_as::<_, ObjectRecord>(
-                        "SELECT * FROM objects WHERE key > ? ORDER BY key",
-                    )
-                    .bind(after)
-                    .fetch(&self.pool),
-                ),
-                (None, Some(ub)) => Box::pin(
-                    sqlx::query_as::<_, ObjectRecord>(
-                        "SELECT * FROM objects WHERE key >= ? AND key < ? ORDER BY key",
-                    )
-                    .bind(prefix_owned.clone())
-                    .bind(ub)
-                    .fetch(&self.pool),
-                ),
-                (None, None) => Box::pin(
-                    sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects ORDER BY key")
+            if name_prefix.is_empty() {
+                // Prefix ends with `/` or is empty.
+                let pfx_upper = prefix_upper_bound(&dir_prefix);
+                match (after_parts, pfx_upper) {
+                    (Some((ad, an)), Some(ub)) => Box::pin(
+                        sqlx::query_as::<_, ObjectRecord>(
+                            "SELECT o.*, d.prefix || o.name AS key \
+                             FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                             WHERE d.prefix >= ? AND d.prefix < ? \
+                               AND (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
+                             ORDER BY d.prefix, o.name",
+                        )
+                        .bind(dir_prefix.clone())
+                        .bind(ub)
+                        .bind(ad.clone())
+                        .bind(ad)
+                        .bind(an)
                         .fetch(&self.pool),
-                ),
+                    ),
+                    (Some((ad, an)), None) => Box::pin(
+                        sqlx::query_as::<_, ObjectRecord>(
+                            "SELECT o.*, d.prefix || o.name AS key \
+                             FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                             WHERE (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
+                             ORDER BY d.prefix, o.name",
+                        )
+                        .bind(ad.clone())
+                        .bind(ad)
+                        .bind(an)
+                        .fetch(&self.pool),
+                    ),
+                    (None, Some(ub)) => Box::pin(
+                        sqlx::query_as::<_, ObjectRecord>(
+                            "SELECT o.*, d.prefix || o.name AS key \
+                             FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                             WHERE d.prefix >= ? AND d.prefix < ? \
+                             ORDER BY d.prefix, o.name",
+                        )
+                        .bind(dir_prefix.clone())
+                        .bind(ub)
+                        .fetch(&self.pool),
+                    ),
+                    (None, None) => Box::pin(
+                        sqlx::query_as::<_, ObjectRecord>(
+                            "SELECT o.*, d.prefix || o.name AS key \
+                             FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                             ORDER BY d.prefix, o.name",
+                        )
+                        .fetch(&self.pool),
+                    ),
+                }
+            } else {
+                // Partial filename prefix — exact dir + name range, plus subdirectories.
+                let name_upper = prefix_upper_bound(&name_prefix).unwrap_or_default();
+                let du = dir_upper.clone().unwrap_or_default();
+                match after_parts {
+                    Some((ad, an)) => Box::pin(
+                        sqlx::query_as::<_, ObjectRecord>(
+                            "SELECT o.*, d.prefix || o.name AS key \
+                             FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                             WHERE ((d.prefix = ? AND o.name >= ? AND o.name < ?) \
+                                 OR (d.prefix > ? AND d.prefix < ?)) \
+                               AND (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
+                             ORDER BY d.prefix, o.name",
+                        )
+                        .bind(dir_prefix.clone())
+                        .bind(name_prefix.clone())
+                        .bind(name_upper)
+                        .bind(dir_prefix)
+                        .bind(du)
+                        .bind(ad.clone())
+                        .bind(ad)
+                        .bind(an)
+                        .fetch(&self.pool),
+                    ),
+                    None => Box::pin(
+                        sqlx::query_as::<_, ObjectRecord>(
+                            "SELECT o.*, d.prefix || o.name AS key \
+                             FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                             WHERE (d.prefix = ? AND o.name >= ? AND o.name < ?) \
+                                OR (d.prefix > ? AND d.prefix < ?) \
+                             ORDER BY d.prefix, o.name",
+                        )
+                        .bind(dir_prefix.clone())
+                        .bind(name_prefix)
+                        .bind(name_upper)
+                        .bind(dir_prefix)
+                        .bind(du)
+                        .fetch(&self.pool),
+                    ),
+                }
             };
+
+        let prefix_owned = prefix.to_string();
 
         match delimiter {
             None => {
@@ -599,9 +743,8 @@ impl MetadataStore {
             Some(delim) => {
                 // Delimiter grouping — collapse matching keys into common prefixes,
                 // deduplicating so each prefix is emitted only once.
-                let prefix_owned = prefix.to_string();
                 let delim_owned = delim.to_string();
-                let prefix_len = prefix.len();
+                let prefix_len = prefix_owned.len();
 
                 Box::pin(futures::stream::try_unfold(
                     (
@@ -656,7 +799,9 @@ impl MetadataStore {
             return Ok(Vec::new());
         };
         let records = sqlx::query_as::<_, ObjectRecord>(
-            "SELECT * FROM objects WHERE parent_dir_id = ? ORDER BY key",
+            "SELECT o.*, d.prefix || o.name AS key \
+             FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+             WHERE o.parent_dir_id = ? ORDER BY o.name",
         )
         .bind(dir_id)
         .fetch_all(&self.pool)
@@ -764,96 +909,234 @@ impl MetadataStore {
         after: Option<&str>,
         limit: i64,
     ) -> Result<Vec<ObjectRecord>, S3Error> {
-        let upper = prefix_upper_bound(prefix);
-        match (after, &upper) {
-            (Some(after), Some(ub)) => sqlx::query_as::<_, ObjectRecord>(
-                "SELECT * FROM objects WHERE key >= ? AND key < ? AND key > ? ORDER BY key LIMIT ?",
-            )
-            .bind(prefix)
-            .bind(ub)
-            .bind(after)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(Into::into),
-            (Some(after), None) => sqlx::query_as::<_, ObjectRecord>(
-                "SELECT * FROM objects WHERE key > ? ORDER BY key LIMIT ?",
-            )
-            .bind(after)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(Into::into),
-            (None, Some(ub)) => sqlx::query_as::<_, ObjectRecord>(
-                "SELECT * FROM objects WHERE key >= ? AND key < ? ORDER BY key LIMIT ?",
-            )
-            .bind(prefix)
-            .bind(ub)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(Into::into),
-            (None, None) => {
-                sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects ORDER BY key LIMIT ?")
-                    .bind(limit)
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(Into::into)
-            }
-        }
-    }
+        let (dir_prefix, name_prefix) = split_key(prefix);
+        let after_parts = after.map(|a| {
+            let (dp, n) = split_key(a);
+            (dp, n.to_string())
+        });
 
-    /// Fetch only the `key` column for all objects matching a prefix, optionally
-    /// starting after `after`. Uses the covering index on `key` (no row lookup).
-    async fn fetch_keys(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>, S3Error> {
-        let upper = prefix_upper_bound(prefix);
-        match (after, &upper) {
-            (Some(after), Some(ub)) => sqlx::query_scalar(
-                "SELECT key FROM objects WHERE key >= ? AND key < ? AND key > ? ORDER BY key",
-            )
-            .bind(prefix)
-            .bind(ub)
-            .bind(after)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(Into::into),
-            (Some(after), None) => {
-                sqlx::query_scalar("SELECT key FROM objects WHERE key > ? ORDER BY key")
-                    .bind(after)
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(Into::into)
-            }
-            (None, Some(ub)) => sqlx::query_scalar(
-                "SELECT key FROM objects WHERE key >= ? AND key < ? ORDER BY key",
-            )
-            .bind(prefix)
-            .bind(ub)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(Into::into),
-            (None, None) => sqlx::query_scalar("SELECT key FROM objects ORDER BY key")
+        if name_prefix.is_empty() {
+            let pfx_upper = prefix_upper_bound(&dir_prefix);
+            match (after_parts, pfx_upper) {
+                (Some((ad, an)), Some(ub)) => sqlx::query_as::<_, ObjectRecord>(
+                    "SELECT o.*, d.prefix || o.name AS key \
+                     FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE d.prefix >= ? AND d.prefix < ? \
+                       AND (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
+                     ORDER BY d.prefix, o.name LIMIT ?",
+                )
+                .bind(&dir_prefix)
+                .bind(&ub)
+                .bind(&ad)
+                .bind(&ad)
+                .bind(&an)
+                .bind(limit)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(Into::into),
+                (Some((ad, an)), None) => sqlx::query_as::<_, ObjectRecord>(
+                    "SELECT o.*, d.prefix || o.name AS key \
+                     FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
+                     ORDER BY d.prefix, o.name LIMIT ?",
+                )
+                .bind(&ad)
+                .bind(&ad)
+                .bind(&an)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Into::into),
+                (None, Some(ub)) => sqlx::query_as::<_, ObjectRecord>(
+                    "SELECT o.*, d.prefix || o.name AS key \
+                     FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE d.prefix >= ? AND d.prefix < ? \
+                     ORDER BY d.prefix, o.name LIMIT ?",
+                )
+                .bind(&dir_prefix)
+                .bind(&ub)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Into::into),
+                (None, None) => sqlx::query_as::<_, ObjectRecord>(
+                    "SELECT o.*, d.prefix || o.name AS key \
+                     FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                     ORDER BY d.prefix, o.name LIMIT ?",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Into::into),
+            }
+        } else {
+            let name_upper = prefix_upper_bound(name_prefix).unwrap_or_default();
+            let du = prefix_upper_bound(prefix).unwrap_or_default();
+            match after_parts {
+                Some((ad, an)) => sqlx::query_as::<_, ObjectRecord>(
+                    "SELECT o.*, d.prefix || o.name AS key \
+                     FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE ((d.prefix = ? AND o.name >= ? AND o.name < ?) \
+                         OR (d.prefix > ? AND d.prefix < ?)) \
+                       AND (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
+                     ORDER BY d.prefix, o.name LIMIT ?",
+                )
+                .bind(&dir_prefix)
+                .bind(name_prefix)
+                .bind(&name_upper)
+                .bind(&dir_prefix)
+                .bind(&du)
+                .bind(&ad)
+                .bind(&ad)
+                .bind(&an)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Into::into),
+                None => sqlx::query_as::<_, ObjectRecord>(
+                    "SELECT o.*, d.prefix || o.name AS key \
+                     FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE (d.prefix = ? AND o.name >= ? AND o.name < ?) \
+                        OR (d.prefix > ? AND d.prefix < ?) \
+                     ORDER BY d.prefix, o.name LIMIT ?",
+                )
+                .bind(&dir_prefix)
+                .bind(name_prefix)
+                .bind(&name_upper)
+                .bind(&dir_prefix)
+                .bind(&du)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Into::into),
+            }
         }
     }
 
-    /// Fetch full ObjectRecords for a specific set of keys.
+    /// Fetch only reconstructed keys for all objects matching a prefix, optionally
+    /// starting after `after`.
+    async fn fetch_keys(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>, S3Error> {
+        let (dir_prefix, name_prefix) = split_key(prefix);
+        let after_parts = after.map(|a| {
+            let (dp, n) = split_key(a);
+            (dp, n.to_string())
+        });
+
+        if name_prefix.is_empty() {
+            let pfx_upper = prefix_upper_bound(&dir_prefix);
+            match (after_parts, pfx_upper) {
+                (Some((ad, an)), Some(ub)) => sqlx::query_scalar(
+                    "SELECT d.prefix || o.name FROM objects o \
+                     JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE d.prefix >= ? AND d.prefix < ? \
+                       AND (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
+                     ORDER BY d.prefix, o.name",
+                )
+                .bind(&dir_prefix)
+                .bind(&ub)
+                .bind(&ad)
+                .bind(&ad)
+                .bind(&an)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Into::into),
+                (Some((ad, an)), None) => sqlx::query_scalar(
+                    "SELECT d.prefix || o.name FROM objects o \
+                     JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
+                     ORDER BY d.prefix, o.name",
+                )
+                .bind(&ad)
+                .bind(&ad)
+                .bind(&an)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Into::into),
+                (None, Some(ub)) => sqlx::query_scalar(
+                    "SELECT d.prefix || o.name FROM objects o \
+                     JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE d.prefix >= ? AND d.prefix < ? \
+                     ORDER BY d.prefix, o.name",
+                )
+                .bind(&dir_prefix)
+                .bind(&ub)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Into::into),
+                (None, None) => sqlx::query_scalar(
+                    "SELECT d.prefix || o.name FROM objects o \
+                     JOIN directories d ON o.parent_dir_id = d.id \
+                     ORDER BY d.prefix, o.name",
+                )
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Into::into),
+            }
+        } else {
+            let name_upper = prefix_upper_bound(name_prefix).unwrap_or_default();
+            let du = prefix_upper_bound(prefix).unwrap_or_default();
+            match after_parts {
+                Some((ad, an)) => sqlx::query_scalar(
+                    "SELECT d.prefix || o.name FROM objects o \
+                     JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE ((d.prefix = ? AND o.name >= ? AND o.name < ?) \
+                         OR (d.prefix > ? AND d.prefix < ?)) \
+                       AND (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
+                     ORDER BY d.prefix, o.name",
+                )
+                .bind(&dir_prefix)
+                .bind(name_prefix)
+                .bind(&name_upper)
+                .bind(&dir_prefix)
+                .bind(&du)
+                .bind(&ad)
+                .bind(&ad)
+                .bind(&an)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Into::into),
+                None => sqlx::query_scalar(
+                    "SELECT d.prefix || o.name FROM objects o \
+                     JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE (d.prefix = ? AND o.name >= ? AND o.name < ?) \
+                        OR (d.prefix > ? AND d.prefix < ?) \
+                     ORDER BY d.prefix, o.name",
+                )
+                .bind(&dir_prefix)
+                .bind(name_prefix)
+                .bind(&name_upper)
+                .bind(&dir_prefix)
+                .bind(&du)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Into::into),
+            }
+        }
+    }
+
+    /// Fetch full ObjectRecords for a specific set of full S3 keys.
     async fn fetch_objects_by_keys(&self, keys: &[String]) -> Result<Vec<ObjectRecord>, S3Error> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders: String = keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT * FROM objects WHERE key IN ({}) ORDER BY key",
-            placeholders
-        );
-        let mut query = sqlx::query_as::<_, ObjectRecord>(&sql);
+        // Decompose each key and query individually, collecting results.
+        let mut results = Vec::with_capacity(keys.len());
         for key in keys {
-            query = query.bind(key);
+            let (dir_prefix, filename) = split_key(key);
+            let record = sqlx::query_as::<_, ObjectRecord>(
+                "SELECT o.*, d.prefix || o.name AS key \
+                 FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                 WHERE d.prefix = ? AND o.name = ?",
+            )
+            .bind(&dir_prefix)
+            .bind(filename)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(r) = record {
+                results.push(r);
+            }
         }
-        query.fetch_all(&self.pool).await.map_err(Into::into)
+        Ok(results)
     }
 
     /// Get the total count of objects in the store.
@@ -865,21 +1148,25 @@ impl MetadataStore {
         Ok(row.0)
     }
 
-    /// Get all tags for an object (looked up by key).
+    /// Rename (move) an object from one key to another.
     pub async fn rename_object(&self, src_key: &str, dst_key: &str) -> Result<(), S3Error> {
+        let (src_dir, src_name) = split_key(src_key);
         let parent = dst_key
             .rsplit_once('/')
             .map(|(p, _)| p.to_string())
             .unwrap_or_default();
         let dir_id = self.get_or_create_dir_id(&parent).await?;
+        let (_, dst_name) = split_key(dst_key);
         let now = SqliteTimestamp::now();
         let result = sqlx::query(
-            "UPDATE objects SET key = ?, parent_dir_id = ?, last_modified = ? WHERE key = ?",
+            "UPDATE objects SET name = ?, parent_dir_id = ?, last_modified = ? \
+             WHERE parent_dir_id = (SELECT id FROM directories WHERE prefix = ?) AND name = ?",
         )
-        .bind(dst_key)
+        .bind(dst_name)
         .bind(dir_id)
         .bind(now)
-        .bind(src_key)
+        .bind(&src_dir)
+        .bind(src_name)
         .execute(&self.pool)
         .await?;
 
@@ -890,12 +1177,15 @@ impl MetadataStore {
     }
 
     pub async fn get_object_tags(&self, key: &str) -> Result<Vec<Tag>, S3Error> {
+        let (dir_prefix, filename) = split_key(key);
         let tags = sqlx::query_as::<_, Tag>(
             "SELECT t.key, t.value FROM object_tags t \
              INNER JOIN objects o ON t.object_id = o.id \
-             WHERE o.key = ? ORDER BY t.key",
+             INNER JOIN directories d ON o.parent_dir_id = d.id \
+             WHERE d.prefix = ? AND o.name = ? ORDER BY t.key",
         )
-        .bind(key)
+        .bind(&dir_prefix)
+        .bind(filename)
         .fetch_all(&self.pool)
         .await?;
 
@@ -904,10 +1194,16 @@ impl MetadataStore {
 
     /// Insert a single tag for an object (looked up by key).
     pub async fn insert_object_tag(&self, key: &str, tag: &Tag) -> Result<(), S3Error> {
-        let object_id: Option<(String,)> = sqlx::query_as("SELECT id FROM objects WHERE key = ?")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await?;
+        let (dir_prefix, filename) = split_key(key);
+        let object_id: Option<(String,)> = sqlx::query_as(
+            "SELECT o.id FROM objects o \
+             JOIN directories d ON o.parent_dir_id = d.id \
+             WHERE d.prefix = ? AND o.name = ?",
+        )
+        .bind(&dir_prefix)
+        .bind(filename)
+        .fetch_optional(&self.pool)
+        .await?;
 
         let (object_id,) = object_id.ok_or(S3Error::NoSuchKey)?;
         let tag_id = uuid::Uuid::new_v4().to_string();
@@ -928,11 +1224,15 @@ impl MetadataStore {
 
     /// Delete all tags for an object (looked up by key).
     pub async fn delete_object_tags(&self, key: &str) -> Result<(), S3Error> {
+        let (dir_prefix, filename) = split_key(key);
         sqlx::query(
             "DELETE FROM object_tags WHERE object_id IN \
-             (SELECT id FROM objects WHERE key = ?)",
+             (SELECT o.id FROM objects o \
+              JOIN directories d ON o.parent_dir_id = d.id \
+              WHERE d.prefix = ? AND o.name = ?)",
         )
-        .bind(key)
+        .bind(&dir_prefix)
+        .bind(filename)
         .execute(&self.pool)
         .await?;
 
@@ -954,7 +1254,9 @@ impl MetadataStore {
         device_id: i64,
     ) -> Result<Option<ObjectRecord>, S3Error> {
         let record = sqlx::query_as::<_, ObjectRecord>(
-            "SELECT * FROM objects WHERE inode = ? AND device_id = ? LIMIT 1",
+            "SELECT o.*, d.prefix || o.name AS key \
+             FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+             WHERE o.inode = ? AND o.device_id = ? LIMIT 1",
         )
         .bind(inode)
         .bind(device_id)
@@ -985,9 +1287,7 @@ impl MetadataStore {
     /// List object keys with scan_level below the given threshold.
     ///
     /// When `after_key` is provided, only keys lexicographically greater than it
-    /// are returned (keyset pagination). This lets continuation jobs skip
-    /// directly to unprocessed work instead of re-scanning the index from the
-    /// beginning.
+    /// are returned (keyset pagination).
     pub async fn list_keys_below_scan_level(
         &self,
         level: i32,
@@ -996,21 +1296,33 @@ impl MetadataStore {
     ) -> Result<Vec<String>, S3Error> {
         let rows: Vec<(String,)> = match after_key {
             Some(key) => {
+                let (ad, an) = split_key(key);
                 sqlx::query_as(
-                    "SELECT key FROM objects WHERE scan_level < ? AND key > ? ORDER BY key LIMIT ?",
+                    "SELECT d.prefix || o.name FROM objects o \
+                     JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE o.scan_level < ? \
+                       AND (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
+                     ORDER BY d.prefix, o.name LIMIT ?",
                 )
                 .bind(level)
-                .bind(key)
+                .bind(&ad)
+                .bind(&ad)
+                .bind(an)
                 .bind(limit)
                 .fetch_all(&self.pool)
                 .await?
             }
             None => {
-                sqlx::query_as("SELECT key FROM objects WHERE scan_level < ? ORDER BY key LIMIT ?")
-                    .bind(level)
-                    .bind(limit)
-                    .fetch_all(&self.pool)
-                    .await?
+                sqlx::query_as(
+                    "SELECT d.prefix || o.name FROM objects o \
+                     JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE o.scan_level < ? \
+                     ORDER BY d.prefix, o.name LIMIT ?",
+                )
+                .bind(level)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
             }
         };
 
@@ -1034,18 +1346,28 @@ impl MetadataStore {
 
         let rows: Vec<(String, i64)> = match after_key {
             Some(key) => {
+                let (ad, an) = split_key(key);
                 sqlx::query_as(
-                    "SELECT key, COALESCE(size, 0) FROM objects WHERE scan_level < ? AND key > ? ORDER BY key LIMIT ?",
+                    "SELECT d.prefix || o.name, COALESCE(o.size, 0) FROM objects o \
+                     JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE o.scan_level < ? \
+                       AND (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
+                     ORDER BY d.prefix, o.name LIMIT ?",
                 )
                 .bind(level)
-                .bind(key)
+                .bind(&ad)
+                .bind(&ad)
+                .bind(an)
                 .bind(ROW_CAP)
                 .fetch_all(&self.pool)
                 .await?
             }
             None => {
                 sqlx::query_as(
-                    "SELECT key, COALESCE(size, 0) FROM objects WHERE scan_level < ? ORDER BY key LIMIT ?",
+                    "SELECT d.prefix || o.name, COALESCE(o.size, 0) FROM objects o \
+                     JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE o.scan_level < ? \
+                     ORDER BY d.prefix, o.name LIMIT ?",
                 )
                 .bind(level)
                 .bind(ROW_CAP)
@@ -1085,9 +1407,9 @@ impl MetadataStore {
         let mut conn = self.pool.acquire().await?;
         sqlx::query(
             "CREATE TEMP TABLE l1_disk (
-                key TEXT NOT NULL PRIMARY KEY,
-                id TEXT NOT NULL,
+                name TEXT NOT NULL,
                 parent_dir_id INTEGER NOT NULL,
+                id TEXT NOT NULL,
                 is_symlink BOOLEAN NOT NULL DEFAULT FALSE,
                 symlink_target TEXT,
                 size INTEGER,
@@ -1095,7 +1417,8 @@ impl MetadataStore {
                 device_id INTEGER,
                 content_type_id INTEGER,
                 last_modified INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (parent_dir_id, name)
             )",
         )
         .execute(&mut *conn)
@@ -1115,13 +1438,13 @@ impl MetadataStore {
         for obj in records {
             sqlx::query(
                 "INSERT OR IGNORE INTO l1_disk (
-                    key, id, parent_dir_id, is_symlink, symlink_target,
+                    name, parent_dir_id, id, is_symlink, symlink_target,
                     size, inode, device_id, content_type_id, last_modified, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
-            .bind(&obj.key)
-            .bind(&obj.id)
+            .bind(&obj.name)
             .bind(obj.parent_dir_id)
+            .bind(&obj.id)
             .bind(obj.is_symlink)
             .bind(&obj.symlink_target)
             .bind(obj.size)
@@ -1141,62 +1464,55 @@ impl MetadataStore {
     /// discovered files, optionally delete stale entries, and return
     /// `(discovered, deleted, moved)`. Drops the temp table when done.
     ///
-    /// Move detection: when a new key (in l1_disk but not in objects) has an
-    /// inode+device_id that matches an existing object under a different key,
-    /// we treat it as a move — updating the existing row's key rather than
-    /// inserting a new one. This preserves the object_id across renames.
+    /// Move detection: when a new `(parent_dir_id, name)` (in l1_disk but not
+    /// in objects) has an inode+device_id that matches an existing object under
+    /// a different location, we treat it as a move — updating the existing
+    /// row's name/parent rather than inserting a new one.
     pub(crate) async fn l1_scan_finish(
         conn: &mut sqlx::SqliteConnection,
         delete_stale: bool,
     ) -> Result<(u64, u64, u64), S3Error> {
-        // Step 1: Detect moves — new keys whose inode+device_id match an
-        // existing object under a different key.
-        let moves: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT d.key, o.key, o.id
-             FROM l1_disk d
-             INNER JOIN objects o ON d.inode = o.inode AND d.device_id = o.device_id
-             WHERE d.key NOT IN (SELECT key FROM objects)
-               AND d.inode IS NOT NULL
-               AND o.key != d.key",
+        // Step 1: Detect moves — new (parent_dir_id, name) combos whose
+        // inode+device_id match an existing object at a different location.
+        //
+        // Returns (new_name, new_parent_dir_id, old_key_reconstructed,
+        //          new_key_reconstructed, object_id).
+        let moves: Vec<(String, i64, String, String, String)> = sqlx::query_as(
+            "SELECT d.name, d.parent_dir_id, \
+                    dir_old.prefix || o.name, \
+                    dir_new.prefix || d.name, \
+                    o.id \
+             FROM l1_disk d \
+             INNER JOIN objects o ON d.inode = o.inode AND d.device_id = o.device_id \
+             INNER JOIN directories dir_old ON o.parent_dir_id = dir_old.id \
+             INNER JOIN directories dir_new ON d.parent_dir_id = dir_new.id \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM objects o2 \
+                 WHERE o2.parent_dir_id = d.parent_dir_id AND o2.name = d.name \
+             ) \
+             AND d.inode IS NOT NULL \
+             AND (o.parent_dir_id != d.parent_dir_id OR o.name != d.name)",
         )
         .fetch_all(&mut *conn)
         .await?;
 
         let mut moved: u64 = 0;
         let now = SqliteTimestamp::now();
-        for (new_key, _old_key, _object_id) in &moves {
-            // Update the existing object's key to the new location
-            let parent = new_key
-                .rsplit_once('/')
-                .map(|(p, _)| p.to_string())
-                .unwrap_or_default();
-            let prefix = if parent.is_empty() {
-                String::new()
-            } else {
-                format!("{parent}/")
-            };
-            let dir_row: (i64,) = sqlx::query_as(
-                "INSERT INTO directories (prefix) VALUES (?) \
-                 ON CONFLICT(prefix) DO UPDATE SET prefix = excluded.prefix \
-                 RETURNING id",
-            )
-            .bind(&prefix)
-            .fetch_one(&mut *conn)
-            .await?;
+        for (new_name, new_parent_dir_id, old_key, new_key, object_id) in &moves {
             sqlx::query(
-                "UPDATE objects SET key = ?, parent_dir_id = ?, last_modified = ?
+                "UPDATE objects SET name = ?, parent_dir_id = ?, last_modified = ? \
                  WHERE id = ?",
             )
-            .bind(new_key)
-            .bind(dir_row.0)
+            .bind(new_name)
+            .bind(new_parent_dir_id)
             .bind(now)
-            .bind(_object_id)
+            .bind(object_id)
             .execute(&mut *conn)
             .await?;
             tracing::info!(
-                old_key = %_old_key,
+                old_key = %old_key,
                 new_key = %new_key,
-                object_id = %_object_id,
+                object_id = %object_id,
                 "Move detected, preserving object_id"
             );
             moved += 1;
@@ -1205,14 +1521,17 @@ impl MetadataStore {
         // Step 2: Insert truly new objects (not in catalog AND not a move)
         let inserted = sqlx::query(
             "INSERT INTO objects (
-                id, key, parent_dir_id, is_symlink, symlink_target,
+                id, name, parent_dir_id, is_symlink, symlink_target,
                 size, inode, device_id, content_type_id, last_modified, created_at, scan_level
             )
             SELECT
-                d.id, d.key, d.parent_dir_id, d.is_symlink, d.symlink_target,
+                d.id, d.name, d.parent_dir_id, d.is_symlink, d.symlink_target,
                 d.size, d.inode, d.device_id, d.content_type_id, d.last_modified, d.created_at, 1
             FROM l1_disk d
-            WHERE d.key NOT IN (SELECT key FROM objects)",
+            WHERE NOT EXISTS (
+                SELECT 1 FROM objects o
+                WHERE o.parent_dir_id = d.parent_dir_id AND o.name = d.name
+            )",
         )
         .execute(&mut *conn)
         .await?;
@@ -1220,10 +1539,14 @@ impl MetadataStore {
 
         // Step 3: Delete objects that are in the catalog but no longer on disk
         let deleted = if delete_stale {
-            let result =
-                sqlx::query("DELETE FROM objects WHERE key NOT IN (SELECT key FROM l1_disk)")
-                    .execute(&mut *conn)
-                    .await?;
+            let result = sqlx::query(
+                "DELETE FROM objects WHERE NOT EXISTS ( \
+                     SELECT 1 FROM l1_disk d \
+                     WHERE d.parent_dir_id = objects.parent_dir_id AND d.name = objects.name \
+                 )",
+            )
+            .execute(&mut *conn)
+            .await?;
             result.rows_affected()
         } else {
             0
@@ -1239,12 +1562,18 @@ impl MetadataStore {
 
     /// Reset an object's scan level (e.g. after a file is modified on disk).
     pub async fn reset_scan_level(&self, key: &str, level: i32) -> Result<(), S3Error> {
-        sqlx::query("UPDATE objects SET scan_level = ? WHERE key = ? AND scan_level > ?")
-            .bind(level)
-            .bind(key)
-            .bind(level)
-            .execute(&self.pool)
-            .await?;
+        let (dir_prefix, filename) = split_key(key);
+        sqlx::query(
+            "UPDATE objects SET scan_level = ? \
+             WHERE parent_dir_id = (SELECT id FROM directories WHERE prefix = ?) \
+               AND name = ? AND scan_level > ?",
+        )
+        .bind(level)
+        .bind(&dir_prefix)
+        .bind(filename)
+        .bind(level)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -1255,10 +1584,12 @@ impl MetadataStore {
         key: &str,
         update: &ObjectMetadataUpdate,
     ) -> Result<(), S3Error> {
+        let (dir_prefix, filename) = split_key(key);
         let result = sqlx::query(
             "UPDATE objects SET size = ?, file_mtime = ?, file_ctime = ?, \
              inode = ?, device_id = ?, scan_level = ?, last_modified = ? \
-             WHERE key = ? AND scan_level < ?",
+             WHERE parent_dir_id = (SELECT id FROM directories WHERE prefix = ?) \
+               AND name = ? AND scan_level < ?",
         )
         .bind(update.size)
         .bind(update.file_mtime.map(SqliteTimestamp::from))
@@ -1267,7 +1598,8 @@ impl MetadataStore {
         .bind(update.device_id.map(|v| v as i64))
         .bind(update.scan_level)
         .bind(SqliteTimestamp::now())
-        .bind(key)
+        .bind(&dir_prefix)
+        .bind(filename)
         .bind(update.scan_level)
         .execute(&self.pool)
         .await?;
@@ -1292,10 +1624,12 @@ impl MetadataStore {
         let mut tx = self.pool.begin().await?;
         let now = SqliteTimestamp::now();
         for (key, update) in updates {
+            let (dir_prefix, filename) = split_key(key);
             sqlx::query(
                 "UPDATE objects SET size = ?, file_mtime = ?, file_ctime = ?, \
                  inode = ?, device_id = ?, scan_level = ?, last_modified = ? \
-                 WHERE key = ? AND scan_level < ?",
+                 WHERE parent_dir_id = (SELECT id FROM directories WHERE prefix = ?) \
+                   AND name = ? AND scan_level < ?",
             )
             .bind(update.size)
             .bind(update.file_mtime.map(SqliteTimestamp::from))
@@ -1304,7 +1638,8 @@ impl MetadataStore {
             .bind(update.device_id.map(|v| v as i64))
             .bind(update.scan_level)
             .bind(now)
-            .bind(key.as_str())
+            .bind(&dir_prefix)
+            .bind(filename)
             .bind(update.scan_level)
             .execute(&mut *tx)
             .await?;
@@ -1321,11 +1656,13 @@ impl MetadataStore {
         checksums: &crate::types::ChecksumValues,
         scan_level: i32,
     ) -> Result<(), S3Error> {
+        let (dir_prefix, filename) = split_key(key);
         let result = sqlx::query(
             "UPDATE objects SET etag = ?, \
              checksum_sha256 = ?, checksum_sha1 = ?, checksum_crc32 = ?, checksum_crc32c = ?, \
              scan_level = ?, last_modified = ? \
-             WHERE key = ? AND scan_level < ?",
+             WHERE parent_dir_id = (SELECT id FROM directories WHERE prefix = ?) \
+               AND name = ? AND scan_level < ?",
         )
         .bind(etag)
         .bind(&checksums.sha256)
@@ -1334,7 +1671,8 @@ impl MetadataStore {
         .bind(&checksums.crc32c)
         .bind(scan_level)
         .bind(SqliteTimestamp::now())
-        .bind(key)
+        .bind(&dir_prefix)
+        .bind(filename)
         .bind(scan_level)
         .execute(&self.pool)
         .await?;
@@ -1360,13 +1698,16 @@ impl MetadataStore {
         let mut tx = self.pool.begin().await?;
         let now = SqliteTimestamp::now();
         for key in keys {
+            let (dir_prefix, filename) = split_key(key);
             sqlx::query(
                 "UPDATE objects SET scan_level = ?, last_modified = ? \
-                 WHERE key = ? AND scan_level < ?",
+                 WHERE parent_dir_id = (SELECT id FROM directories WHERE prefix = ?) \
+                   AND name = ? AND scan_level < ?",
             )
             .bind(target_level)
             .bind(now)
-            .bind(key.as_str())
+            .bind(&dir_prefix)
+            .bind(filename)
             .bind(target_level)
             .execute(&mut *tx)
             .await?;
@@ -1386,11 +1727,13 @@ impl MetadataStore {
         let mut tx = self.pool.begin().await?;
         let now = SqliteTimestamp::now();
         for update in updates {
+            let (dir_prefix, filename) = split_key(&update.key);
             sqlx::query(
                 "UPDATE objects SET etag = ?, \
                  checksum_sha256 = ?, checksum_sha1 = ?, checksum_crc32 = ?, checksum_crc32c = ?, \
                  scan_level = ?, last_modified = ? \
-                 WHERE key = ? AND scan_level < ?",
+                 WHERE parent_dir_id = (SELECT id FROM directories WHERE prefix = ?) \
+                   AND name = ? AND scan_level < ?",
             )
             .bind(&update.etag)
             .bind(&update.checksums.sha256)
@@ -1399,7 +1742,8 @@ impl MetadataStore {
             .bind(&update.checksums.crc32c)
             .bind(update.scan_level)
             .bind(now)
-            .bind(update.key.as_str())
+            .bind(&dir_prefix)
+            .bind(filename)
             .bind(update.scan_level)
             .execute(&mut *tx)
             .await?;
@@ -1662,11 +2006,15 @@ impl MetadataStore {
         if use_filter {
             sql.push_str(
                 "WITH matching AS (\
-                   SELECT DISTINCT checksum_sha256 FROM objects \
-                   WHERE checksum_sha256 IS NOT NULL AND key LIKE '%' || ? || '%'",
+                   SELECT DISTINCT obj.checksum_sha256 FROM objects obj \
+                   JOIN directories dir ON obj.parent_dir_id = dir.id \
+                   WHERE obj.checksum_sha256 IS NOT NULL \
+                     AND (dir.prefix || obj.name) LIKE '%' || ? || '%'",
             );
             if use_depth {
-                sql.push_str(" AND (LENGTH(key) - LENGTH(REPLACE(key, '/', ''))) <= ?");
+                sql.push_str(
+                    " AND (LENGTH(dir.prefix) - LENGTH(REPLACE(dir.prefix, '/', ''))) <= ?",
+                );
             }
             sql.push_str(") ");
             sql.push_str(
@@ -1735,7 +2083,9 @@ impl MetadataStore {
         checksum_sha256: &str,
     ) -> Result<Vec<ObjectRecord>, S3Error> {
         let records = sqlx::query_as::<_, ObjectRecord>(
-            "SELECT * FROM objects WHERE checksum_sha256 = ? ORDER BY key",
+            "SELECT o.*, d.prefix || o.name AS key \
+             FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+             WHERE o.checksum_sha256 = ? ORDER BY d.prefix, o.name",
         )
         .bind(checksum_sha256)
         .fetch_all(&self.pool)
@@ -1754,9 +2104,10 @@ impl MetadataStore {
         let records = match after {
             Some(hash) => {
                 sqlx::query_as::<_, ObjectRecord>(
-                    "SELECT * FROM objects \
-                     WHERE checksum_sha256 IS NOT NULL AND checksum_sha256 >= ? \
-                     ORDER BY checksum_sha256, key LIMIT ?",
+                    "SELECT o.*, d.prefix || o.name AS key \
+                     FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE o.checksum_sha256 IS NOT NULL AND o.checksum_sha256 >= ? \
+                     ORDER BY o.checksum_sha256, d.prefix, o.name LIMIT ?",
                 )
                 .bind(hash)
                 .bind(limit)
@@ -1765,9 +2116,10 @@ impl MetadataStore {
             }
             None => {
                 sqlx::query_as::<_, ObjectRecord>(
-                    "SELECT * FROM objects \
-                     WHERE checksum_sha256 IS NOT NULL \
-                     ORDER BY checksum_sha256, key LIMIT ?",
+                    "SELECT o.*, d.prefix || o.name AS key \
+                     FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE o.checksum_sha256 IS NOT NULL \
+                     ORDER BY o.checksum_sha256, d.prefix, o.name LIMIT ?",
                 )
                 .bind(limit)
                 .fetch_all(&self.pool)
@@ -1779,7 +2131,7 @@ impl MetadataStore {
     }
 
     /// Lightweight query for directory hash computation: returns only
-    /// (key, checksum_sha256, size) for direct children of a directory.
+    /// (name, checksum_sha256, size) for direct children of a directory.
     /// Uses `parent_dir_id` FK instead of a prefix range scan.
     pub async fn get_dir_children_for_hashing(
         &self,
@@ -1798,8 +2150,8 @@ impl MetadataStore {
             return Ok(Vec::new());
         };
         let rows: Vec<(String, Option<String>, Option<i64>)> = sqlx::query_as(
-            "SELECT key, checksum_sha256, size FROM objects \
-             WHERE parent_dir_id = ? ORDER BY key",
+            "SELECT name, checksum_sha256, size FROM objects \
+             WHERE parent_dir_id = ? ORDER BY name",
         )
         .bind(dir_id)
         .fetch_all(&self.pool)
@@ -1812,18 +2164,45 @@ impl MetadataStore {
         &self,
         prefix: &str,
     ) -> Result<Vec<ObjectRecord>, S3Error> {
-        let records = if let Some(upper) = prefix_upper_bound(prefix) {
-            sqlx::query_as::<_, ObjectRecord>(
-                "SELECT * FROM objects WHERE key >= ? AND key < ? ORDER BY key",
-            )
-            .bind(prefix)
-            .bind(&upper)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects ORDER BY key")
+        let (dir_prefix, name_prefix) = split_key(prefix);
+        let records = if name_prefix.is_empty() {
+            if let Some(upper) = prefix_upper_bound(&dir_prefix) {
+                sqlx::query_as::<_, ObjectRecord>(
+                    "SELECT o.*, d.prefix || o.name AS key \
+                     FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                     WHERE d.prefix >= ? AND d.prefix < ? \
+                     ORDER BY d.prefix, o.name",
+                )
+                .bind(&dir_prefix)
+                .bind(&upper)
                 .fetch_all(&self.pool)
                 .await?
+            } else {
+                sqlx::query_as::<_, ObjectRecord>(
+                    "SELECT o.*, d.prefix || o.name AS key \
+                     FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                     ORDER BY d.prefix, o.name",
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+        } else {
+            let name_upper = prefix_upper_bound(name_prefix).unwrap_or_default();
+            let du = prefix_upper_bound(prefix).unwrap_or_default();
+            sqlx::query_as::<_, ObjectRecord>(
+                "SELECT o.*, d.prefix || o.name AS key \
+                 FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+                 WHERE (d.prefix = ? AND o.name >= ? AND o.name < ?) \
+                    OR (d.prefix > ? AND d.prefix < ?) \
+                 ORDER BY d.prefix, o.name",
+            )
+            .bind(&dir_prefix)
+            .bind(name_prefix)
+            .bind(&name_upper)
+            .bind(&dir_prefix)
+            .bind(&du)
+            .fetch_all(&self.pool)
+            .await?
         };
 
         Ok(records)
@@ -1832,7 +2211,9 @@ impl MetadataStore {
     /// Get all objects at scan level 3 (content-hashed).
     pub async fn get_all_objects_at_level_3(&self) -> Result<Vec<ObjectRecord>, S3Error> {
         let records = sqlx::query_as::<_, ObjectRecord>(
-            "SELECT * FROM objects WHERE scan_level >= 3 ORDER BY key",
+            "SELECT o.*, d.prefix || o.name AS key \
+             FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+             WHERE o.scan_level >= 3 ORDER BY d.prefix, o.name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1842,10 +2223,14 @@ impl MetadataStore {
 
     /// Get a single object by its UUID id.
     pub async fn get_object_by_id(&self, id: &str) -> Result<Option<ObjectRecord>, S3Error> {
-        let record = sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let record = sqlx::query_as::<_, ObjectRecord>(
+            "SELECT o.*, d.prefix || o.name AS key \
+             FROM objects o JOIN directories d ON o.parent_dir_id = d.id \
+             WHERE o.id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
 
         Ok(record)
     }
@@ -2194,11 +2579,13 @@ mod tests {
             .get_or_create_content_type_id("application/octet-stream")
             .await
             .unwrap();
+        let (_, filename) = split_key(key);
 
         ObjectRecord {
             id: uuid::Uuid::new_v4().to_string(),
-            key: key.to_string(),
+            name: filename.to_string(),
             parent_dir_id: dir_id,
+            key: key.to_string(),
             size: Some(1024),
             file_mtime: Some(now),
             content_type_id: Some(ct_id),
@@ -2361,8 +2748,9 @@ mod tests {
             .unwrap();
         let obj = ObjectRecord {
             id: uuid::Uuid::new_v4().to_string(),
-            key: "my-link".to_string(),
+            name: "my-link".to_string(),
             parent_dir_id: dir_id,
+            key: "my-link".to_string(),
             is_symlink: true,
             symlink_target: Some("/some/target".to_string()),
             content_type_id: Some(ct_id),

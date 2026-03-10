@@ -7,8 +7,7 @@ CREATE TABLE IF NOT EXISTS content_types (
 -- Object metadata
 CREATE TABLE IF NOT EXISTS objects (
     id TEXT PRIMARY KEY,
-    -- UNIQUE implies an implicit index; no explicit CREATE INDEX needed for key lookups.
-    key TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
     parent_dir_id INTEGER NOT NULL REFERENCES directories(id),
     is_symlink BOOLEAN NOT NULL DEFAULT FALSE,
     symlink_target TEXT,
@@ -39,6 +38,6 @@ CREATE TABLE IF NOT EXISTS objects (
     scan_level INTEGER NOT NULL DEFAULT 1
 );
 
-CREATE INDEX IF NOT EXISTS idx_objects_parent ON objects(parent_dir_id, key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_parent_name ON objects(parent_dir_id, name);
 CREATE INDEX IF NOT EXISTS idx_objects_checksum_sha256 ON objects(checksum_sha256);
 CREATE INDEX IF NOT EXISTS idx_objects_inode ON objects(inode, device_id) WHERE inode IS NOT NULL;

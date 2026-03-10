@@ -160,11 +160,13 @@ async fn handle_file_changed(
         .to_string();
     let ct_id = metadata.get_or_create_content_type_id(&ct_mime).await?;
 
+    let (_, filename) = crate::metadata::sqlite::split_key(key);
     let now = crate::metadata::sqlite::SqliteTimestamp::now();
     let obj = crate::metadata::sqlite::ObjectRecord {
         id: uuid::Uuid::new_v4().to_string(),
-        key: key.to_string(),
+        name: filename.to_string(),
         parent_dir_id: dir_id,
+        key: key.to_string(),
         is_symlink,
         symlink_target,
         size,
