@@ -911,6 +911,13 @@ impl TaskStore {
 
     /// Close the store and flush WAL.
     pub async fn close(&self) {
+        // Consolidate the WAL file into the main database before closing.
+        if let Err(e) = sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await
+        {
+            tracing::warn!(error = %e, "WAL checkpoint failed during close");
+        }
         self.pool.close().await;
     }
 
