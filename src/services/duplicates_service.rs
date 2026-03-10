@@ -114,6 +114,7 @@ pub async fn find_bucket_duplicates(
     allow_partial: bool,
     continuation_token: Option<&str>,
     key_contains: Option<&str>,
+    max_depth: Option<i32>,
 ) -> Result<DuplicateReport, S3Error> {
     let status = metadata.get_scan_status().await?;
     let scan_complete = status.total_files == 0 || status.files_at_level_3 >= status.total_files;
@@ -138,6 +139,7 @@ pub async fn find_bucket_duplicates(
             max_results + 1,
             cursor.as_ref().map(|(s, h)| (*s, h.as_str())),
             key_contains,
+            max_depth,
         )
         .await?;
 
@@ -441,6 +443,7 @@ pub async fn find_bucket_duplicate_dirs(
     max_results: i32,
     prefix: Option<&str>,
     continuation_token: Option<&str>,
+    max_depth: Option<i32>,
 ) -> Result<DuplicateDirReport, S3Error> {
     // Recompute stale/missing directory hashes first
     recompute_stale_directory_hashes(metadata).await?;
@@ -449,7 +452,13 @@ pub async fn find_bucket_duplicate_dirs(
 
     // Fetch one extra to detect truncation.
     let mut dup_groups = metadata
-        .find_duplicate_dir_hashes(min_files, max_results + 1, prefix, cursor.as_deref())
+        .find_duplicate_dir_hashes(
+            min_files,
+            max_results + 1,
+            prefix,
+            cursor.as_deref(),
+            max_depth,
+        )
         .await?;
 
     let is_truncated = dup_groups.len() as i32 > max_results;
