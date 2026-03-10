@@ -58,10 +58,29 @@ pub fn check_origin(rules: &[CorsRule], origin: &str, method: &str) -> Option<Co
                 .iter()
                 .any(|m| m == "*" || m.eq_ignore_ascii_case(method))
         {
+            // The CORS spec says the `*` wildcard for Access-Control-Allow-Headers
+            // does NOT cover `Authorization` — it must be listed explicitly.
+            let allow_headers = if rule.allowed_headers.iter().any(|h| h == "*") {
+                let mut headers: Vec<&str> = vec!["*", "Authorization"];
+                // Include any other explicitly listed headers
+                for h in &rule.allowed_headers {
+                    if h != "*"
+                        && !headers
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(h))
+                    {
+                        headers.push(h);
+                    }
+                }
+                headers.join(", ")
+            } else {
+                rule.allowed_headers.join(", ")
+            };
+
             return Some(CorsHeaders {
                 allow_origin: origin.to_string(),
                 allow_methods: rule.allowed_methods.join(", "),
-                allow_headers: rule.allowed_headers.join(", "),
+                allow_headers,
                 expose_headers: rule.expose_headers.join(", "),
                 max_age: rule.max_age_seconds,
             });
@@ -149,5 +168,17 @@ mod tests {
     fn test_method_case_insensitive() {
         let rules = vec![rule(&["*"], &["get"])];
         assert!(check_origin(&rules, "https://example.com", "GET").is_some());
+    }
+
+    #[test]
+    fn test_wildcard_headers_includes_authorization() {
+        let rules = vec![rule(&["*"], &["GET"])];
+        let cors = check_origin(&rules, "https://example.com", "GET").unwrap();
+        assert!(
+            cors.allow_headers.contains("Authorization"),
+            "Wildcard allow_headers must explicitly include Authorization: got '{}'",
+            cors.allow_headers
+        );
+        assert!(cors.allow_headers.contains("*"));
     }
 }

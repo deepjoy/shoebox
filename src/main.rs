@@ -234,6 +234,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("          Secret: {}", cred.secret_access_key);
             }
         }
+        if show {
+            if let Some(first_cred) = bucket.config.credentials.first() {
+                let endpoint = format!("http://{}:{}", serve.host, serve.port);
+                print_cors_hint(
+                    &endpoint,
+                    &bucket.name,
+                    &first_cred.access_key_id,
+                    &first_cred.secret_access_key,
+                );
+            }
+        }
         println!();
     }
 
@@ -303,6 +314,11 @@ async fn handle_command(command: Commands) -> Result<(), Box<dyn std::error::Err
 
             save_bucket_config(&shoebox_dir, &config).await?;
 
+            let bucket_name = bucket_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+
             println!("Credential added:");
             println!("  Access Key ID: {}", access_key_id);
             println!("  Secret Access Key: {}", secret_access_key);
@@ -310,6 +326,13 @@ async fn handle_command(command: Commands) -> Result<(), Box<dyn std::error::Err
             if let Some(desc) = description {
                 println!("  Description: {}", desc);
             }
+
+            print_cors_hint(
+                &format!("http://localhost:{}", port),
+                bucket_name,
+                &access_key_id,
+                &secret_access_key,
+            );
         }
 
         Commands::ListCredentials { bucket_path, port } => {
@@ -600,6 +623,22 @@ async fn handle_command(command: Commands) -> Result<(), Box<dyn std::error::Err
     }
 
     Ok(())
+}
+
+/// Print a CORS configuration hint for a bucket.
+fn print_cors_hint(endpoint: &str, bucket: &str, access_key_id: &str, secret_access_key: &str) {
+    println!();
+    println!("    To enable browser access (CORS), run:");
+    println!();
+    println!("      export AWS_ACCESS_KEY_ID='{}'", access_key_id);
+    println!("      export AWS_SECRET_ACCESS_KEY='{}'", secret_access_key);
+    println!("      export BUCKET='{}'", bucket);
+    println!();
+    println!("      curl -X PUT \"{}/${{BUCKET}}?cors\" \\", endpoint);
+    println!("        --aws-sigv4 \"aws:amz:us-east-1:s3\" \\");
+    println!("        --user \"$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY\" \\");
+    println!("        -H \"Content-Type: application/json\" \\");
+    println!("        -d '[{{\"allowed_origins\":[\"*\"],\"allowed_methods\":[\"GET\",\"PUT\",\"POST\",\"DELETE\",\"HEAD\"],\"allowed_headers\":[\"*\"],\"expose_headers\":[\"ETag\",\"x-amz-request-id\"],\"max_age_seconds\":3600}}]'");
 }
 
 /// Resolve the .shoebox directory for a given bucket path.

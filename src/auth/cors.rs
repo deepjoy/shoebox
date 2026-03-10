@@ -135,6 +135,14 @@ fn build_preflight_response(cors: &CorsHeaders) -> Response {
         cors.allow_headers.parse().unwrap(),
     );
     headers.insert(header::VARY, "Origin".parse().unwrap());
+    // Allow requests from public sites (e.g. GitHub Pages) to reach localhost.
+    // See https://wicg.github.io/private-network-access/
+    headers.insert(
+        "Access-Control-Allow-Private-Network"
+            .parse::<header::HeaderName>()
+            .unwrap(),
+        "true".parse().unwrap(),
+    );
 
     if let Some(max_age) = cors.max_age {
         headers.insert(
