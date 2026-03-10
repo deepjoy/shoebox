@@ -127,6 +127,12 @@ pub async fn bucket_or_list(
         return super::integrity::get_integrity_status(State(state), Path(bucket), Query(params))
             .await;
     }
+    // Bucket stats
+    if params.contains_key("stats") {
+        return get_bucket_stats(State(state), Path(bucket))
+            .await
+            .map(IntoResponse::into_response);
+    }
     // Phase 9: CORS configuration
     if params.contains_key("cors") {
         return super::cors::get_bucket_cors(State(state), Path(bucket)).await;
@@ -252,5 +258,42 @@ async fn delete_objects(
     Ok(XmlResponse(DeleteResult {
         deleted: if req.quiet { Vec::new() } else { deleted },
         errors,
+    }))
+}
+
+// ── Bucket stats ────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+#[serde(rename = "BucketStatsResult")]
+struct BucketStatsResultXml {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "TotalFiles")]
+    total_files: i64,
+    #[serde(rename = "TotalSize")]
+    total_size: i64,
+    #[serde(rename = "DuplicateFolders")]
+    duplicate_folders: i64,
+    #[serde(rename = "DuplicateFiles")]
+    duplicate_files: i64,
+    #[serde(rename = "StorageReclaimable")]
+    storage_reclaimable: i64,
+}
+
+/// GET /{bucket}?stats — return aggregate bucket statistics.
+async fn get_bucket_stats(
+    State(state): State<AppState>,
+    Path(bucket_name): Path<String>,
+) -> Result<XmlResponse<BucketStatsResultXml>, S3Error> {
+    let bucket = state.get_bucket(&bucket_name)?;
+    let stats = bucket.metadata.get_bucket_stats().await?;
+
+    Ok(XmlResponse(BucketStatsResultXml {
+        name: bucket_name,
+        total_files: stats.total_files,
+        total_size: stats.total_size,
+        duplicate_folders: stats.duplicate_folders,
+        duplicate_files: stats.duplicate_files,
+        storage_reclaimable: stats.storage_reclaimable,
     }))
 }

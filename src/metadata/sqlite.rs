@@ -2504,6 +2504,62 @@ impl MetadataStore {
         .await?;
         Ok(())
     }
+
+    // -- Bucket stats --
+
+    /// Aggregate stats for a bucket: total files, total size,
+    /// duplicate file/folder counts, and reclaimable storage.
+    pub async fn get_bucket_stats(&self) -> Result<BucketStats, S3Error> {
+        // 1) Total files & total size
+        let (total_files, total_size): (i64, i64) =
+            sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(size), 0) FROM objects")
+                .fetch_one(&self.pool)
+                .await?;
+
+        // 2) Duplicate files count & reclaimable bytes
+        let (duplicate_files, storage_reclaimable): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(cnt - 1), 0), \
+                    COALESCE(SUM(total_size - (total_size / cnt)), 0) \
+             FROM ( \
+               SELECT COUNT(*) AS cnt, SUM(COALESCE(size, 0)) AS total_size \
+               FROM objects \
+               WHERE checksum_sha256 IS NOT NULL \
+               GROUP BY checksum_sha256 \
+               HAVING COUNT(*) > 1 \
+             )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        // 3) Duplicate folders count (groups of dirs sharing a hash)
+        let (duplicate_folders,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM ( \
+               SELECT dir_hash FROM directories \
+               WHERE stale = FALSE AND file_count > 0 \
+               GROUP BY dir_hash \
+               HAVING COUNT(*) > 1 \
+             )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(BucketStats {
+            total_files,
+            total_size,
+            duplicate_files,
+            duplicate_folders,
+            storage_reclaimable,
+        })
+    }
+}
+
+/// Bucket-level aggregate statistics.
+pub struct BucketStats {
+    pub total_files: i64,
+    pub total_size: i64,
+    pub duplicate_files: i64,
+    pub duplicate_folders: i64,
+    pub storage_reclaimable: i64,
 }
 
 /// Scan status summary for a bucket.
