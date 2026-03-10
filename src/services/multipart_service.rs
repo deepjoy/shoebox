@@ -157,23 +157,27 @@ pub async fn complete(
     let etag = format!("\"{}-{}\"", composite_md5, parts.len());
 
     // Create object record
+    let parent = upload
+        .key
+        .rsplit_once('/')
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_default();
+    let dir_id = metadata.get_or_create_dir_id(&parent).await?;
+    let ct_mime = upload
+        .content_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+    let ct_id = metadata.get_or_create_content_type_id(ct_mime).await?;
+    let now = crate::metadata::sqlite::SqliteTimestamp::now();
     let obj = ObjectRecord {
         id: uuid::Uuid::new_v4().to_string(),
         key: upload.key.clone(),
-        parent_directory: upload
-            .key
-            .rsplit_once('/')
-            .map(|(p, _)| p.to_string())
-            .unwrap_or_default(),
+        parent_dir_id: dir_id,
         size: Some(total_size),
         etag: Some(etag.clone()),
-        content_type: Some(
-            upload
-                .content_type
-                .unwrap_or_else(|| "application/octet-stream".to_string()),
-        ),
-        last_modified: time::OffsetDateTime::now_utc(),
-        created_at: time::OffsetDateTime::now_utc(),
+        content_type_id: Some(ct_id),
+        last_modified: now,
+        created_at: now,
         metadata: upload.metadata,
         scan_level: 2, // Has metadata, needs L3 for checksums
         ..Default::default()

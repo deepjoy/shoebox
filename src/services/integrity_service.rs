@@ -104,7 +104,8 @@ async fn verify_file(root: &Path, record: &ObjectRecord) -> Result<(), Discrepan
             ..Default::default()
         })?);
 
-    let mtime_changed = record.file_mtime != Some(current_mtime);
+    let mtime_changed =
+        record.file_mtime != Some(crate::metadata::sqlite::SqliteTimestamp(current_mtime));
 
     // Compute fresh SHA-256
     let computed_hash = compute_sha256(&path).await.map_err(|_| Discrepancy {

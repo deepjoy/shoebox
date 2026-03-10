@@ -87,14 +87,19 @@ pub async fn put_object(
         }
     }
 
-    let now = time::OffsetDateTime::now_utc();
+    let now = crate::metadata::sqlite::SqliteTimestamp::now();
+    let parent = key
+        .rsplit_once('/')
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_default();
+    let dir_id = metadata.get_or_create_dir_id(&parent).await?;
+    let ct_id = metadata
+        .get_or_create_content_type_id(&input.content_type)
+        .await?;
     let obj = ObjectRecord {
         id: uuid::Uuid::new_v4().to_string(),
         key: key.to_string(),
-        parent_directory: key
-            .rsplit_once('/')
-            .map(|(p, _)| p.to_string())
-            .unwrap_or_default(),
+        parent_dir_id: dir_id,
         size: Some(result.bytes_written as i64),
         file_mtime: Some(now),
         etag: Some(etag.clone()),
@@ -102,7 +107,7 @@ pub async fn put_object(
         checksum_sha1: result.checksums.sha1.clone(),
         checksum_crc32: result.checksums.crc32.clone(),
         checksum_crc32c: result.checksums.crc32c.clone(),
-        content_type: Some(input.content_type),
+        content_type_id: Some(ct_id),
         last_modified: now,
         created_at: now,
         metadata: if input.user_metadata.is_empty() {

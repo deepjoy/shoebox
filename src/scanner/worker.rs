@@ -122,8 +122,10 @@ async fn handle_file_changed(
         // Compare current mtime and size with stored values to detect real changes.
         // The watcher can fire spuriously (e.g. atime updates from scanner reads),
         // so we only reset scan_level when the file content may have changed.
-        let current_mtime: Option<time::OffsetDateTime> =
-            fs_meta.modified().ok().map(time::OffsetDateTime::from);
+        let current_mtime: Option<crate::metadata::sqlite::SqliteTimestamp> = fs_meta
+            .modified()
+            .ok()
+            .map(|t| crate::metadata::sqlite::SqliteTimestamp(time::OffsetDateTime::from(t)));
         let current_size = fs_meta.len() as i64;
 
         if obj.file_mtime == current_mtime && obj.size == Some(current_size) {
@@ -143,6 +145,7 @@ async fn handle_file_changed(
         .rsplit_once('/')
         .map(|(p, _)| p.to_string())
         .unwrap_or_default();
+    let dir_id = metadata.get_or_create_dir_id(&parent).await?;
 
     let symlink_target = if is_symlink {
         std::fs::read_link(&path)
@@ -152,20 +155,20 @@ async fn handle_file_changed(
         None
     };
 
-    let content_type = mime_guess::from_path(key)
+    let ct_mime = mime_guess::from_path(key)
         .first_or_octet_stream()
         .to_string();
+    let ct_id = metadata.get_or_create_content_type_id(&ct_mime).await?;
 
-    let now = time::OffsetDateTime::now_utc();
+    let now = crate::metadata::sqlite::SqliteTimestamp::now();
     let obj = crate::metadata::sqlite::ObjectRecord {
         id: uuid::Uuid::new_v4().to_string(),
         key: key.to_string(),
-        parent_directory: parent,
-        is_directory: false,
+        parent_dir_id: dir_id,
         is_symlink,
         symlink_target,
         size,
-        content_type: Some(content_type),
+        content_type_id: Some(ct_id),
         scan_level: 1,
         last_modified: now,
         created_at: now,
