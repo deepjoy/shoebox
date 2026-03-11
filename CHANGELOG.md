@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/deepjoy/shoebox/compare/shoebox-v0.3.1...shoebox-v0.3.2) - 2026-03-11
+
+### Fixed
+
+- use cargo-chef for Docker layer caching instead of ephemeral BuildKit mounts ([#64](https://github.com/deepjoy/shoebox/pull/64))
+
 ## [0.3.1](https://github.com/deepjoy/shoebox/compare/shoebox-v0.3.0...shoebox-v0.3.1) - 2026-03-11
 
 ### Added
