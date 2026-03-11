@@ -364,7 +364,7 @@ pub async fn cleanup_loop(
 /// Calculate total size of a directory recursively.
 fn dir_size(
     path: &Path,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, S3Error>> + '_>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, S3Error>> + Send + '_>> {
     Box::pin(async move {
         let mut total = 0u64;
         let mut read_dir = tokio::fs::read_dir(path).await?;
