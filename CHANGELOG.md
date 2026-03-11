@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5](https://github.com/deepjoy/shoebox/compare/shoebox-v0.3.4...shoebox-v0.3.5) - 2026-03-11
+
+### Added
+
+- add HTTPS webhook delivery via hyper-rustls ([#70](https://github.com/deepjoy/shoebox/pull/70))
+
+### Fixed
+
+- speed up Docker builds and chain from release-plz ([#71](https://github.com/deepjoy/shoebox/pull/71))
+
 ## [0.3.4](https://github.com/deepjoy/shoebox/compare/shoebox-v0.3.3...shoebox-v0.3.4) - 2026-03-11
 
 ### Fixed
