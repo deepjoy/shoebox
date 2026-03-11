@@ -61,5 +61,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=gha,scope=buildkit-amd64
+            type=gha,scope=buildkit-arm64
+          cache-to: type=gha,mode=max,scope=buildkit-${{ github.ref_name }}
