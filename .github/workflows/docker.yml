@@ -2,7 +2,7 @@ name: Docker
 
 on:
   push:
-    tags: ['v*']
+    tags: ['shoebox-v*']
   # pull_request:  for testing
   workflow_dispatch:
 
@@ -40,6 +40,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Extract version
+        id: version
+        run: echo "tag=${GITHUB_REF_NAME#shoebox-}" >> "$GITHUB_OUTPUT"
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -48,9 +52,9 @@ jobs:
             ${{ env.IMAGE_NAME_DOCKERHUB }}
             ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME_GHCR }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ steps.version.outputs.tag }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
