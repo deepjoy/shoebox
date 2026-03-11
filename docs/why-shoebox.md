@@ -167,7 +167,7 @@ shoebox ~/Photos
 
 **Docker:**
 ```bash
-docker run -v ~/Photos:/data -p 9000:9000 deeppjoymajumdar/shoebox /data
+docker run -v ~/Photos:/data -p 9000:9000 ghcr.io/deepjoy/shoebox /data
 ```
 
 Pick whichever fits your workflow.
@@ -180,7 +180,7 @@ Pick whichever fits your workflow.
 ```yaml
 services:
   shoebox:
-    image: deeppjoymajumdar/shoebox
+    image: ghcr.io/deepjoy/shoebox
     volumes:
       - ./test-fixtures:/data
 steps:
