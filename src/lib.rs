@@ -697,6 +697,20 @@ impl Shoebox {
         // Spawn scheduled integrity checks (every 24 hours)
         self.spawn_scheduled_integrity_checks(std::time::Duration::from_secs(24 * 60 * 60));
 
+        // Spawn abandoned multipart upload cleanup (every 6 hours, max age 24 hours)
+        for bucket in self.buckets.values() {
+            let metadata = bucket.metadata.clone();
+            let parts_dir = bucket.parts_dir.clone();
+            let token = self.shutdown_token.clone();
+            tokio::spawn(crate::services::multipart_service::cleanup_loop(
+                metadata,
+                parts_dir,
+                std::time::Duration::from_secs(24 * 60 * 60),
+                std::time::Duration::from_secs(6 * 60 * 60),
+                token,
+            ));
+        }
+
         let app_state = self.to_app_state();
         let router = create_router(app_state);
         let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
