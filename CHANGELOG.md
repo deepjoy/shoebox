@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4](https://github.com/deepjoy/shoebox/compare/shoebox-v0.3.3...shoebox-v0.3.4) - 2026-03-11
+
+### Fixed
+
+- match release-plz prefixed tags in Docker workflow ([#68](https://github.com/deepjoy/shoebox/pull/68))
+
 ## [0.3.3](https://github.com/deepjoy/shoebox/compare/shoebox-v0.3.2...shoebox-v0.3.3) - 2026-03-11
 
 ### Fixed
