@@ -3,7 +3,12 @@ name: Docker
 on:
   push:
     tags: ['shoebox-v*']
-  # pull_request:  for testing
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Git tag to build (e.g. shoebox-v0.3.4)'
+        required: true
+        type: string
   workflow_dispatch:
 
 env:
@@ -20,6 +25,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -65,7 +72,5 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: |
-            type=gha,scope=buildkit-amd64
-            type=gha,scope=buildkit-arm64
-          cache-to: type=gha,mode=max,scope=buildkit-${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

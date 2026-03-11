@@ -1,6 +1,6 @@
 # Stage 1: Generate dependency recipe
 FROM rust:slim AS planner
-RUN cargo install cargo-chef
+COPY --from=lukemathwalker/cargo-chef:latest /usr/local/bin/cargo-chef /usr/local/bin/cargo-chef
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -9,7 +9,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 2: Build dependencies (cached layer when deps unchanged)
 FROM rust:slim AS builder
-RUN cargo install cargo-chef
+COPY --from=lukemathwalker/cargo-chef:latest /usr/local/bin/cargo-chef /usr/local/bin/cargo-chef
 RUN apt-get update && apt-get install -y pkg-config libsqlite3-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY --from=planner /build/recipe.json recipe.json
