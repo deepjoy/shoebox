@@ -71,9 +71,10 @@ mime_guess = "2"
 # Task scheduling
 taskmill = { version = "0.1.1", path = "crates/taskmill", default-features = false }
 
-# HTTP client for webhook delivery (Phase 9)
+# HTTP client for webhook delivery (Phase 9, HTTPS added in Phase 10)
 hyper = "1"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "webpki-tokio"] }
 http-body-util = "0.1"
 
 # CLI (optional for library-only usage)
