@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Full;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tokio::sync::{broadcast, mpsc};
@@ -34,7 +35,8 @@ pub async fn set_webhook_config(
 
 // --- NotificationService: stateful struct for webhook delivery ---
 
-type HttpClient = Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>;
+type HttpsConnector = hyper_rustls::HttpsConnector<HttpConnector>;
+type HttpClient = Client<HttpsConnector, Full<Bytes>>;
 
 #[derive(Clone)]
 pub struct NotificationService {
@@ -51,7 +53,12 @@ impl NotificationService {
     ) -> (Self, impl std::future::Future<Output = ()>) {
         let (tx, rx) = mpsc::channel(1000);
 
-        let http_client = Client::builder(TokioExecutor::new()).build_http();
+        let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let http_client = Client::builder(TokioExecutor::new()).build(https_connector);
 
         let service = Self {
             metadata,
@@ -196,12 +203,13 @@ impl NotificationService {
                         .ok();
                 }
                 Ok(Err(e)) => {
+                    let error = format_error_chain(&e);
                     self.metadata
                         .log_delivery(
                             &job.webhook_id,
                             &job.event.object_key,
                             "failed",
-                            Some(&e.to_string()),
+                            Some(&error),
                         )
                         .await
                         .ok();
@@ -236,6 +244,21 @@ impl NotificationService {
             tokio::time::sleep(Duration::from_secs(delay)).await;
         }
     }
+}
+
+/// Walk the `std::error::Error::source()` chain to produce a detailed message.
+/// hyper wraps connection-layer errors (e.g. TLS failures) so the top-level
+/// `Display` is generic ("client error (Connect)"). This captures the full
+/// chain so the root cause (e.g. rustls certificate rejection) is visible.
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut msg = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        msg.push_str(": ");
+        msg.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    msg
 }
 
 /// Pure function — check if a webhook matches an event.

@@ -143,7 +143,82 @@ p06_events_on_operations() {
 }
 part p06_events_on_operations "Event Emission"
 
-p07_delete_cors() {
+p07_https_webhook() {
+  step "Test HTTPS webhook delivery (Phase 10.4)"
+
+  note "Start a tiny Python HTTPS server with a self-signed certificate"
+  CERT_DIR="$DEMO_ROOT/certs"
+  mkdir -p "$CERT_DIR"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -nodes -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
+    -days 1 -subj '/CN=localhost' 2>/dev/null
+  echo ""
+
+  python3 -c "
+import http.server, ssl, sys
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', 0))
+        self.rfile.read(length)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'ok')
+    def log_message(self, *a): pass
+
+srv = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain('$CERT_DIR/cert.pem', '$CERT_DIR/key.pem')
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+" > "$DEMO_ROOT/https_port.txt" &
+  HTTPS_SERVER_PID=$!
+  # Update trap to also clean up the HTTPS server
+  trap 'kill "$HTTPS_SERVER_PID" 2>/dev/null || true; kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; rm -rf "$DEMO_ROOT"' EXIT
+  # Wait for the server to write its port
+  for _i in $(seq 1 20); do
+    if [ -s "$DEMO_ROOT/https_port.txt" ]; then break; fi
+    sleep 0.1
+  done
+  HTTPS_PORT=$(cat "$DEMO_ROOT/https_port.txt")
+
+  note "Configure an HTTPS webhook pointing to our self-signed server"
+  HTTPS_NOTIF='[{"id":"tls-test","url":"https://localhost:'"$HTTPS_PORT"'/hook","events":["s3:ObjectCreated:*"],"filter":null}]'
+  run "signed_curl PUT '/photos?notification' -H 'Content-Type: application/json' -d '$HTTPS_NOTIF'"
+  echo ""
+
+  note "Upload a file to trigger s3:ObjectCreated:Put event"
+  echo "tls-test-payload" > "$DEMO_ROOT/tls-test.txt"
+  run "$AWS s3 cp '$DEMO_ROOT/tls-test.txt' s3://photos/tls-test.txt"
+  echo ""
+
+  note "Wait for delivery attempts (3 retries with 1s/5s backoff)…"
+  note "Polling delivery_log until tls-test result appears (up to 30s)…"
+  TLS_RESULT=""
+  for _i in $(seq 1 60); do
+    TLS_RESULT=$(sqlite3 "$BUCKET_DIR/.shoebox/metadata.db" \
+      "SELECT webhook_id, status, last_error FROM notification_delivery_log WHERE webhook_id = 'tls-test' LIMIT 1;" 2>/dev/null)
+    if [ -n "$TLS_RESULT" ]; then break; fi
+    sleep 0.5
+  done
+  echo ""
+
+  note "Query delivery_log — rustls should reject the self-signed certificate"
+  note "The full error chain proves the HTTPS connector is doing real TLS verification"
+  run "sqlite3 -header -column '$BUCKET_DIR/.shoebox/metadata.db' \"SELECT webhook_id, status, last_error FROM notification_delivery_log WHERE webhook_id = 'tls-test' ORDER BY delivered_at DESC LIMIT 1;\""
+  echo ""
+
+  note "Clean up: restore original HTTP webhook config"
+  run "signed_curl PUT '/photos?notification' -H 'Content-Type: application/json' -d '$NOTIF_BODY'"
+  echo ""
+
+  kill "$HTTPS_SERVER_PID" 2>/dev/null || true
+  wait "$HTTPS_SERVER_PID" 2>/dev/null || true
+}
+part p07_https_webhook "HTTPS Webhook (TLS)"
+
+p08_delete_cors() {
   step "Delete CORS configuration"
 
   run "signed_curl DELETE '/photos?cors' -o /dev/null -w 'HTTP Status: %{http_code}\n'"
@@ -157,7 +232,7 @@ p07_delete_cors() {
   run "curl -s -o /dev/null -w 'HTTP Status: %{http_code}\n' -X OPTIONS '$ENDPOINT/photos/test.jpg' -H 'Origin: https://example.com' -H 'Access-Control-Request-Method: GET'"
   echo ""
 }
-part p07_delete_cors "Delete CORS"
+part p08_delete_cors "Delete CORS"
 
 p99_done() {
   echo ""
@@ -166,6 +241,7 @@ p99_done() {
   ok "CORS on root path: ListBuckets preflight and response headers verified."
   ok "Notification configuration: PUT and GET working."
   ok "Events emitted on object create and delete."
+  ok "HTTPS webhook delivery: TLS connector verified (hyper-rustls)."
   echo ""
 }
 part p99_done "Done!"
