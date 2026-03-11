@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6](https://github.com/deepjoy/shoebox/compare/shoebox-v0.3.5...shoebox-v0.3.6) - 2026-03-11
+
+### Fixed
+
+- use cargo-chef base image instead of COPY --from for binary ([#73](https://github.com/deepjoy/shoebox/pull/73))
+
 ## [0.3.5](https://github.com/deepjoy/shoebox/compare/shoebox-v0.3.4...shoebox-v0.3.5) - 2026-03-11
 
 ### Added
