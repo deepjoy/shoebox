@@ -117,6 +117,43 @@ p04_custom_host_port() {
 }
 part p04_custom_host_port "Custom Host & Port"
 
+p05_validate() {
+  note "Use 'shoebox validate' to check a bucket's configuration"
+  note "without starting the server."
+
+  step "Validate a bucket (table output)"
+  run "SHOEBOX_LOG=off $SHOEBOX validate '$DEMO_ROOT/Photos'"
+
+  step "Validate with JSON output"
+  run "SHOEBOX_LOG=off $SHOEBOX validate '$DEMO_ROOT/Photos' --format json"
+
+  step "Validate a nonexistent path"
+  run "SHOEBOX_LOG=off $SHOEBOX validate '$DEMO_ROOT/nope' || true"
+
+  step "Validate a bucket with bad config (duplicate key, non-standard format)"
+  note "Inject a second credential with a duplicate access key ID"
+  note "and a third with a non-standard format"
+  ORIG_CONFIG="$(cat "$DEMO_ROOT/Photos/.shoebox/config.toml")"
+  FIRST_AK=$(grep access_key_id "$DEMO_ROOT/Photos/.shoebox/config.toml" | head -1 | cut -d'"' -f2)
+  cat >> "$DEMO_ROOT/Photos/.shoebox/config.toml" <<EOF
+
+[[credentials]]
+access_key_id = "$FIRST_AK"
+secret_access_key = "DuplicateSecretKeyForTesting1234567890ab"
+description = "Duplicate key (should error)"
+
+[[credentials]]
+access_key_id = "SHORT"
+secret_access_key = "BadFormatSecretKeyForTesting123456789012"
+description = "Non-standard key (should warn)"
+EOF
+  run "SHOEBOX_LOG=off $SHOEBOX validate '$DEMO_ROOT/Photos' || true"
+
+  note "Restore original config"
+  echo "$ORIG_CONFIG" > "$DEMO_ROOT/Photos/.shoebox/config.toml"
+}
+part p05_validate "Validate Bucket Config"
+
 p99_done() {
   note "Each directory now has a .shoebox/config.toml with its credentials."
   step "Peeking at generated config"
@@ -124,6 +161,7 @@ p99_done() {
 
   echo ""
   ok "That's shoebox — zero-config, no-copy, S3-compatible local storage."
+  ok "Use 'shoebox validate' to check credentials, CORS, and webhooks."
   echo ""
 }
 part p99_done "Done!"
