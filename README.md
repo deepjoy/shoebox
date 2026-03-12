@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/deepjoy/shoebox/actions/workflows/ci.yml/badge.svg)](https://github.com/deepjoy/shoebox/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/shoebox.svg)](https://crates.io/crates/shoebox)
-[![Docker](https://img.shields.io/docker/v/deeppjoymajumdar/shoebox?label=docker)](https://hub.docker.com/r/deeppjoymajumdar/shoebox)
+[![Docker](https://ghcr-badge.egpl.dev/deepjoy/shoebox/latest_tag?label=docker)](https://ghcr.io/deepjoy/shoebox)
 [![MIT license](https://img.shields.io/crates/l/shoebox.svg)](LICENSE)
 
 A local S3-compatible server for your files. Find duplicates, verify integrity, zero config.
@@ -13,7 +13,7 @@ A local S3-compatible server for your files. Find duplicates, verify integrity, 
 
 ```bash
 # Docker (recommended)
-docker pull deeppjoymajumdar/shoebox:latest
+docker pull ghcr.io/deepjoy/shoebox:latest
 
 # Or via Cargo
 cargo install shoebox

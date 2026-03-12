@@ -16,7 +16,7 @@ shoebox ~/Documents
 Or with Docker:
 
 ```bash
-docker run -v ~/Documents:/data -p 9000:9000 deeppjoymajumdar/shoebox /data
+docker run -v ~/Documents:/data -p 9000:9000 ghcr.io/deepjoy/shoebox /data
 ```
 
 ## 2. Configure AWS CLI

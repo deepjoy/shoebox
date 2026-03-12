@@ -3,11 +3,6 @@
 ## Docker (Recommended)
 
 ```bash
-# From Docker Hub
-docker pull deeppjoymajumdar/shoebox:latest
-docker run -v /path/to/data:/data -p 9000:9000 deeppjoymajumdar/shoebox /data
-
-# Or from GitHub Container Registry
 docker pull ghcr.io/deepjoy/shoebox:latest
 docker run -v /path/to/data:/data -p 9000:9000 ghcr.io/deepjoy/shoebox /data
 ```
@@ -25,7 +20,7 @@ docker compose up
 ```yaml
 services:
   shoebox:
-    image: deeppjoymajumdar/shoebox:latest
+    image: ghcr.io/deepjoy/shoebox:latest
     ports:
       - "9000:9000"
     volumes:
@@ -42,7 +37,7 @@ services:
 ```yaml
 services:
   shoebox:
-    image: deeppjoymajumdar/shoebox:latest
+    image: ghcr.io/deepjoy/shoebox:latest
     volumes:
       - ./data:/data
     labels:
