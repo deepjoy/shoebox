@@ -16,31 +16,46 @@ shoebox ~/Documents
 Or with Docker:
 
 ```bash
-docker run -v ~/Documents:/data -p 9000:9000 deeppjoymajumdar/shoebox /data
+docker run -v ~/Documents:/data -p 9000:9000 ghcr.io/deepjoy/shoebox /data
 ```
 
-## 2. Configure AWS CLI
+## 2. Enable browser access (CORS)
+
+Shoebox prints a ready-to-run `curl` command on startup — just copy and run it:
 
 ```bash
-aws configure --profile shoebox
-# AWS Access Key ID: (paste from output)
-# AWS Secret Access Key: (paste from output)
-# Default region: us-east-1
-# Default output format: json
+export AWS_ACCESS_KEY_ID='<from startup output>'
+export AWS_SECRET_ACCESS_KEY='<from startup output>'
+export BUCKET='documents'
+
+curl -X PUT "http://localhost:9000/${BUCKET}?cors" \
+  --aws-sigv4 "aws:amz:us-east-1:s3" \
+  --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+  -H "Content-Type: application/json" \
+  -d '[{"allowed_origins":["*"],"allowed_methods":["GET","PUT","POST","DELETE","HEAD"],"allowed_headers":["*"],"expose_headers":["ETag","x-amz-request-id"],"max_age_seconds":3600}]'
 ```
 
-## 3. Use it
+## 3. Browse with the webapp
 
-```bash
-# List files
-aws --profile shoebox --endpoint-url http://localhost:9000 s3 ls s3://documents/
+Open **https://deepjoy.github.io/shoebox-webapp/** in your browser. Click **Add Connection** to get started:
 
-# Upload a file
-aws --profile shoebox --endpoint-url http://localhost:9000 s3 cp file.txt s3://documents/
+![Initial screen — no connections yet](screenshots/01-initial-screen.png)
 
-# Download a file
-aws --profile shoebox --endpoint-url http://localhost:9000 s3 cp s3://documents/file.txt ./
-```
+Enter your server URL (`http://localhost:9000`) and the credentials from the startup output, then click **Create**:
+
+![New connection form with endpoint and credentials](screenshots/02-new-connection.png)
+
+Your connection is saved. Click **Connect** to open it:
+
+![Connection saved — ready to connect](screenshots/03-connection-saved.png)
+
+Shoebox scans your files in the background — duplicates and stats appear as processing completes:
+
+![Bucket overview with background processing](screenshots/03-bucket-processing.png)
+
+Click a bucket to browse its contents:
+
+![Browsing objects inside a bucket](screenshots/04-bucket-list.png)
 
 ## Multiple Buckets
 

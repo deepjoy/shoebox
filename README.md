@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/deepjoy/shoebox/actions/workflows/ci.yml/badge.svg)](https://github.com/deepjoy/shoebox/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/shoebox.svg)](https://crates.io/crates/shoebox)
-[![Docker](https://img.shields.io/docker/v/deeppjoymajumdar/shoebox?label=docker)](https://hub.docker.com/r/deeppjoymajumdar/shoebox)
+[![Docker](https://ghcr-badge.egpl.dev/deepjoy/shoebox/latest_tag?label=docker)](https://ghcr.io/deepjoy/shoebox)
 [![MIT license](https://img.shields.io/crates/l/shoebox.svg)](LICENSE)
 
 A local S3-compatible server for your files. Find duplicates, verify integrity, zero config.
@@ -13,7 +13,7 @@ A local S3-compatible server for your files. Find duplicates, verify integrity, 
 
 ```bash
 # Docker (recommended)
-docker pull deeppjoymajumdar/shoebox:latest
+docker pull ghcr.io/deepjoy/shoebox:latest
 
 # Or via Cargo
 cargo install shoebox
@@ -22,19 +22,25 @@ cargo install shoebox
 ## Quick Start
 
 ```bash
-# Point Shoebox at one or more directories
-shoebox ~/Photos ~/Documents
+# Point Shoebox at a directory
+shoebox ~/Photos
+
+# Or with Docker
+docker run -it --rm -p 9000:9000 -v ~/Photos:/photos ghcr.io/deepjoy/shoebox /photos
 
 # Output:
-# Serving 2 buckets on http://localhost:9000
-#   photos    → /home/user/Photos
-#   documents → /home/user/Documents
+# Serving 1 bucket on http://localhost:9000
+#   photos → /home/user/Photos
 ```
 
-Files already on disk appear in S3 immediately — no uploading required. Use the AWS CLI, rclone, or any S3 SDK:
+Files already on disk appear in S3 immediately — no uploading required. Credentials are generated on first run and printed in the output. To enable browser access (CORS), follow the on-screen instructions — or use the AWS CLI:
 
 ```bash
-aws --endpoint-url http://localhost:9000 s3 ls s3://photos/
+# Configure credentials (printed on first run)
+aws configure --profile shoebox
+
+# List objects
+aws --profile shoebox --endpoint-url http://localhost:9000 s3 ls s3://photos/
 ```
 
 [![asciicast](https://asciinema.org/a/0zpWhRhyMKbrqt0S.svg)](https://asciinema.org/a/0zpWhRhyMKbrqt0S)
@@ -50,7 +56,7 @@ aws --endpoint-url http://localhost:9000 s3 ls s3://photos/
 - **Multipart uploads** — full support for large file uploads
 - **CORS** — browser-based clients work out of the box
 - **Webhook notifications** — get notified on object events (put, delete, copy)
-- **Single binary, ~10MB** — no runtime dependencies
+- **Single binary, ~18MB** — no runtime dependencies
 
 ## Duplicate Detection
 
@@ -73,30 +79,24 @@ Duplicate groups (2 groups, 5 files, 3 duplicates):
     backup/mountain.txt      ← duplicate
 ```
 
-Pick a winner, delete the rest:
-
-```bash
-$ shoebox duplicates ~/Photos --merge
-```
-
 ## Webapp
 
 A companion browser UI is available at **https://deepjoy.github.io/shoebox-webapp/**.
 
 Browse buckets, view objects, and see duplicate groups visually — no CLI needed. The webapp talks directly to your local Shoebox server via the S3 API.
 
-**CORS setup** (required for browser access):
+**CORS setup** (required for browser access) — Shoebox prints this command on startup, just copy and run it:
 
 ```bash
-aws s3api put-bucket-cors --endpoint-url http://localhost:9000 --bucket photos --cors-configuration '{
-  "CORSRules": [{
-    "AllowedOrigins": ["https://deepjoy.github.io"],
-    "AllowedMethods": ["GET", "PUT", "DELETE", "HEAD"],
-    "AllowedHeaders": ["*"],
-    "ExposeHeaders": ["ETag", "x-amz-request-id"],
-    "MaxAgeSeconds": 3600
-  }]
-}'
+export AWS_ACCESS_KEY_ID='<from startup output>'
+export AWS_SECRET_ACCESS_KEY='<from startup output>'
+export BUCKET='photos'
+
+curl -X PUT "http://localhost:9000/${BUCKET}?cors" \
+  --aws-sigv4 "aws:amz:us-east-1:s3" \
+  --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+  -H "Content-Type: application/json" \
+  -d '[{"allowed_origins":["*"],"allowed_methods":["GET","PUT","POST","DELETE","HEAD"],"allowed_headers":["*"],"expose_headers":["ETag","x-amz-request-id"],"max_age_seconds":3600}]'
 ```
 
 ## Who It's For
@@ -115,11 +115,11 @@ aws s3api put-bucket-cors --endpoint-url http://localhost:9000 --bucket photos -
 | Architecture | Managed service | Specialized nodes | Master/volume servers | Homogeneous nodes | Single process |
 | Setup | Account + IAM | Docker + config | Docker + config | Docker + config | Single command |
 | Data location | Cloud | MinIO data dir | SeaweedFS volumes | Garage data dir | Your existing files |
-| File visibility | S3 only | S3 only | S3 only | S3 only | Filesystem + S3 |
+| File visibility | S3 only | S3 only | S3, FUSE, WebDAV | S3 only | Filesystem + S3 |
 | Offline use | No | Yes | Yes | Yes | Yes |
-| Binary size | N/A | ~200MB | ~40MB | ~25MB | ~10MB |
+| Binary size | N/A | ~100MB | ~40MB | ~25MB | ~18MB |
 | Duplicate detection | No | No | No | No | Built-in |
-| Integrity checks | No | Yes (bitrot healing) | No | Yes (scrub) | Built-in (scheduled) |
+| Integrity checks | Yes (default checksums) | Yes (bitrot healing) | Limited (CRC) | Yes (scrub) | Built-in (scheduled) |
 | Max recommended scale | Unlimited | Petabytes | Petabytes | Petabytes | ~10TB |
 
 See [docs/why-shoebox.md](docs/why-shoebox.md) for the full story.
