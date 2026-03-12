@@ -128,7 +128,7 @@ Access your files via the filesystem *and* S3 API, interchangeably. Copy files i
 | Data location | Cloud | MinIO data dir | SeaweedFS volumes | Garage data dir | Your existing files |
 | File visibility | S3 only | S3 only | S3 only | S3 only | Filesystem + S3 |
 | Offline use | No | Yes | Yes | Yes | Yes |
-| Binary size | N/A | ~200MB | ~40MB | ~25MB | ~10MB |
+| Binary size | N/A | ~200MB | ~40MB | ~25MB | ~18MB |
 | Docker image | N/A | ~300MB | ~50MB | ~30MB | ~15MB |
 | Credentials | IAM | Configured | Configured | Configured | Auto-generated |
 | Per-directory isolation | No | Manual | No | No | Automatic |
@@ -199,7 +199,7 @@ I wanted to find duplicate photos. I ended up building an S3 server.
 
 When every file has a content hash in SQLite, duplicates are just a GROUP BY. But the real discovery: every S3 tool just works. rclone, AWS CLI, any SDK.
 
-~10MB binary. Files stay where they are. One command.
+~18MB binary. Files stay where they are. One command.
 
 ```bash
 shoebox ~/Photos
