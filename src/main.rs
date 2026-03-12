@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use shoebox::auth::presigned;
 use shoebox::config::{
-    generate_access_key_id, generate_secret_access_key, load_or_create_bucket_config,
-    save_bucket_config, Credential,
+    derive_bucket_name, generate_access_key_id, generate_secret_access_key,
+    load_or_create_bucket_config, save_bucket_config, Credential,
 };
 use shoebox::error::ShoeboxError;
 
@@ -129,6 +129,15 @@ enum Commands {
         /// Allow partial results when scan is incomplete.
         #[arg(long)]
         allow_partial: bool,
+        /// Output format.
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+
+    /// Validate a bucket's configuration (credentials, CORS, webhooks).
+    Validate {
+        /// Path to the bucket directory.
+        bucket_path: PathBuf,
         /// Output format.
         #[arg(long, default_value = "table")]
         format: String,
@@ -517,6 +526,326 @@ async fn handle_command(command: Commands) -> Result<(), Box<dyn std::error::Err
                 if !report.scan_complete {
                     println!("\nWarning: Scan incomplete — results may be partial.");
                 }
+            }
+        }
+
+        Commands::Validate {
+            bucket_path,
+            format,
+        } => {
+            #[derive(serde::Serialize)]
+            struct Check {
+                category: &'static str,
+                status: &'static str,
+                message: String,
+            }
+
+            let mut checks: Vec<Check> = Vec::new();
+
+            // -- Path checks --
+            let canon_path = match std::fs::canonicalize(&bucket_path) {
+                Ok(p) if p.is_dir() => Some(p),
+                _ => {
+                    checks.push(Check {
+                        category: "path",
+                        status: "error",
+                        message: format!("Directory does not exist: {}", bucket_path.display()),
+                    });
+                    None
+                }
+            };
+
+            let resolved_path = canon_path.as_deref().unwrap_or(&bucket_path);
+
+            // -- Bucket name --
+            let bucket_name = match derive_bucket_name(resolved_path) {
+                Ok(name) => {
+                    checks.push(Check {
+                        category: "name",
+                        status: "pass",
+                        message: format!("Bucket name \"{}\" is valid", name),
+                    });
+                    Some(name)
+                }
+                Err(e) => {
+                    checks.push(Check {
+                        category: "name",
+                        status: "error",
+                        message: format!("Invalid bucket name: {}", e),
+                    });
+                    None
+                }
+            };
+
+            // -- Credentials --
+            let shoebox_dir = resolve_shoebox_dir(resolved_path);
+            if shoebox_dir.join("config.toml").exists() {
+                match load_or_create_bucket_config(&shoebox_dir).await {
+                    Ok((config, _)) => {
+                        if config.credentials.is_empty() {
+                            checks.push(Check {
+                                category: "credentials",
+                                status: "warn",
+                                message: "No credentials configured".to_string(),
+                            });
+                        } else {
+                            checks.push(Check {
+                                category: "credentials",
+                                status: "pass",
+                                message: format!(
+                                    "{} credential(s) configured",
+                                    config.credentials.len()
+                                ),
+                            });
+
+                            // Check format
+                            for cred in &config.credentials {
+                                if !cred.access_key_id.starts_with("AKIA")
+                                    || cred.access_key_id.len() != 20
+                                {
+                                    checks.push(Check {
+                                        category: "credentials",
+                                        status: "warn",
+                                        message: format!(
+                                            "Access key \"{}\" has non-standard format \
+                                             (expected 20 chars starting with AKIA)",
+                                            cred.access_key_id
+                                        ),
+                                    });
+                                }
+                            }
+
+                            // Check duplicates
+                            let mut seen = std::collections::HashSet::new();
+                            for cred in &config.credentials {
+                                if !seen.insert(&cred.access_key_id) {
+                                    checks.push(Check {
+                                        category: "credentials",
+                                        status: "error",
+                                        message: format!(
+                                            "Duplicate access key ID: {}",
+                                            cred.access_key_id
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        checks.push(Check {
+                            category: "credentials",
+                            status: "error",
+                            message: format!("Failed to load config.toml: {}", e),
+                        });
+                    }
+                }
+            } else {
+                checks.push(Check {
+                    category: "credentials",
+                    status: "warn",
+                    message: "No .shoebox/config.toml found (will be created on first run)"
+                        .to_string(),
+                });
+            }
+
+            // -- CORS & Webhooks (require building Shoebox for SQLite access) --
+            if canon_path.is_some() && bucket_name.is_some() {
+                let bname = bucket_name.as_deref().unwrap();
+                match shoebox::Shoebox::builder()
+                    .bucket(resolved_path)
+                    .build()
+                    .await
+                {
+                    Ok(shoebox) => {
+                        // CORS
+                        match shoebox.get_cors_rules(bname).await {
+                            Ok(rules) if rules.is_empty() => {
+                                checks.push(Check {
+                                    category: "cors",
+                                    status: "warn",
+                                    message: "No CORS rules configured".to_string(),
+                                });
+                            }
+                            Ok(rules) => {
+                                checks.push(Check {
+                                    category: "cors",
+                                    status: "pass",
+                                    message: format!("{} CORS rule(s) configured", rules.len()),
+                                });
+                                let valid_methods = ["GET", "PUT", "POST", "DELETE", "HEAD"];
+                                for (i, rule) in rules.iter().enumerate() {
+                                    for method in &rule.allowed_methods {
+                                        if !valid_methods.contains(&method.as_str()) {
+                                            checks.push(Check {
+                                                category: "cors",
+                                                status: "warn",
+                                                message: format!(
+                                                    "CORS rule {} has unrecognized method: {}",
+                                                    i + 1,
+                                                    method
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                checks.push(Check {
+                                    category: "cors",
+                                    status: "error",
+                                    message: format!("Failed to read CORS rules: {}", e),
+                                });
+                            }
+                        }
+
+                        // Webhooks
+                        match shoebox.get_webhooks(bname).await {
+                            Ok(hooks) if hooks.is_empty() => {
+                                checks.push(Check {
+                                    category: "webhooks",
+                                    status: "pass",
+                                    message: "No webhooks configured".to_string(),
+                                });
+                            }
+                            Ok(hooks) => {
+                                checks.push(Check {
+                                    category: "webhooks",
+                                    status: "pass",
+                                    message: format!("{} webhook(s) configured", hooks.len()),
+                                });
+
+                                let known_event_prefixes = [
+                                    "s3:ObjectCreated:",
+                                    "s3:ObjectRemoved:",
+                                    "s3:ObjectRestore:",
+                                    "s3:ReducedRedundancyLostObject",
+                                    "s3:Replication:",
+                                    "s3:ObjectTagging:",
+                                    "s3:ObjectAcl:",
+                                ];
+
+                                for hook in &hooks {
+                                    // URL validity
+                                    match url::Url::parse(&hook.url) {
+                                        Ok(parsed) => {
+                                            if parsed.scheme() == "http" {
+                                                checks.push(Check {
+                                                    category: "webhooks",
+                                                    status: "warn",
+                                                    message: format!(
+                                                        "Webhook \"{}\" uses HTTP (not HTTPS): {}",
+                                                        hook.id, hook.url
+                                                    ),
+                                                });
+                                            }
+                                        }
+                                        Err(e) => {
+                                            checks.push(Check {
+                                                category: "webhooks",
+                                                status: "error",
+                                                message: format!(
+                                                    "Webhook \"{}\" has invalid URL \"{}\": {}",
+                                                    hook.id, hook.url, e
+                                                ),
+                                            });
+                                        }
+                                    }
+
+                                    // Event patterns
+                                    for event in &hook.events {
+                                        if !known_event_prefixes
+                                            .iter()
+                                            .any(|p| event.starts_with(p))
+                                        {
+                                            checks.push(Check {
+                                                category: "webhooks",
+                                                status: "warn",
+                                                message: format!(
+                                                    "Webhook \"{}\" has unrecognized event pattern: {}",
+                                                    hook.id, event
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                checks.push(Check {
+                                    category: "webhooks",
+                                    status: "error",
+                                    message: format!("Failed to read webhook configs: {}", e),
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        checks.push(Check {
+                            category: "metadata",
+                            status: "error",
+                            message: format!("Failed to open bucket: {}", e),
+                        });
+                    }
+                }
+            }
+
+            // -- Output --
+            let passed = checks.iter().filter(|c| c.status == "pass").count();
+            let warnings = checks.iter().filter(|c| c.status == "warn").count();
+            let errors = checks.iter().filter(|c| c.status == "error").count();
+
+            if format == "json" {
+                #[derive(serde::Serialize)]
+                struct Report {
+                    bucket_name: Option<String>,
+                    bucket_path: String,
+                    checks: Vec<Check>,
+                    summary: Summary,
+                }
+                #[derive(serde::Serialize)]
+                struct Summary {
+                    passed: usize,
+                    warnings: usize,
+                    errors: usize,
+                }
+                let report = Report {
+                    bucket_name,
+                    bucket_path: resolved_path.display().to_string(),
+                    checks,
+                    summary: Summary {
+                        passed,
+                        warnings,
+                        errors,
+                    },
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .unwrap_or_else(|_| "serialization error".into())
+                );
+            } else {
+                let display_name = bucket_name.as_deref().unwrap_or("(unknown)");
+                println!(
+                    "Validating bucket: {} ({})\n",
+                    display_name,
+                    resolved_path.display()
+                );
+                for check in &checks {
+                    let tag = match check.status {
+                        "pass" => "PASS",
+                        "warn" => "WARN",
+                        "error" => "FAIL",
+                        _ => "????",
+                    };
+                    println!("  [{}] {}", tag, check.message);
+                }
+                println!(
+                    "\nResult: {} passed, {} warnings, {} errors",
+                    passed, warnings, errors
+                );
+            }
+
+            if errors > 0 {
+                std::process::exit(1);
             }
         }
 
