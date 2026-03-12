@@ -25,14 +25,15 @@ RUN cargo build --release
 # Stage 5: Runtime
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y libsqlite3-0 ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y libsqlite3-0 ca-certificates gosu && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/shoebox /usr/local/bin/shoebox
+COPY docker-entrypoint.sh /usr/local/bin/
 
 # Default data directory
 RUN mkdir -p /data
 
 EXPOSE 9000
 
-ENTRYPOINT ["shoebox"]
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["/data"]
