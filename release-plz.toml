@@ -17,3 +17,6 @@ semver_check = true
 
 # Label release PRs for easy identification
 pr_labels = ["release"]
+
+# Create release PRs as drafts
+pr_draft = true
