@@ -168,6 +168,12 @@ See [docs/when-not-to-use-shoebox.md](docs/when-not-to-use-shoebox.md) for an ho
 
 MIT
 
+## Documentation
+
+- [Quickstart](docs/quickstart.md) — Running in 5 minutes
+- [Installation](docs/installation.md) — Docker, cargo install, from source
+- [User Guides](docs/README.md) — Configuration, credentials, S3 compatibility, and more
+
 ## Following Along
 
 This is a personal project built in public. v0.3.0 is the latest release — expect breaking changes before 1.0.
