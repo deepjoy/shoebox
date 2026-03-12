@@ -1,56 +1,56 @@
 # Shoebox
 
-I have 2TB of photos across 3 drives. Some are backups of backups. Some are originals I'm afraid to delete. Finding duplicates was always a weekend project that never happened.
+[![CI](https://github.com/deepjoy/shoebox/actions/workflows/ci.yml/badge.svg)](https://github.com/deepjoy/shoebox/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/shoebox.svg)](https://crates.io/crates/shoebox)
+[![Docker](https://img.shields.io/docker/v/deeppjoymajumdar/shoebox?label=docker)](https://hub.docker.com/r/deeppjoymajumdar/shoebox)
+[![MIT license](https://img.shields.io/crates/l/shoebox.svg)](LICENSE)
 
-Then I realized: if an object store knows the content hash of every file, duplicates are just a query.
-
-I'm building a tool to do that. Once you have an S3 API for local files, everything else comes for free—rclone, AWS CLI, any SDK. I set out to find duplicate photos and accidentally designed a local S3 server.
+A local S3-compatible server for your files. Find duplicates, verify integrity, zero config.
 
 ![Shoebox webapp — browsing a bucket](docs/screenshots/bucket-sample.png)
 
-## Webapp
-
-A companion browser UI for Shoebox is available at **https://deepjoy.github.io/shoebox-webapp/**.
-
-Browse buckets, view objects, and see duplicate groups visually—no CLI needed. The webapp talks directly to your local Shoebox server via the S3 API.
-
-**CORS setup** (required for browser access):
+## Install
 
 ```bash
-# Start Shoebox
-shoebox ~/Photos
+# Docker (recommended)
+docker pull deeppjoymajumdar/shoebox:latest
 
-# Enable CORS for the webapp origin
-aws s3api put-bucket-cors --bucket photos --cors-configuration '{
-  "CORSRules": [{
-    "AllowedOrigins": ["https://deepjoy.github.io"],
-    "AllowedMethods": ["GET", "PUT", "DELETE", "HEAD"],
-    "AllowedHeaders": ["*"],
-    "ExposeHeaders": ["ETag", "x-amz-request-id"],
-    "MaxAgeSeconds": 3600
-  }]
-}'
+# Or via Cargo
+cargo install shoebox
 ```
 
-## What This Is
+## Quick Start
 
 ```bash
-shoebox ~/Photos
+# Point Shoebox at one or more directories
+shoebox ~/Photos ~/Documents
+
+# Output:
+# Serving 2 buckets on http://localhost:9000
+#   photos    → /home/user/Photos
+#   documents → /home/user/Documents
 ```
 
-Your photos accessible via S3. Files stay where they are. No configuration. No cloud account. No data leaving your machine.
+Files already on disk appear in S3 immediately — no uploading required. Use the AWS CLI, rclone, or any S3 SDK:
 
-**The goal:**
-- S3-compatible API backed by your local filesystem
-- Zero-config startup—just point at directories
-- Built-in duplicate detection via content hashing
-- Integrity verification to detect bit rot
-- Sync endpoint with move detection
-- CORS support for browser-based clients
-- Works with rclone, AWS CLI, and standard SDKs
-- Single binary, ~10MB
+```bash
+aws --endpoint-url http://localhost:9000 s3 ls s3://photos/
+```
 
-[![asciicast](https://asciinema.org/a/pcK5rLzuAW2xlhp2.svg)](https://asciinema.org/a/pcK5rLzuAW2xlhp2)
+[![asciicast](https://asciinema.org/a/0zpWhRhyMKbrqt0S.svg)](https://asciinema.org/a/0zpWhRhyMKbrqt0S)
+
+## Features
+
+- **S3-compatible API** — works with AWS CLI, rclone, and any S3 SDK out of the box
+- **Zero-config startup** — just point at directories, no cloud account or configuration needed
+- **Duplicate detection** — find and merge duplicate files and directories via content hashing
+- **Integrity verification** — scheduled checks to detect bit rot and data corruption
+- **Filesystem sync** — background scanning with move detection, real-time file watching
+- **Authentication** — AWS Signature V4, per-bucket credentials, pre-signed URLs
+- **Multipart uploads** — full support for large file uploads
+- **CORS** — browser-based clients work out of the box
+- **Webhook notifications** — get notified on object events (put, delete, copy)
+- **Single binary, ~10MB** — no runtime dependencies
 
 ## Duplicate Detection
 
@@ -77,68 +77,36 @@ Pick a winner, delete the rest:
 
 ```bash
 $ shoebox duplicates ~/Photos --merge
-# or via the S3 API:
-# POST /photos?merge  {"winner_key": "originals/sunset.txt", "loser_keys": ["backup/sunset.txt", "edited/sunset-copy.txt"]}
 ```
 
-## Current Status — v0.3.0
+## Webapp
 
-**Phases 1–9 complete.** 157 tests passing. Works with AWS CLI, rclone, any S3 SDK.
+A companion browser UI is available at **https://deepjoy.github.io/shoebox-webapp/**.
 
-**What works today:**
-- **Core operations** — ListBuckets, PutObject, GetObject, DeleteObject, HeadObject, ListObjectsV2, DeleteObjects
-- **Authentication** — AWS Signature V4 (header and pre-signed URLs), per-bucket and global credentials, runtime credential CRUD via CLI and API
-- **Virtual-hosted routing** — `bucket.localhost:9000/key` style requests alongside path-style
-- **Copy & rename** — Same-bucket and cross-bucket copy, atomic rename
-- **Range requests** — Partial content reads (206 responses)
-- **Conditional requests** — If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since
-- **Object tagging** — Get, put, delete tags with S3-compatible XML
-- **Multipart uploads** — Initiate, upload parts, complete, abort, list uploads/parts
-- **Filesystem scanner** — Multi-level scanning (L1 walk, L2 stat, L3 dual hashing), background workers, real-time filesystem watching, checkpoint and resume
-- **Sync endpoint** — Trigger rescan via `POST /{bucket}?sync`, move detection preserves object identity across renames
-- **Duplicate detection** — Per-bucket and cross-bucket duplicate files and directories, streaming merge algorithm, duplicate merge (keep winner, delete losers)
-- **Integrity verification** — Sync and async integrity checks, scheduled checks (every 24h), bit rot detection, CLI subcommands
-- **Directory comparison** — Compare two directories across buckets, showing identical/modified/unique files
-- **CORS** — PutBucketCors, GetBucketCors, DeleteBucketCors, preflight OPTIONS handling, in-memory rule cache
-- **Bucket notifications** — Webhook delivery with retry on object events (put, delete, copy, multipart complete)
-- **Library API** — Rust-native `Shoebox` struct with methods that map 1:1 to S3 operations, usable without an HTTP server
-- **CLI subcommands** — `duplicates`, `integrity-check`, `compare-dirs`, `presign`, `rename`, credential management
-- **Graceful shutdown** — Clean SIGINT/SIGTERM handling with WAL flush
+Browse buckets, view objects, and see duplicate groups visually — no CLI needed. The webapp talks directly to your local Shoebox server via the S3 API.
 
-Files already on disk appear in S3 without uploading — the scanner picks them up automatically.
+**CORS setup** (required for browser access):
 
-## The Problem
-
-### Finding Duplicates is Surprisingly Hard
-
-You have photos scattered across drives, backup folders, and downloads. Some are duplicates. Finding them is tedious:
-
-- Filesystem tools compare by name, not content
-- Cloud S3 has no duplicate detection
-- Third-party tools require exporting data or running separate processes
-
-When your object store knows the content hash of every file, finding duplicates is a query, not a project.
-
-### Cloud S3 for Local Development is Wasteful
-
-You're building an app that stores files in S3. To test it, you need an AWS account, managed credentials, network connectivity, patience for latency, and money for data transfer. For files that exist only to be deleted when you're done testing.
-
-### Existing Solutions Solve Different Problems
-
-MinIO, SeaweedFS, and Garage are built for distributed storage—erasure coding, multi-node replication, cluster management. They solve a real problem: storing more data than fits on one machine.
-
-But most people don't have that problem. They have a NAS, a laptop, maybe an external drive. For single-machine storage, these tools bring complexity you don't need.
+```bash
+aws s3api put-bucket-cors --endpoint-url http://localhost:9000 --bucket photos --cors-configuration '{
+  "CORSRules": [{
+    "AllowedOrigins": ["https://deepjoy.github.io"],
+    "AllowedMethods": ["GET", "PUT", "DELETE", "HEAD"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag", "x-amz-request-id"],
+    "MaxAgeSeconds": 3600
+  }]
+}'
+```
 
 ## Who It's For
 
-- **Developers**: Test S3 integrations without cloud dependencies. Work offline.
-- **Home users**: Expose NAS storage to S3-compatible backup tools. Find duplicates with a single query.
-- **Archivists**: Verify file integrity with content hashes. Detect bit rot.
-- **Privacy-conscious users**: Keep files local. No account required, no telemetry.
+- **Developers** — test S3 integrations without cloud dependencies, work offline
+- **Home users** — expose NAS storage to S3-compatible backup tools, find duplicates with a single query
+- **Archivists** — verify file integrity with content hashes, detect bit rot
+- **Privacy-conscious users** — keep files local, no account required, no telemetry
 
 ## Comparison
-
-See [docs/why-shoebox.md](docs/why-shoebox.md) for the full story — problem, approach, and who it's for.
 
 | Concern | Cloud S3 | MinIO | SeaweedFS | Garage | Shoebox |
 |---------|----------|-------|-----------|--------|---------|
@@ -154,19 +122,17 @@ See [docs/why-shoebox.md](docs/why-shoebox.md) for the full story — problem, a
 | Integrity checks | No | Yes (bitrot healing) | No | Yes (scrub) | Built-in (scheduled) |
 | Max recommended scale | Unlimited | Petabytes | Petabytes | Petabytes | ~10TB |
 
+See [docs/why-shoebox.md](docs/why-shoebox.md) for the full story.
+
 ## When Not to Use Shoebox
 
 See [docs/when-not-to-use-shoebox.md](docs/when-not-to-use-shoebox.md) for an honest assessment of limitations, including:
 
 - Strong consistency requirements
 - Distributed / multi-node storage
-- >10TB of data
+- \>10TB of data
 - Enterprise S3 features (object lock, lifecycle policies, versioning)
 - High-throughput ingestion (thousands of files/second)
-
-## License
-
-MIT
 
 ## Documentation
 
@@ -174,8 +140,18 @@ MIT
 - [Installation](docs/installation.md) — Docker, cargo install, from source
 - [User Guides](docs/README.md) — Configuration, credentials, S3 compatibility, and more
 
-## Following Along
+## Contributing
 
-This is a personal project built in public. v0.3.0 is the latest release — expect breaking changes before 1.0.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
-If you're curious about local-first S3 storage or have thoughts on the approach, I'd like to hear from you. Open an issue or start a discussion.
+## Security
+
+See [SECURITY.md](SECURITY.md) for the security model and how to report vulnerabilities.
+
+## License
+
+MIT
+
+## Background
+
+I had 2TB of photos across 3 drives — backups of backups, originals I was afraid to delete. I set out to find duplicate photos and accidentally designed a local S3 server. If an object store knows the content hash of every file, duplicates are just a query. This is a personal project built in public — expect breaking changes before 1.0. If you have thoughts on the approach, [open an issue](https://github.com/deepjoy/shoebox/issues) or start a discussion.
