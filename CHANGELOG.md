@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8](https://github.com/deepjoy/shoebox/compare/shoebox-v0.3.7...shoebox-v0.3.8) - 2026-03-12
+
+### Fixed
+
+- run Docker container as UID/GID of mounted data directory ([#81](https://github.com/deepjoy/shoebox/pull/81))
+
+### Other
+
+- migrate to GHCR, update quickstart with webapp walkthrough ([#80](https://github.com/deepjoy/shoebox/pull/80))
+- add community files and rewrite README for users ([#78](https://github.com/deepjoy/shoebox/pull/78))
+
 ## [0.3.7](https://github.com/deepjoy/shoebox/compare/shoebox-v0.3.6...shoebox-v0.3.7) - 2026-03-12
 
 ### Added
