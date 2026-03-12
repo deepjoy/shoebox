@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7](https://github.com/deepjoy/shoebox/compare/shoebox-v0.3.6...shoebox-v0.3.7) - 2026-03-12
+
+### Added
+
+- add shoebox validate CLI command ([#75](https://github.com/deepjoy/shoebox/pull/75))
+
+### Other
+
+- add user-facing guide documentation ([#77](https://github.com/deepjoy/shoebox/pull/77))
+
 ## [0.3.6](https://github.com/deepjoy/shoebox/compare/shoebox-v0.3.5...shoebox-v0.3.6) - 2026-03-11
 
 ### Fixed
