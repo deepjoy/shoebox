@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/deepjoy/shoebox/compare/v0.3.8...v0.4.0) - 2026-03-14
+
+### Other
+
+- *(taskmill)* migrate from local copy to published crate 0.3.1 ([#84](https://github.com/deepjoy/shoebox/pull/84))
+- create release-plz PRs as drafts ([#82](https://github.com/deepjoy/shoebox/pull/82))
+
 ## [0.3.8](https://github.com/deepjoy/shoebox/compare/shoebox-v0.3.7...shoebox-v0.3.8) - 2026-03-12
 
 ### Fixed
