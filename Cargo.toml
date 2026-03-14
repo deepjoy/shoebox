@@ -1,6 +1,6 @@
 [package]
 name = "shoebox"
-version = "0.3.8"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "Lightweight S3-compatible object storage backed by local filesystem"
