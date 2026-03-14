@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use taskmill::{TaskContext, TaskError, TaskExecutor, TaskResult, TypedTask};
+use taskmill::{TaskContext, TaskError, TaskExecutor, TypedTask};
 
 use crate::scanner::app_state::ScanAppState;
 use crate::scanner::levels;
@@ -90,58 +90,36 @@ impl TypedTask for ScanL3Task {
 pub struct ScanL1Executor;
 
 impl TaskExecutor for ScanL1Executor {
-    async fn execute<'a>(&'a self, ctx: &'a TaskContext) -> Result<TaskResult, TaskError> {
-        let task: ScanL1Task = ctx
-            .deserialize_typed()
-            .map_err(|e| TaskError {
-                message: format!("failed to deserialize ScanL1Task: {e}"),
-                retryable: false,
-                actual_read_bytes: 0,
-                actual_write_bytes: 0,
-            })?
-            .ok_or_else(|| TaskError {
-                message: "missing payload".into(),
-                retryable: false,
-                actual_read_bytes: 0,
-                actual_write_bytes: 0,
-            })?;
+    async fn execute<'a>(&'a self, ctx: &'a TaskContext) -> Result<(), TaskError> {
+        let task: ScanL1Task = ctx.payload()?;
 
-        let app = ctx.state::<ScanAppState>().ok_or_else(|| TaskError {
-            message: "ScanAppState not set".into(),
-            retryable: false,
-            actual_read_bytes: 0,
-            actual_write_bytes: 0,
-        })?;
+        let app = ctx
+            .state::<ScanAppState>()
+            .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
 
-        let bucket_state = app.buckets.get(&task.bucket).ok_or_else(|| TaskError {
-            message: format!("bucket '{}' not found in ScanAppState", task.bucket),
-            retryable: false,
-            actual_read_bytes: 0,
-            actual_write_bytes: 0,
+        let bucket_state = app.buckets.get(&task.bucket).ok_or_else(|| {
+            TaskError::new(format!(
+                "bucket '{}' not found in ScanAppState",
+                task.bucket
+            ))
         })?;
 
         levels::scan_l1(&bucket_state.metadata, &bucket_state.root, &task.scope)
             .await
-            .map_err(|e| TaskError {
-                message: format!("L1 scan failed: {e}"),
-                retryable: e.is_retryable(),
-                actual_read_bytes: 0,
-                actual_write_bytes: 0,
+            .map_err(|e| {
+                if e.is_retryable() {
+                    TaskError::retryable(format!("L1 scan failed: {e}"))
+                } else {
+                    TaskError::new(format!("L1 scan failed: {e}"))
+                }
             })?;
 
         // Schedule downstream L2 (and optionally L3) if target_level warrants it.
-        let scheduler = bucket_state.scheduler.get().ok_or_else(|| TaskError {
-            message: "scheduler not initialised yet".into(),
-            retryable: true,
-            actual_read_bytes: 0,
-            actual_write_bytes: 0,
-        })?;
-
         // Propagate the current task's priority to downstream scans.
-        let priority = ctx.record.priority;
+        let priority = ctx.record().priority;
 
         if task.target_level >= 2 {
-            let _ = scheduler
+            let _ = ctx
                 .submit_typed_at(
                     &ScanL2Task {
                         bucket: task.bucket.clone(),
@@ -153,7 +131,7 @@ impl TaskExecutor for ScanL1Executor {
                 .await;
         }
         if task.target_level >= 3 {
-            let _ = scheduler
+            let _ = ctx
                 .submit_typed_at(
                     &ScanL3Task {
                         bucket: task.bucket.clone(),
@@ -165,55 +143,35 @@ impl TaskExecutor for ScanL1Executor {
                 .await;
         }
 
-        Ok(TaskResult {
-            actual_read_bytes: 0,
-            actual_write_bytes: 0,
-        })
+        Ok(())
     }
 }
 
 pub struct ScanL2Executor;
 
 impl TaskExecutor for ScanL2Executor {
-    async fn execute<'a>(&'a self, ctx: &'a TaskContext) -> Result<TaskResult, TaskError> {
-        let task: ScanL2Task = ctx
-            .deserialize_typed()
-            .map_err(|e| TaskError {
-                message: format!("failed to deserialize ScanL2Task: {e}"),
-                retryable: false,
-                actual_read_bytes: 0,
-                actual_write_bytes: 0,
-            })?
-            .ok_or_else(|| TaskError {
-                message: "missing payload".into(),
-                retryable: false,
-                actual_read_bytes: 0,
-                actual_write_bytes: 0,
-            })?;
+    async fn execute<'a>(&'a self, ctx: &'a TaskContext) -> Result<(), TaskError> {
+        let task: ScanL2Task = ctx.payload()?;
 
-        let app = ctx.state::<ScanAppState>().ok_or_else(|| TaskError {
-            message: "ScanAppState not set".into(),
-            retryable: false,
-            actual_read_bytes: 0,
-            actual_write_bytes: 0,
-        })?;
+        let app = ctx
+            .state::<ScanAppState>()
+            .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
 
-        let bucket_state = app.buckets.get(&task.bucket).ok_or_else(|| TaskError {
-            message: format!("bucket '{}' not found", task.bucket),
-            retryable: false,
-            actual_read_bytes: 0,
-            actual_write_bytes: 0,
-        })?;
+        let bucket_state = app
+            .buckets
+            .get(&task.bucket)
+            .ok_or_else(|| TaskError::new(format!("bucket '{}' not found", task.bucket)))?;
 
         let keys = bucket_state
             .metadata
             .list_keys_below_scan_level(2, L2_BATCH_LIMIT, task.cursor.as_deref())
             .await
-            .map_err(|e| TaskError {
-                message: format!("L2 key listing failed: {e}"),
-                retryable: e.is_retryable(),
-                actual_read_bytes: 0,
-                actual_write_bytes: 0,
+            .map_err(|e| {
+                if e.is_retryable() {
+                    TaskError::retryable(format!("L2 key listing failed: {e}"))
+                } else {
+                    TaskError::new(format!("L2 key listing failed: {e}"))
+                }
             })?;
 
         let has_remaining = keys.len() as i64 >= L2_BATCH_LIMIT;
@@ -221,11 +179,12 @@ impl TaskExecutor for ScanL2Executor {
         if !keys.is_empty() {
             levels::scan_l2(&bucket_state.metadata, &bucket_state.root, &keys)
                 .await
-                .map_err(|e| TaskError {
-                    message: format!("L2 scan failed: {e}"),
-                    retryable: e.is_retryable(),
-                    actual_read_bytes: 0,
-                    actual_write_bytes: 0,
+                .map_err(|e| {
+                    if e.is_retryable() {
+                        TaskError::retryable(format!("L2 scan failed: {e}"))
+                    } else {
+                        TaskError::new(format!("L2 scan failed: {e}"))
+                    }
                 })?;
         }
 
@@ -248,59 +207,36 @@ impl TaskExecutor for ScanL2Executor {
 
         // Schedule continuation if more keys remain.
         if has_remaining {
-            if let Some(scheduler) = bucket_state.scheduler.get() {
-                let _ = scheduler
-                    .submit_typed_at(
-                        &ScanL2Task {
-                            bucket: task.bucket.clone(),
-                            cursor: keys.last().cloned(),
-                            priority: None,
-                        },
-                        ctx.record.priority,
-                    )
-                    .await;
-            }
+            let _ = ctx
+                .submit_typed_at(
+                    &ScanL2Task {
+                        bucket: task.bucket.clone(),
+                        cursor: keys.last().cloned(),
+                        priority: None,
+                    },
+                    ctx.record().priority,
+                )
+                .await;
         }
 
-        Ok(TaskResult {
-            actual_read_bytes: 0,
-            actual_write_bytes: 0,
-        })
+        Ok(())
     }
 }
 
 pub struct ScanL3Executor;
 
 impl TaskExecutor for ScanL3Executor {
-    async fn execute<'a>(&'a self, ctx: &'a TaskContext) -> Result<TaskResult, TaskError> {
-        let task: ScanL3Task = ctx
-            .deserialize_typed()
-            .map_err(|e| TaskError {
-                message: format!("failed to deserialize ScanL3Task: {e}"),
-                retryable: false,
-                actual_read_bytes: 0,
-                actual_write_bytes: 0,
-            })?
-            .ok_or_else(|| TaskError {
-                message: "missing payload".into(),
-                retryable: false,
-                actual_read_bytes: 0,
-                actual_write_bytes: 0,
-            })?;
+    async fn execute<'a>(&'a self, ctx: &'a TaskContext) -> Result<(), TaskError> {
+        let task: ScanL3Task = ctx.payload()?;
 
-        let app = ctx.state::<ScanAppState>().ok_or_else(|| TaskError {
-            message: "ScanAppState not set".into(),
-            retryable: false,
-            actual_read_bytes: 0,
-            actual_write_bytes: 0,
-        })?;
+        let app = ctx
+            .state::<ScanAppState>()
+            .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
 
-        let bucket_state = app.buckets.get(&task.bucket).ok_or_else(|| TaskError {
-            message: format!("bucket '{}' not found", task.bucket),
-            retryable: false,
-            actual_read_bytes: 0,
-            actual_write_bytes: 0,
-        })?;
+        let bucket_state = app
+            .buckets
+            .get(&task.bucket)
+            .ok_or_else(|| TaskError::new(format!("bucket '{}' not found", task.bucket)))?;
 
         // Compute byte budget from previous throughput or use seed.
         let byte_budget = match task.bytes_per_sec {
@@ -320,16 +256,16 @@ impl TaskExecutor for ScanL3Executor {
             .metadata
             .list_keys_by_byte_budget(3, byte_budget, task.cursor.as_deref())
             .await
-            .map_err(|e| TaskError {
-                message: format!("L3 key listing failed: {e}"),
-                retryable: e.is_retryable(),
-                actual_read_bytes: 0,
-                actual_write_bytes: 0,
+            .map_err(|e| {
+                if e.is_retryable() {
+                    TaskError::retryable(format!("L3 key listing failed: {e}"))
+                } else {
+                    TaskError::new(format!("L3 key listing failed: {e}"))
+                }
             })?;
 
         let has_remaining = !exhausted;
 
-        let mut actual_read_bytes: i64 = 0;
         let mut new_bytes_per_sec = task.bytes_per_sec;
 
         if !keys.is_empty() {
@@ -352,14 +288,15 @@ impl TaskExecutor for ScanL3Executor {
                 concurrency,
             )
             .await
-            .map_err(|e| TaskError {
-                message: format!("L3 scan failed: {e}"),
-                retryable: e.is_retryable(),
-                actual_read_bytes: 0,
-                actual_write_bytes: 0,
+            .map_err(|e| {
+                if e.is_retryable() {
+                    TaskError::retryable(format!("L3 scan failed: {e}"))
+                } else {
+                    TaskError::new(format!("L3 scan failed: {e}"))
+                }
             })?;
             let elapsed = l3_start.elapsed().as_secs_f64();
-            actual_read_bytes = report.bytes as i64;
+            ctx.record_read_bytes(report.bytes as i64);
 
             let total_attempted = report.hashed + report.skipped;
             if elapsed > 0.0 && total_attempted > 0 {
@@ -393,24 +330,19 @@ impl TaskExecutor for ScanL3Executor {
 
         // Schedule continuation if more keys remain.
         if has_remaining {
-            if let Some(scheduler) = bucket_state.scheduler.get() {
-                let _ = scheduler
-                    .submit_typed_at(
-                        &ScanL3Task {
-                            bucket: task.bucket.clone(),
-                            cursor: keys.last().cloned(),
-                            bytes_per_sec: new_bytes_per_sec,
-                        },
-                        ctx.record.priority,
-                    )
-                    .await;
-            }
+            let _ = ctx
+                .submit_typed_at(
+                    &ScanL3Task {
+                        bucket: task.bucket.clone(),
+                        cursor: keys.last().cloned(),
+                        bytes_per_sec: new_bytes_per_sec,
+                    },
+                    ctx.record().priority,
+                )
+                .await;
         }
 
-        Ok(TaskResult {
-            actual_read_bytes,
-            actual_write_bytes: 0,
-        })
+        Ok(())
     }
 }
 

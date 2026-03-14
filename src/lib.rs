@@ -923,7 +923,7 @@ impl ShoeboxBuilder {
             });
         }
 
-        // ── Phase 2: Build ScanAppState with empty OnceLock schedulers ──
+        // ── Phase 2: Build ScanAppState ──
         let scan_app_state = Arc::new(ScanAppState {
             buckets: resolved
                 .iter()
@@ -933,7 +933,6 @@ impl ShoeboxBuilder {
                         BucketScanState {
                             metadata: r.metadata.clone(),
                             root: r.root.clone(),
-                            scheduler: std::sync::OnceLock::new(),
                         },
                     )
                 })
@@ -976,11 +975,6 @@ impl ShoeboxBuilder {
 
                 sched
             };
-
-            // Fulfil the OnceLock so executors can submit continuation tasks.
-            if let Some(bucket_state) = scan_app_state.buckets.get(&r.name) {
-                let _ = bucket_state.scheduler.set(scheduler.clone());
-            }
 
             // Submit initial background L2+L3 scan tasks.
             let _ = scheduler
@@ -2033,21 +2027,29 @@ mod tests {
     #[tokio::test]
     async fn test_allow_partial_returns_results_despite_incomplete_scan() {
         let tmp = TempDir::new().unwrap();
-        let bucket_dir = tmp.path().join("partial");
-        std::fs::create_dir_all(&bucket_dir).unwrap();
-
-        // Create a file on disk (will be L1 after build)
-        std::fs::write(bucket_dir.join("preexisting.txt"), "on disk only").unwrap();
-
-        let shoebox = Shoebox::builder()
-            .bucket(&bucket_dir)
-            .build()
-            .await
-            .unwrap();
+        let shoebox = build_shoebox(&tmp, "partial").await;
 
         // Upload a duplicate pair via API (these become L3)
         put_file(&shoebox, "partial", "dup1.txt", b"duplicate data").await;
         put_file(&shoebox, "partial", "dup2.txt", b"duplicate data").await;
+
+        // Insert a synthetic L1 record so the scan is never "complete",
+        // regardless of scheduler timing.
+        let bucket = shoebox.loaded_buckets().get("partial").unwrap();
+        let root_dir_id = bucket.metadata.get_or_create_dir_id("").await.unwrap();
+        bucket
+            .metadata
+            .insert_object(&ObjectRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "unscanned.txt".into(),
+                parent_dir_id: root_dir_id,
+                scan_level: 1,
+                last_modified: crate::metadata::sqlite::SqliteTimestamp::now(),
+                created_at: crate::metadata::sqlite::SqliteTimestamp::now(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         // Without allow-partial, should fail
         let err = shoebox
