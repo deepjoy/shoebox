@@ -5,7 +5,6 @@ WORKDIR /build
 # Stage 2: Generate dependency recipe
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
 COPY src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -17,7 +16,6 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 # Stage 4: Build application
 COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
 COPY migrations ./migrations
 COPY src ./src
 RUN cargo build --release
