@@ -105,6 +105,17 @@ curl "http://localhost:9000/?compare-dirs&left-bucket=photos&left-prefix=vacatio
   --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY"
 ```
 
+## OS Junk Files
+
+Operating systems create hidden housekeeping files — `.DS_Store` (macOS), `Thumbs.db` and `desktop.ini` (Windows) — that vary from machine to machine. Shoebox automatically excludes these files when computing directory hashes, so two directories with identical real content are recognised as duplicates even if one contains `.DS_Store` and the other contains `Thumbs.db`.
+
+This affects:
+
+- **Directory hashing** — junk files are excluded from the hash input and from the reported `file_count`.
+- **Duplicate directory detection** — groups are based on the junk-free hash.
+
+Individual file-level duplicate detection is not affected — junk files are still tracked as regular objects and will appear in per-file duplicate reports if they happen to share a hash.
+
 ## Duplicate Directories
 
 Find entire directories that are duplicates of each other:
