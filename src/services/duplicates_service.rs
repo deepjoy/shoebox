@@ -8,6 +8,11 @@ use crate::error::S3Error;
 use crate::metadata::sqlite::{DirectoryRecord, ObjectRecord, SqliteTimestamp};
 use crate::metadata::MetadataStore;
 
+/// OS-generated junk files excluded from directory hash computation.
+/// These files vary per-machine and would cause otherwise-identical
+/// directories to appear as different duplicates.
+const OS_JUNK_FILES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
+
 // ── Types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -374,15 +379,24 @@ pub async fn compute_single_directory_hash(
 
     // Build sorted list of (relative_key, checksum_sha256) for hashing.
     // Already sorted by key from the query.
+    // OS junk files (.DS_Store, Thumbs.db, etc.) are excluded so they
+    // don't cause otherwise-identical directories to hash differently.
     let mut pairs: Vec<(&str, &str)> = Vec::with_capacity(children.len());
     let mut total_size: i64 = 0;
     for (key, checksum, size) in &children {
         let rel_key = key.strip_prefix(&prefix).unwrap_or(key);
+        if OS_JUNK_FILES.iter().any(|&junk| rel_key == junk) {
+            continue;
+        }
         match checksum {
             Some(hash) => pairs.push((rel_key, hash.as_str())),
             None => return Ok(false), // Not all children hashed yet
         }
         total_size += size.unwrap_or(0);
+    }
+
+    if pairs.is_empty() {
+        return Ok(false); // Directory only contains OS junk files
     }
 
     let mut hasher = Sha256::new();
@@ -398,7 +412,7 @@ pub async fn compute_single_directory_hash(
         id: 0, // Will be resolved by upsert (existing row looked up by prefix)
         prefix: prefix.clone(),
         dir_hash: Some(dir_hash),
-        file_count: Some(children.len() as i32),
+        file_count: Some(pairs.len() as i32),
         total_size: Some(total_size),
         computed_at: Some(SqliteTimestamp::now()),
         stale: false,
