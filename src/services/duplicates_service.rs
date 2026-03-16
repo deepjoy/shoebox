@@ -8,6 +8,11 @@ use crate::error::S3Error;
 use crate::metadata::sqlite::{DirectoryRecord, ObjectRecord, SqliteTimestamp};
 use crate::metadata::MetadataStore;
 
+/// OS-generated junk files excluded from directory hash computation.
+/// These files vary per-machine and would cause otherwise-identical
+/// directories to appear as different duplicates.
+const OS_JUNK_FILES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
+
 // ── Types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -374,15 +379,24 @@ pub async fn compute_single_directory_hash(
 
     // Build sorted list of (relative_key, checksum_sha256) for hashing.
     // Already sorted by key from the query.
+    // OS junk files (.DS_Store, Thumbs.db, etc.) are excluded so they
+    // don't cause otherwise-identical directories to hash differently.
     let mut pairs: Vec<(&str, &str)> = Vec::with_capacity(children.len());
     let mut total_size: i64 = 0;
     for (key, checksum, size) in &children {
         let rel_key = key.strip_prefix(&prefix).unwrap_or(key);
+        if OS_JUNK_FILES.contains(&rel_key) {
+            continue;
+        }
         match checksum {
             Some(hash) => pairs.push((rel_key, hash.as_str())),
             None => return Ok(false), // Not all children hashed yet
         }
         total_size += size.unwrap_or(0);
+    }
+
+    if pairs.is_empty() {
+        return Ok(false); // Directory only contains OS junk files
     }
 
     let mut hasher = Sha256::new();
@@ -398,7 +412,7 @@ pub async fn compute_single_directory_hash(
         id: 0, // Will be resolved by upsert (existing row looked up by prefix)
         prefix: prefix.clone(),
         dir_hash: Some(dir_hash),
-        file_count: Some(children.len() as i32),
+        file_count: Some(pairs.len() as i32),
         total_size: Some(total_size),
         computed_at: Some(SqliteTimestamp::now()),
         stale: false,
@@ -591,4 +605,214 @@ pub async fn compare_dirs(
         },
         differences,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::sqlite::{split_key, ObjectRecord, SqliteTimestamp};
+    use tempfile::TempDir;
+
+    async fn make_store(tmp: &TempDir) -> MetadataStore {
+        let db_path = tmp.path().join("test.db");
+        MetadataStore::new(&db_path).await.unwrap()
+    }
+
+    /// Insert an object with a SHA-256 checksum into the store.
+    async fn insert_hashed_object(store: &MetadataStore, key: &str, hash: &str, size: i64) {
+        let now = SqliteTimestamp::now();
+        let parent = key
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        let dir_id = store.get_or_create_dir_id(&parent).await.unwrap();
+        let ct_id = store
+            .get_or_create_content_type_id("application/octet-stream")
+            .await
+            .unwrap();
+        let (_, filename) = split_key(key);
+
+        let obj = ObjectRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: filename.to_string(),
+            parent_dir_id: dir_id,
+            key: key.to_string(),
+            size: Some(size),
+            file_mtime: Some(now),
+            content_type_id: Some(ct_id),
+            last_modified: now,
+            created_at: now,
+            scan_level: 3,
+            checksum_sha256: Some(hash.to_string()),
+            ..Default::default()
+        };
+        store.insert_object(&obj).await.unwrap();
+    }
+
+    // ── OS_JUNK_FILES constant ──────────────────────────────────────
+
+    #[test]
+    fn os_junk_files_contains_expected_entries() {
+        assert!(OS_JUNK_FILES.contains(&".DS_Store"));
+        assert!(OS_JUNK_FILES.contains(&"Thumbs.db"));
+        assert!(OS_JUNK_FILES.contains(&"desktop.ini"));
+    }
+
+    // ── Cursor encoding/decoding ────────────────────────────────────
+
+    #[test]
+    fn duplicate_cursor_roundtrip() {
+        let encoded = encode_duplicate_cursor(4096, "abc123");
+        let (size, hash) = decode_duplicate_cursor(&encoded).unwrap();
+        assert_eq!(size, 4096);
+        assert_eq!(hash, "abc123");
+    }
+
+    #[test]
+    fn dir_cursor_roundtrip() {
+        let encoded = encode_dir_cursor("deadbeef");
+        let decoded = decode_dir_cursor(&encoded).unwrap();
+        assert_eq!(decoded, "deadbeef");
+    }
+
+    #[test]
+    fn decode_duplicate_cursor_rejects_garbage() {
+        assert!(decode_duplicate_cursor("not-base64!!!").is_none());
+    }
+
+    // ── Directory hashing with junk-file exclusion ──────────────────
+
+    #[tokio::test]
+    async fn dir_hash_excludes_ds_store() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp).await;
+
+        insert_hashed_object(&store, "photos/a.jpg", "aaa", 100).await;
+        insert_hashed_object(&store, "photos/.DS_Store", "ddd", 6148).await;
+
+        // Hash with the junk file present.
+        let ok = compute_single_directory_hash(&store, "photos")
+            .await
+            .unwrap();
+        assert!(ok, "should compute hash");
+
+        // Compute expected hash from only a.jpg.
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"a.jpg");
+        hasher.update(b":");
+        hasher.update(b"aaa");
+        hasher.update(b"\n");
+        let expected = hex::encode(hasher.finalize());
+
+        let dirs = store.get_dirs_by_hash(&expected).await.unwrap();
+        assert_eq!(
+            dirs.len(),
+            1,
+            "directory should be stored with junk-excluded hash"
+        );
+        assert_eq!(
+            dirs[0].file_count,
+            Some(1),
+            "file_count should exclude junk files"
+        );
+    }
+
+    #[tokio::test]
+    async fn dir_hash_excludes_thumbs_db_and_desktop_ini() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp).await;
+
+        insert_hashed_object(&store, "docs/readme.md", "rrr", 500).await;
+        insert_hashed_object(&store, "docs/Thumbs.db", "ttt", 76800).await;
+        insert_hashed_object(&store, "docs/desktop.ini", "iii", 282).await;
+
+        let ok = compute_single_directory_hash(&store, "docs").await.unwrap();
+        assert!(ok);
+
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"readme.md");
+        hasher.update(b":");
+        hasher.update(b"rrr");
+        hasher.update(b"\n");
+        let expected = hex::encode(hasher.finalize());
+
+        let dirs = store.get_dirs_by_hash(&expected).await.unwrap();
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].file_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn dir_hash_skipped_when_only_junk_files() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp).await;
+
+        insert_hashed_object(&store, "empty/.DS_Store", "ddd", 6148).await;
+        insert_hashed_object(&store, "empty/Thumbs.db", "ttt", 76800).await;
+
+        let ok = compute_single_directory_hash(&store, "empty")
+            .await
+            .unwrap();
+        assert!(!ok, "should return false for junk-only directory");
+    }
+
+    #[tokio::test]
+    async fn dir_hash_unchanged_without_junk_files() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp).await;
+
+        insert_hashed_object(&store, "clean/a.txt", "aaa", 100).await;
+        insert_hashed_object(&store, "clean/b.txt", "bbb", 200).await;
+
+        let ok = compute_single_directory_hash(&store, "clean")
+            .await
+            .unwrap();
+        assert!(ok);
+
+        // Compute expected hash from both files (sorted by name).
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"a.txt");
+        hasher.update(b":");
+        hasher.update(b"aaa");
+        hasher.update(b"\n");
+        hasher.update(b"b.txt");
+        hasher.update(b":");
+        hasher.update(b"bbb");
+        hasher.update(b"\n");
+        let expected = hex::encode(hasher.finalize());
+
+        let dirs = store.get_dirs_by_hash(&expected).await.unwrap();
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].file_count, Some(2));
+    }
+
+    #[tokio::test]
+    async fn identical_dirs_match_despite_different_junk_files() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp).await;
+
+        // dir_a has .DS_Store, dir_b has Thumbs.db — same real content.
+        insert_hashed_object(&store, "dir_a/photo.jpg", "ppp", 1000).await;
+        insert_hashed_object(&store, "dir_a/.DS_Store", "ddd", 6148).await;
+
+        insert_hashed_object(&store, "dir_b/photo.jpg", "ppp", 1000).await;
+        insert_hashed_object(&store, "dir_b/Thumbs.db", "ttt", 76800).await;
+
+        compute_single_directory_hash(&store, "dir_a")
+            .await
+            .unwrap();
+        compute_single_directory_hash(&store, "dir_b")
+            .await
+            .unwrap();
+
+        // Both should produce the same hash (only photo.jpg contributes).
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"photo.jpg");
+        hasher.update(b":");
+        hasher.update(b"ppp");
+        hasher.update(b"\n");
+        let expected = hex::encode(hasher.finalize());
+
+        let dirs = store.get_dirs_by_hash(&expected).await.unwrap();
+        assert_eq!(dirs.len(), 2, "both dirs should share the same hash");
+    }
 }
