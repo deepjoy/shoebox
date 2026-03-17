@@ -110,13 +110,22 @@ impl TaskExecutor for ScanL1Executor {
             bucket_state.l1_running.store(true, Ordering::Release);
         }
 
-        let result =
-            levels::scan_l1(&bucket_state.metadata, &bucket_state.root, &task.scope).await;
+        let result = levels::scan_l1(&bucket_state.metadata, &bucket_state.root, &task.scope).await;
 
         if matches!(task.scope, ScanScope::Bucket) {
             bucket_state.l1_running.store(false, Ordering::Release);
-            if result.is_ok() {
-                bucket_state.l1_completed_once.store(true, Ordering::Release);
+            match &result {
+                Ok(_) => {
+                    bucket_state
+                        .l1_completed_once
+                        .store(true, Ordering::Release);
+                    app.l1_notify.notify_waiters();
+                }
+                Err(e) if !e.is_retryable() => {
+                    bucket_state.l1_failed.store(true, Ordering::Release);
+                    app.l1_notify.notify_waiters();
+                }
+                Err(_) => {} // retryable — will be retried by taskmill
             }
         }
 

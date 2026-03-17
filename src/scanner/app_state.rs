@@ -11,6 +11,9 @@ use crate::metadata::MetadataStore;
 /// `ctx.submit_typed_at()` on the [`TaskContext`](taskmill::TaskContext).
 pub struct ScanAppState {
     pub buckets: HashMap<String, BucketScanState>,
+    /// Notified whenever any bucket's L1 scan completes (or permanently fails)
+    /// for the first time. Used by `Shoebox::wait_for_initial_scan()`.
+    pub l1_notify: tokio::sync::Notify,
 }
 
 pub struct BucketScanState {
@@ -22,4 +25,7 @@ pub struct BucketScanState {
     /// Set to `true` once the first bucket-wide L1 scan has completed.
     /// Used by `Shoebox::wait_for_initial_scan()`.
     pub l1_completed_once: AtomicBool,
+    /// Set to `true` if L1 scan fails permanently (non-retryable error).
+    /// Used by `Shoebox::wait_for_initial_scan()` to avoid hanging forever.
+    pub l1_failed: AtomicBool,
 }

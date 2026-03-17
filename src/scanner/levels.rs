@@ -11,7 +11,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::config::SHOEBOX_DIR;
 use crate::error::S3Error;
-use crate::metadata::sqlite::{L3HashUpdate, ObjectMetadataUpdate, ObjectRecord};
+use crate::metadata::sqlite::{L3HashUpdate, ObjectMetadataUpdate, ObjectRecord, SqliteTimestamp};
 use crate::metadata::MetadataStore;
 use crate::scanner::platform;
 use crate::scanner::scope::ScanScope;
@@ -30,6 +30,8 @@ pub struct L1Report {
     pub deleted: u64,
     pub unchanged: u64,
     pub moved: u64,
+    /// Files skipped because (inode, device_id, size) matched the catalog.
+    pub skipped: u64,
 }
 
 /// Result of an L2 (metadata) scan.
@@ -56,30 +58,44 @@ fn is_shoebox_dir(path: &Path) -> bool {
 
 /// L1: Fast directory walk — discovers files on disk and inserts new records.
 ///
-/// Uses a SQLite temp table to collect all discovered disk keys during the walk,
-/// then merges against the `objects` table in two SQL statements (INSERT new,
-/// DELETE stale). This keeps memory usage O(1) regardless of file count — all
-/// working set pressure is handled by SQLite's page cache.
+/// Uses an **incremental** approach when the catalog is non-empty:
 ///
-/// This is a free function per the library-first design principle. Both HTTP
-/// handlers and `Shoebox` library methods can call it directly.
+/// 1. Load all known files into an in-memory `KnownFiles` map (one query).
+/// 2. Walk the filesystem. For each file:
+///    - If `(parent_dir_id, name, inode, device_id, size)` match the catalog → skip (unchanged).
+///    - If inode+device_id match an existing object at a different location → move (update in-place).
+///    - Otherwise → insert into a temp table as a new file.
+/// 3. Merge the (much smaller) temp table into the catalog.
+/// 4. Delete stale objects whose keys were not seen during the walk.
+///
+/// When the catalog is empty (first scan), this degrades gracefully to the
+/// full temp-table approach since no files will match.
+///
+/// Memory: ~30 MB for 100K files with average 100-byte keys.
 pub async fn scan_l1(
     metadata: &MetadataStore,
     root: &Path,
     scope: &ScanScope,
 ) -> Result<L1Report, S3Error> {
     let scan_start = std::time::Instant::now();
+    let scan_start_ts = SqliteTimestamp::now();
 
-    // Acquire a dedicated connection and create a temp table for disk keys.
-    // The connection must be reused for all temp table operations.
+    // Phase 1: Load known files for incremental comparison
+    let known = metadata.l1_scan_load_known_files().await?;
+    let known_count = known.by_key.len();
+    tracing::info!(known_files = known_count, "L1 scan started (incremental)");
+
+    // Phase 2: Acquire a dedicated connection and create a temp table for NEW disk keys.
     let mut conn = metadata.l1_scan_begin().await?;
-    tracing::info!("L1 scan started, temp table created");
 
-    // Walk the filesystem and batch-insert every discovered file into the temp table
+    // Track all seen keys for deletion detection
+    let mut seen: HashSet<(i64, String)> = HashSet::with_capacity(known_count);
+    let mut skipped: u64 = 0;
+    let mut moved: u64 = 0;
+    let mut files_walked: u64 = 0;
     let mut batch: Vec<ObjectRecord> = Vec::with_capacity(BATCH_SIZE);
     let mut batch_start = std::time::Instant::now();
     let mut last_progress = std::time::Instant::now();
-    let mut files_walked: u64 = 0;
 
     let mut walker = WalkDir::new(root);
     walker = walker.filter(|entry| async move {
@@ -141,18 +157,75 @@ pub async fn scan_l1(
         if last_progress.elapsed() >= std::time::Duration::from_secs(5) {
             tracing::info!(
                 files = files_walked,
+                skipped = skipped,
                 elapsed = ?scan_start.elapsed(),
                 "L1 scan in progress"
             );
             last_progress = std::time::Instant::now();
         }
 
+        // Stat the file to get size and inode/device_id
+        let fs_meta = tokio::fs::symlink_metadata(&path).await.ok();
+        let size = fs_meta.as_ref().map(|m| m.len() as i64);
+        let (inode, device_id) = fs_meta
+            .as_ref()
+            .map(platform::file_identity)
+            .unwrap_or((None, None));
+        let inode_i64 = inode.map(|v| v as i64);
+        let device_id_i64 = device_id.map(|v| v as i64);
+
         let parent = key
             .rsplit_once('/')
             .map(|(p, _)| p.to_string())
             .unwrap_or_default();
+        let dir_id = metadata.get_or_create_dir_id(&parent).await?;
+        let (_, filename) = crate::metadata::sqlite::split_key(&key);
+        let filename = filename.to_string();
 
-        // Read symlink target if applicable
+        // Mark this key as seen for stale-deletion detection
+        seen.insert((dir_id, filename.clone()));
+
+        // Check 1: Does this file exist at the same location with matching identity?
+        if let Some(identity) = known.by_key.get(&(dir_id, filename.clone())) {
+            if identity.inode == inode_i64
+                && identity.device_id == device_id_i64
+                && identity.size == size
+            {
+                // File unchanged — skip temp table insert entirely
+                skipped += 1;
+                continue;
+            }
+        }
+
+        // Check 2: Is this a moved file? (same inode, different location)
+        if let (Some(ino), Some(dev)) = (inode_i64, device_id_i64) {
+            if let Some((old_parent_dir_id, old_name)) = known.by_inode.get(&(ino, dev)) {
+                if *old_parent_dir_id != dir_id || *old_name != filename {
+                    // Move detected — update the existing row in-place
+                    let now = SqliteTimestamp::now();
+                    let old_prefix = parent_prefix_for_log(metadata, *old_parent_dir_id).await;
+                    metadata
+                        .l1_scan_apply_move(
+                            &mut conn,
+                            *old_parent_dir_id,
+                            old_name,
+                            dir_id,
+                            &filename,
+                            now,
+                        )
+                        .await?;
+                    tracing::info!(
+                        old_key = %format!("{}{}", old_prefix, old_name),
+                        new_key = %key,
+                        "Move detected (incremental), preserving object_id"
+                    );
+                    moved += 1;
+                    continue;
+                }
+            }
+        }
+
+        // New or changed file — insert into temp table for merge
         let symlink_target = if is_symlink {
             std::fs::read_link(&path)
                 .ok()
@@ -161,36 +234,24 @@ pub async fn scan_l1(
             None
         };
 
-        // Infer content type from file extension
         let content_type = mime_guess::from_path(&key)
             .first_or_octet_stream()
             .to_string();
-
-        // Stat the file to get size and inode/device_id so they're
-        // available immediately after L1 (inode is needed for move detection).
-        let fs_meta = tokio::fs::symlink_metadata(&path).await.ok();
-        let size = fs_meta.as_ref().map(|m| m.len() as i64);
-        let (inode, device_id) = fs_meta
-            .as_ref()
-            .map(platform::file_identity)
-            .unwrap_or((None, None));
-
-        let now = crate::metadata::sqlite::SqliteTimestamp::now();
-        let dir_id = metadata.get_or_create_dir_id(&parent).await?;
         let ct_id = metadata
             .get_or_create_content_type_id(&content_type)
             .await?;
-        let (_, filename) = crate::metadata::sqlite::split_key(&key);
+
+        let now = SqliteTimestamp::now();
         let obj = ObjectRecord {
             id: uuid::Uuid::new_v4().to_string(),
-            name: filename.to_string(),
+            name: filename,
             parent_dir_id: dir_id,
             key: key.clone(),
             is_symlink,
             symlink_target,
             size,
-            inode: inode.map(|v| v as i64),
-            device_id: device_id.map(|v| v as i64),
+            inode: inode_i64,
+            device_id: device_id_i64,
             content_type_id: Some(ct_id),
             scan_level: 1,
             last_modified: now,
@@ -216,20 +277,32 @@ pub async fn scan_l1(
 
     tracing::info!(
         files = files_walked,
+        skipped = skipped,
+        moved = moved,
         elapsed = ?scan_start.elapsed(),
-        "L1 walk complete, merging into catalog"
+        "L1 walk complete, merging new files into catalog"
     );
 
-    // Merge: detect moves, insert new objects, and delete stale ones
-    let delete_stale = matches!(scope, ScanScope::Bucket);
-    let (discovered, deleted, moved) =
-        MetadataStore::l1_scan_finish(&mut conn, delete_stale).await?;
+    // Phase 3: Merge the temp table (only new/changed files) — moves already applied
+    let (discovered, _temp_deleted, temp_moved) =
+        MetadataStore::l1_scan_finish(&mut conn, false).await?;
+    moved += temp_moved;
 
-    let unchanged = files_walked.saturating_sub(discovered + moved);
+    // Phase 4: Delete stale objects (only for bucket-wide scans)
+    // Exclude objects created after the scan started to avoid racing with
+    // concurrent API uploads (put_object inserts at scan_level 3).
+    let deleted = if matches!(scope, ScanScope::Bucket) {
+        metadata.l1_scan_delete_stale(&seen, scan_start_ts).await?
+    } else {
+        0
+    };
+
+    let unchanged = files_walked.saturating_sub(discovered + moved + skipped);
 
     tracing::info!(
         discovered = discovered,
         moved = moved,
+        skipped = skipped,
         unchanged = unchanged,
         deleted = deleted,
         elapsed = ?scan_start.elapsed(),
@@ -241,7 +314,16 @@ pub async fn scan_l1(
         deleted,
         unchanged,
         moved,
+        skipped,
     })
+}
+
+/// Helper: get directory prefix for logging move detection.
+async fn parent_prefix_for_log(metadata: &MetadataStore, parent_dir_id: i64) -> String {
+    metadata
+        .get_directory_prefix(parent_dir_id)
+        .await
+        .unwrap_or_default()
 }
 
 /// L2: stat() each file for metadata (size, mtime, ctime, inode, device_id).
@@ -709,7 +791,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r2.discovered, 0);
-        assert_eq!(r2.unchanged, 1);
+        assert_eq!(r2.skipped, 1); // unchanged file detected by inode/size match
     }
 
     #[tokio::test]
@@ -811,5 +893,297 @@ mod tests {
         let target = store.get_object("target.txt").await.unwrap().unwrap();
         assert_eq!(target.scan_level, 3);
         assert!(target.etag.is_some());
+    }
+
+    // -- Incremental L1 scan tests (Phase 11b) --
+
+    #[tokio::test]
+    async fn test_l1_incremental_skips_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket_root).unwrap();
+        std::fs::write(bucket_root.join("a.txt"), "aaa").unwrap();
+        std::fs::write(bucket_root.join("b.txt"), "bbb").unwrap();
+
+        let store = make_store(&tmp).await;
+
+        // First scan: discovers all files
+        let r1 = scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+        assert_eq!(r1.discovered, 2);
+        assert_eq!(r1.skipped, 0);
+
+        // Second scan: files unchanged, should be skipped
+        let r2 = scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+        assert_eq!(r2.discovered, 0);
+        assert_eq!(r2.skipped, 2);
+        assert_eq!(r2.deleted, 0);
+        assert_eq!(r2.moved, 0);
+    }
+
+    #[tokio::test]
+    async fn test_l1_incremental_detects_new_files() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket_root).unwrap();
+        std::fs::write(bucket_root.join("existing.txt"), "existing").unwrap();
+
+        let store = make_store(&tmp).await;
+
+        // First scan
+        let r1 = scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+        assert_eq!(r1.discovered, 1);
+
+        // Add a new file
+        std::fs::write(bucket_root.join("new.txt"), "new").unwrap();
+
+        // Second scan: should discover the new file, skip the existing one
+        let r2 = scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+        assert_eq!(r2.discovered, 1);
+        assert_eq!(r2.skipped, 1);
+
+        // Both files should be in the catalog
+        assert!(store.get_object("existing.txt").await.unwrap().is_some());
+        assert!(store.get_object("new.txt").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_l1_incremental_detects_deleted_files() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket_root).unwrap();
+        std::fs::write(bucket_root.join("keep.txt"), "keep").unwrap();
+        std::fs::write(bucket_root.join("remove.txt"), "remove").unwrap();
+
+        let store = make_store(&tmp).await;
+
+        // First scan
+        scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+
+        // Delete one file
+        std::fs::remove_file(bucket_root.join("remove.txt")).unwrap();
+
+        // Second scan: should detect the deletion
+        let r2 = scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+        assert_eq!(r2.deleted, 1);
+        assert_eq!(r2.skipped, 1); // keep.txt unchanged
+        assert!(store.get_object("remove.txt").await.unwrap().is_none());
+        assert!(store.get_object("keep.txt").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_l1_incremental_detects_moves() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket_root).unwrap();
+        std::fs::write(bucket_root.join("original.txt"), "move me").unwrap();
+
+        let store = make_store(&tmp).await;
+
+        // First scan
+        let r1 = scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+        assert_eq!(r1.discovered, 1);
+
+        // Get original object ID
+        let original = store.get_object("original.txt").await.unwrap().unwrap();
+        let original_id = original.id.clone();
+
+        // Rename (move) the file
+        std::fs::rename(
+            bucket_root.join("original.txt"),
+            bucket_root.join("renamed.txt"),
+        )
+        .unwrap();
+
+        // Second scan: should detect the move
+        let r2 = scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+        assert_eq!(r2.moved, 1);
+        assert_eq!(r2.discovered, 0);
+        assert_eq!(r2.deleted, 0);
+
+        // Object ID should be preserved
+        let renamed = store.get_object("renamed.txt").await.unwrap().unwrap();
+        assert_eq!(renamed.id, original_id);
+
+        // Old key should not exist
+        assert!(store.get_object("original.txt").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_l1_incremental_first_scan_identical() {
+        // On an empty catalog, incremental scan should behave identically
+        // to the old full-scan approach.
+        let tmp = TempDir::new().unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket_root).unwrap();
+        std::fs::write(bucket_root.join("file.txt"), "data").unwrap();
+        std::fs::create_dir_all(bucket_root.join("sub")).unwrap();
+        std::fs::write(bucket_root.join("sub/nested.txt"), "nested").unwrap();
+
+        let store = make_store(&tmp).await;
+
+        let r1 = scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+        assert_eq!(r1.discovered, 2);
+        assert_eq!(r1.skipped, 0);
+        assert_eq!(r1.deleted, 0);
+        assert_eq!(r1.moved, 0);
+
+        // Verify records
+        let obj = store.get_object("file.txt").await.unwrap().unwrap();
+        assert_eq!(obj.scan_level, 1);
+        assert_eq!(obj.size, Some(4)); // "data" = 4 bytes
+    }
+
+    #[tokio::test]
+    async fn test_l1_incremental_mixed_scenario() {
+        // Simulate: some unchanged, one deleted, one moved, one new.
+        // We separate delete+create to avoid inode reuse confusing move detection.
+        let tmp = TempDir::new().unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket_root).unwrap();
+        std::fs::write(bucket_root.join("unchanged.txt"), "stable").unwrap();
+        std::fs::write(bucket_root.join("to-move.txt"), "mobile").unwrap();
+        // Create brand-new.txt BEFORE first scan so its inode is known,
+        // then we'll remove and re-create it with guaranteed-different inode.
+        std::fs::write(bucket_root.join("placeholder.txt"), "placeholder").unwrap();
+
+        let store = make_store(&tmp).await;
+
+        // First scan
+        let r1 = scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+        assert_eq!(r1.discovered, 3);
+
+        let move_id = store
+            .get_object("to-move.txt")
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+            .clone();
+
+        // Make changes:
+        // 1. Delete one file
+        std::fs::remove_file(bucket_root.join("placeholder.txt")).unwrap();
+        // 2. Move one file
+        std::fs::rename(
+            bucket_root.join("to-move.txt"),
+            bucket_root.join("moved.txt"),
+        )
+        .unwrap();
+
+        // Second scan: 1 unchanged (skipped), 1 moved, 1 deleted
+        let r2 = scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+        assert_eq!(r2.skipped, 1, "unchanged.txt should be skipped");
+        assert_eq!(r2.moved, 1, "to-move.txt → moved.txt");
+        assert_eq!(r2.discovered, 0, "no new files");
+        assert_eq!(r2.deleted, 1, "placeholder.txt deleted");
+
+        // Verify catalog state
+        assert!(store.get_object("unchanged.txt").await.unwrap().is_some());
+        assert!(store.get_object("placeholder.txt").await.unwrap().is_none());
+        assert!(store.get_object("to-move.txt").await.unwrap().is_none());
+        let moved = store.get_object("moved.txt").await.unwrap().unwrap();
+        assert_eq!(moved.id, move_id, "Move should preserve object ID");
+
+        // Now add a brand-new file and scan again
+        std::fs::write(bucket_root.join("brand-new.txt"), "hello").unwrap();
+
+        let r3 = scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+        assert_eq!(r3.discovered, 1, "brand-new.txt");
+        assert_eq!(r3.skipped, 2, "unchanged.txt + moved.txt");
+        assert!(store.get_object("brand-new.txt").await.unwrap().is_some());
+    }
+
+    /// Regression test: an API upload (put_object, scan_level=3) that lands in
+    /// the DB while an L1 scan is in progress must NOT be deleted as stale.
+    ///
+    /// Simulates the race by calling `l1_scan_delete_stale` directly with a
+    /// controlled `scan_start` timestamp, so we can insert an object with
+    /// `created_at > scan_start` without needing real concurrency.
+    #[tokio::test]
+    async fn test_l1_does_not_delete_concurrent_api_upload() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket_root).unwrap();
+        std::fs::write(bucket_root.join("on-disk.txt"), "disk file").unwrap();
+
+        let store = make_store(&tmp).await;
+
+        // First scan to populate the catalog
+        scan_l1(&store, &bucket_root, &ScanScope::Bucket)
+            .await
+            .unwrap();
+
+        // Record a timestamp representing when a hypothetical second scan starts
+        let scan_start = SqliteTimestamp::now();
+
+        // Small delay so the API upload's created_at is strictly after scan_start
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        // Simulate an API upload that arrives during the scan.
+        // The file exists only in the DB (scan_level=3), not on disk, mimicking
+        // a put_object that wrote to storage but the walk already passed that
+        // directory.
+        let now = SqliteTimestamp::now();
+        let dir_id = store.get_or_create_dir_id("").await.unwrap();
+        let ct_id = store
+            .get_or_create_content_type_id("text/plain")
+            .await
+            .unwrap();
+        let api_obj = ObjectRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "api-upload.txt".to_string(),
+            parent_dir_id: dir_id,
+            key: "api-upload.txt".to_string(),
+            size: Some(42),
+            content_type_id: Some(ct_id),
+            scan_level: 3,
+            last_modified: now,
+            created_at: now,
+            ..Default::default()
+        };
+        store.insert_object(&api_obj).await.unwrap();
+
+        // Build a `seen` set containing only the on-disk file (simulating a
+        // walk that never encountered api-upload.txt)
+        let (_, on_disk_name) = crate::metadata::sqlite::split_key("on-disk.txt");
+        let mut seen = std::collections::HashSet::new();
+        seen.insert((dir_id, on_disk_name.to_string()));
+
+        // Call l1_scan_delete_stale with the pre-upload timestamp.
+        // Without the fix, api-upload.txt would be deleted here.
+        let deleted = store.l1_scan_delete_stale(&seen, scan_start).await.unwrap();
+        assert_eq!(deleted, 0, "API upload must not be deleted as stale");
+
+        // Verify the API-uploaded object still exists in the catalog
+        assert!(
+            store.get_object("api-upload.txt").await.unwrap().is_some(),
+            "API-uploaded object should survive stale deletion"
+        );
+        // And the on-disk file is still there too
+        assert!(store.get_object("on-disk.txt").await.unwrap().is_some());
     }
 }

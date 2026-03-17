@@ -377,20 +377,26 @@ impl Shoebox {
     /// Wait until the background L1 scan has completed for every bucket.
     ///
     /// L1 runs as a background taskmill task after `build()`. This method
-    /// polls the `l1_completed_once` flag on each bucket until all are
-    /// `true`, sleeping briefly between checks.
-    pub async fn wait_for_initial_scan(&self) {
+    /// awaits a [`Notify`](tokio::sync::Notify) that fires whenever any
+    /// bucket's L1 finishes or permanently fails, then re-checks all buckets.
+    ///
+    /// Returns `Err` if any bucket's L1 scan failed permanently.
+    pub async fn wait_for_initial_scan(&self) -> Result<(), S3Error> {
         use std::sync::atomic::Ordering;
         loop {
-            let all_done = self
-                .scan_app_state
-                .buckets
-                .values()
-                .all(|s| s.l1_completed_once.load(Ordering::Acquire));
-            if all_done {
-                return;
+            let mut all_done = true;
+            for state in self.scan_app_state.buckets.values() {
+                if state.l1_failed.load(Ordering::Acquire) {
+                    return Err(S3Error::InternalError);
+                }
+                if !state.l1_completed_once.load(Ordering::Acquire) {
+                    all_done = false;
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if all_done {
+                return Ok(());
+            }
+            self.scan_app_state.l1_notify.notified().await;
         }
     }
 
@@ -785,6 +791,7 @@ impl Shoebox {
     }
 }
 
+#[derive(Default)]
 pub struct ShoeboxBuilder {
     paths: Vec<PathBuf>,
     host: Option<String>,
@@ -793,20 +800,6 @@ pub struct ShoeboxBuilder {
     global_config: Option<GlobalConfig>,
     config_file: Option<PathBuf>,
     external_schedulers: HashMap<String, taskmill::Scheduler>,
-}
-
-impl Default for ShoeboxBuilder {
-    fn default() -> Self {
-        Self {
-            paths: Vec::new(),
-            host: None,
-            port: None,
-            data_dir: None,
-            global_config: None,
-            config_file: None,
-            external_schedulers: HashMap::new(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -956,10 +949,12 @@ impl ShoeboxBuilder {
                             root: r.root.clone(),
                             l1_running: AtomicBool::new(false),
                             l1_completed_once: AtomicBool::new(false),
+                            l1_failed: AtomicBool::new(false),
                         },
                     )
                 })
                 .collect(),
+            l1_notify: tokio::sync::Notify::new(),
         });
 
         // ── Phase 3: Build per-bucket taskmill Schedulers ───────────
@@ -1484,7 +1479,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        shoebox.wait_for_initial_scan().await;
+        shoebox.wait_for_initial_scan().await.unwrap();
 
         let objects = collect_objects(&shoebox, "photos").await;
         assert_eq!(objects.len(), 2);
@@ -1509,7 +1504,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        shoebox.wait_for_initial_scan().await;
+        shoebox.wait_for_initial_scan().await.unwrap();
 
         let objects = collect_objects(&shoebox, "mybucket").await;
 
@@ -1532,7 +1527,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        shoebox.wait_for_initial_scan().await;
+        shoebox.wait_for_initial_scan().await.unwrap();
 
         // Upload via API
         let data = Bytes::from_static(b"uploaded via API");
@@ -1588,12 +1583,12 @@ mod tests {
             .build()
             .await
             .unwrap();
-        shoebox.wait_for_initial_scan().await;
+        shoebox.wait_for_initial_scan().await.unwrap();
 
         // Files already discovered by background L1, so re-scan should find 0 new
         let report = shoebox.scan_l1("scantest").await.unwrap();
         assert_eq!(report.discovered, 0);
-        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.skipped, 1); // unchanged file detected by inode/size match
 
         // Add a new file
         std::fs::write(bucket_dir.join("b.txt"), "b").unwrap();
@@ -1602,7 +1597,7 @@ mod tests {
         // discovered by the background filesystem watcher before scan_l1
         // runs, so we check the total rather than asserting discovered == 1.
         let report = shoebox.scan_l1("scantest").await.unwrap();
-        assert_eq!(report.discovered + report.unchanged, 2);
+        assert_eq!(report.discovered + report.skipped, 2);
     }
 
     #[tokio::test]
@@ -1726,7 +1721,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        shoebox.wait_for_initial_scan().await;
+        shoebox.wait_for_initial_scan().await.unwrap();
 
         // Get the original object's id
         let original = shoebox
@@ -2034,7 +2029,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        shoebox.wait_for_initial_scan().await;
+        shoebox.wait_for_initial_scan().await.unwrap();
 
         // Files are at L1, not L3 — FindBucketDuplicates should fail with ScanPending
         let err = shoebox
@@ -2266,7 +2261,7 @@ mod tests {
         assert!(objects_before.len() <= 2);
 
         // wait_for_initial_scan should resolve once L1 completes
-        shoebox.wait_for_initial_scan().await;
+        shoebox.wait_for_initial_scan().await.unwrap();
 
         let objects = collect_objects(&shoebox, "bgtest").await;
         assert_eq!(objects.len(), 2);

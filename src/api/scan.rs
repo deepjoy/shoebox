@@ -31,6 +31,8 @@ pub struct BucketStatus {
     is_paused: bool,
     #[serde(rename = "L1Running")]
     l1_running: bool,
+    #[serde(rename = "L1Failed")]
+    l1_failed: bool,
     #[serde(rename = "RunningTask")]
     running_tasks: Vec<TaskEntry>,
     #[serde(rename = "Progress")]
@@ -76,11 +78,12 @@ pub async fn scan_status(State(state): State<AppState>) -> XmlResponse<ScanStatu
             Err(_) => continue,
         };
 
-        let l1_running = state
-            .scan_app_state
-            .buckets
-            .get(name)
+        let scan_state = state.scan_app_state.buckets.get(name);
+        let l1_running = scan_state
             .map(|s| s.l1_running.load(Ordering::Acquire))
+            .unwrap_or(false);
+        let l1_failed = scan_state
+            .map(|s| s.l1_failed.load(Ordering::Acquire))
             .unwrap_or(false);
 
         buckets.push(BucketStatus {
@@ -92,6 +95,7 @@ pub async fn scan_status(State(state): State<AppState>) -> XmlResponse<ScanStatu
             max_concurrency: snapshot.max_concurrency,
             is_paused: snapshot.is_paused,
             l1_running,
+            l1_failed,
             running_tasks: snapshot
                 .running
                 .iter()
