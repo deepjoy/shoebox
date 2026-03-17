@@ -50,6 +50,8 @@ pub struct AppState {
     pub bucket_names: Arc<Vec<String>>,
     /// Async integrity check results, keyed by check_id.
     pub integrity_checks: IntegrityCheckStore,
+    /// Scan state shared with taskmill executors (exposes per-bucket progress).
+    pub scan_app_state: Arc<crate::scanner::app_state::ScanAppState>,
     /// Shutdown token for cancelling background tasks.
     pub shutdown_token: tokio_util::sync::CancellationToken,
 }

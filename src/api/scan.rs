@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use axum::extract::State;
 use serde::Serialize;
 
@@ -27,6 +29,8 @@ pub struct BucketStatus {
     max_concurrency: usize,
     #[serde(rename = "IsPaused")]
     is_paused: bool,
+    #[serde(rename = "L1Running")]
+    l1_running: bool,
     #[serde(rename = "RunningTask")]
     running_tasks: Vec<TaskEntry>,
     #[serde(rename = "Progress")]
@@ -72,6 +76,13 @@ pub async fn scan_status(State(state): State<AppState>) -> XmlResponse<ScanStatu
             Err(_) => continue,
         };
 
+        let l1_running = state
+            .scan_app_state
+            .buckets
+            .get(name)
+            .map(|s| s.l1_running.load(Ordering::Acquire))
+            .unwrap_or(false);
+
         buckets.push(BucketStatus {
             name: name.clone(),
             running_count: snapshot.running.len(),
@@ -80,6 +91,7 @@ pub async fn scan_status(State(state): State<AppState>) -> XmlResponse<ScanStatu
             pressure: snapshot.pressure,
             max_concurrency: snapshot.max_concurrency,
             is_paused: snapshot.is_paused,
+            l1_running,
             running_tasks: snapshot
                 .running
                 .iter()

@@ -11,6 +11,7 @@ pub mod types;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use axum::Router;
@@ -83,6 +84,7 @@ pub type ListStream<'a> =
 pub struct Shoebox {
     buckets: Arc<HashMap<String, LoadedBucket>>,
     credential_provider: Arc<tokio::sync::RwLock<CredentialProvider>>,
+    scan_app_state: Arc<ScanAppState>,
     host: String,
     port: u16,
     shutdown_token: CancellationToken,
@@ -372,6 +374,26 @@ impl Shoebox {
         levels::scan_l1(&b.metadata, b.storage.root(), &ScanScope::Bucket).await
     }
 
+    /// Wait until the background L1 scan has completed for every bucket.
+    ///
+    /// L1 runs as a background taskmill task after `build()`. This method
+    /// polls the `l1_completed_once` flag on each bucket until all are
+    /// `true`, sleeping briefly between checks.
+    pub async fn wait_for_initial_scan(&self) {
+        use std::sync::atomic::Ordering;
+        loop {
+            let all_done = self
+                .scan_app_state
+                .buckets
+                .values()
+                .all(|s| s.l1_completed_once.load(Ordering::Acquire));
+            if all_done {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Trigger sync for a bucket — submits L1 (HIGH) + L2 (NORMAL) tasks
     /// to TaskMill and returns immediately.
     ///
@@ -603,6 +625,7 @@ impl Shoebox {
             credential_provider: self.credential_provider.clone(),
             bucket_names: Arc::new(self.buckets.keys().cloned().collect()),
             integrity_checks: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            scan_app_state: self.scan_app_state.clone(),
             shutdown_token: self.shutdown_token.clone(),
         }
     }
@@ -762,7 +785,6 @@ impl Shoebox {
     }
 }
 
-#[derive(Default)]
 pub struct ShoeboxBuilder {
     paths: Vec<PathBuf>,
     host: Option<String>,
@@ -771,6 +793,20 @@ pub struct ShoeboxBuilder {
     global_config: Option<GlobalConfig>,
     config_file: Option<PathBuf>,
     external_schedulers: HashMap<String, taskmill::Scheduler>,
+}
+
+impl Default for ShoeboxBuilder {
+    fn default() -> Self {
+        Self {
+            paths: Vec::new(),
+            host: None,
+            port: None,
+            data_dir: None,
+            global_config: None,
+            config_file: None,
+            external_schedulers: HashMap::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -896,21 +932,6 @@ impl ShoeboxBuilder {
                 .await
                 .map_err(|e| ShoeboxError::Other(e.into()))?;
 
-            // Blocking L1 scan — discover files before serving so that
-            // list_objects returns results immediately after build().
-            let l1_report = levels::scan_l1(&metadata, &state.root, &ScanScope::Bucket)
-                .await
-                .map_err(|e| ShoeboxError::Other(e.into()))?;
-            if l1_report.discovered > 0 || l1_report.deleted > 0 {
-                tracing::info!(
-                    bucket = %state.name,
-                    discovered = l1_report.discovered,
-                    deleted = l1_report.deleted,
-                    unchanged = l1_report.unchanged,
-                    "L1 scan complete"
-                );
-            }
-
             resolved.push(ResolvedBucket {
                 name: state.name,
                 config: state.config,
@@ -933,6 +954,8 @@ impl ShoeboxBuilder {
                         BucketScanState {
                             metadata: r.metadata.clone(),
                             root: r.root.clone(),
+                            l1_running: AtomicBool::new(false),
+                            l1_completed_once: AtomicBool::new(false),
                         },
                     )
                 })
@@ -976,19 +999,14 @@ impl ShoeboxBuilder {
                 sched
             };
 
-            // Submit initial background L2+L3 scan tasks.
+            // Submit background L1 scan that cascades to L2+L3.
+            tracing::info!(bucket = %r.name, "L1 scan scheduled (background)");
             let _ = scheduler
-                .submit_typed(&ScanL2Task {
+                .submit_typed(&ScanL1Task {
                     bucket: r.name.clone(),
-                    cursor: None,
+                    scope: ScanScope::Bucket,
+                    target_level: 3,
                     priority: None,
-                })
-                .await;
-            let _ = scheduler
-                .submit_typed(&ScanL3Task {
-                    bucket: r.name.clone(),
-                    cursor: None,
-                    bytes_per_sec: None,
                 })
                 .await;
 
@@ -1074,6 +1092,7 @@ impl ShoeboxBuilder {
         Ok(Shoebox {
             buckets: Arc::new(buckets),
             credential_provider,
+            scan_app_state,
             host,
             port,
             shutdown_token,
@@ -1465,8 +1484,8 @@ mod tests {
             .build()
             .await
             .unwrap();
+        shoebox.wait_for_initial_scan().await;
 
-        // L1 scan should have discovered the files during build()
         let objects = collect_objects(&shoebox, "photos").await;
         assert_eq!(objects.len(), 2);
         let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
@@ -1490,6 +1509,7 @@ mod tests {
             .build()
             .await
             .unwrap();
+        shoebox.wait_for_initial_scan().await;
 
         let objects = collect_objects(&shoebox, "mybucket").await;
 
@@ -1512,6 +1532,7 @@ mod tests {
             .build()
             .await
             .unwrap();
+        shoebox.wait_for_initial_scan().await;
 
         // Upload via API
         let data = Bytes::from_static(b"uploaded via API");
@@ -1567,8 +1588,9 @@ mod tests {
             .build()
             .await
             .unwrap();
+        shoebox.wait_for_initial_scan().await;
 
-        // Files already discovered on build, so re-scan should find 0 new
+        // Files already discovered by background L1, so re-scan should find 0 new
         let report = shoebox.scan_l1("scantest").await.unwrap();
         assert_eq!(report.discovered, 0);
         assert_eq!(report.unchanged, 1);
@@ -1704,6 +1726,7 @@ mod tests {
             .build()
             .await
             .unwrap();
+        shoebox.wait_for_initial_scan().await;
 
         // Get the original object's id
         let original = shoebox
@@ -2011,6 +2034,7 @@ mod tests {
             .build()
             .await
             .unwrap();
+        shoebox.wait_for_initial_scan().await;
 
         // Files are at L1, not L3 — FindBucketDuplicates should fail with ScanPending
         let err = shoebox
@@ -2216,5 +2240,38 @@ mod tests {
 
         // Give the background task time to complete
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test]
+    async fn test_background_l1_scan_deferred() {
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().join("bgtest");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        // Create files before building Shoebox
+        std::fs::write(bucket_dir.join("a.txt"), "aaa").unwrap();
+        std::fs::write(bucket_dir.join("b.txt"), "bbb").unwrap();
+
+        // L1 now always runs in the background
+        let shoebox = Shoebox::builder()
+            .bucket(&bucket_dir)
+            .build()
+            .await
+            .unwrap();
+
+        // Immediately after build(), catalog may be empty (L1 hasn't run yet)
+        let objects_before = collect_objects(&shoebox, "bgtest").await;
+        // We don't assert == 0 because L1 *might* have already run on a fast machine,
+        // but we DO verify the server is operational.
+        assert!(objects_before.len() <= 2);
+
+        // wait_for_initial_scan should resolve once L1 completes
+        shoebox.wait_for_initial_scan().await;
+
+        let objects = collect_objects(&shoebox, "bgtest").await;
+        assert_eq!(objects.len(), 2);
+        let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
+        assert!(keys.contains(&"a.txt"));
+        assert!(keys.contains(&"b.txt"));
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 
 use crate::metadata::MetadataStore;
 
@@ -15,4 +16,10 @@ pub struct ScanAppState {
 pub struct BucketScanState {
     pub metadata: MetadataStore,
     pub root: PathBuf,
+    /// `true` while a bucket-wide L1 scan is executing. Set before
+    /// `scan_l1()` starts and cleared when it finishes.
+    pub l1_running: AtomicBool,
+    /// Set to `true` once the first bucket-wide L1 scan has completed.
+    /// Used by `Shoebox::wait_for_initial_scan()`.
+    pub l1_completed_once: AtomicBool,
 }

@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use serde::{Deserialize, Serialize};
 use taskmill::{TaskContext, TaskError, TaskExecutor, TypedTask};
 
@@ -104,15 +106,27 @@ impl TaskExecutor for ScanL1Executor {
             ))
         })?;
 
-        levels::scan_l1(&bucket_state.metadata, &bucket_state.root, &task.scope)
-            .await
-            .map_err(|e| {
-                if e.is_retryable() {
-                    TaskError::retryable(format!("L1 scan failed: {e}"))
-                } else {
-                    TaskError::new(format!("L1 scan failed: {e}"))
-                }
-            })?;
+        if matches!(task.scope, ScanScope::Bucket) {
+            bucket_state.l1_running.store(true, Ordering::Release);
+        }
+
+        let result =
+            levels::scan_l1(&bucket_state.metadata, &bucket_state.root, &task.scope).await;
+
+        if matches!(task.scope, ScanScope::Bucket) {
+            bucket_state.l1_running.store(false, Ordering::Release);
+            if result.is_ok() {
+                bucket_state.l1_completed_once.store(true, Ordering::Release);
+            }
+        }
+
+        result.map_err(|e| {
+            if e.is_retryable() {
+                TaskError::retryable(format!("L1 scan failed: {e}"))
+            } else {
+                TaskError::new(format!("L1 scan failed: {e}"))
+            }
+        })?;
 
         // Schedule downstream L2 (and optionally L3) if target_level warrants it.
         // Propagate the current task's priority to downstream scans.
