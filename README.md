@@ -11,11 +11,13 @@ A local S3-compatible server for your files. Find duplicates, verify integrity, 
 
 ## Install
 
+**Prerequisites:** [Docker](https://docs.docker.com/get-docker/) must be installed for the recommended method. Check with `docker --version`.
+
 ```bash
 # Docker (recommended)
 docker pull ghcr.io/deepjoy/shoebox:latest
 
-# Or via Cargo
+# Or via Cargo (no Docker needed)
 cargo install shoebox
 ```
 

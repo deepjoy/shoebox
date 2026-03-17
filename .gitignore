@@ -25,3 +25,5 @@ target
 
 # Per-bucket metadata directory (contains credentials)
 .shoebox/
+
+plans
