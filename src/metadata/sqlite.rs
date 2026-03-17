@@ -13,6 +13,30 @@ use crate::error::S3Error;
 use crate::types::ChecksumValues;
 
 // ---------------------------------------------------------------------------
+// KnownFiles — in-memory catalog snapshot for incremental L1 scanning
+// ---------------------------------------------------------------------------
+
+/// Identity of a file in the catalog, used for change detection.
+#[derive(Debug, Clone)]
+pub struct FileIdentity {
+    pub inode: Option<i64>,
+    pub device_id: Option<i64>,
+    pub size: Option<i64>,
+}
+
+/// Preloaded catalog snapshot for incremental L1 scanning.
+///
+/// Contains two lookup maps:
+/// - `by_key`: for checking if a file at a given location is unchanged
+/// - `by_inode`: for detecting file moves (same inode, different path)
+pub struct KnownFiles {
+    /// `(parent_dir_id, name) → FileIdentity`
+    pub by_key: HashMap<(i64, String), FileIdentity>,
+    /// `(inode, device_id) → (parent_dir_id, name)` for move detection
+    pub by_inode: HashMap<(i64, i64), (i64, String)>,
+}
+
+// ---------------------------------------------------------------------------
 // SqliteTimestamp — newtype for storing OffsetDateTime as INTEGER (epoch nanos)
 // ---------------------------------------------------------------------------
 
@@ -1397,6 +1421,103 @@ impl MetadataStore {
         Ok((keys, exhausted, cumulative))
     }
 
+    /// Load all known files from the catalog for incremental L1 scanning.
+    ///
+    /// Returns a `KnownFiles` struct containing two lookup maps:
+    /// - `by_key`: `(parent_dir_id, name) → FileIdentity` for quick unchanged-file detection
+    /// - `by_inode`: `(inode, device_id) → (parent_dir_id, name)` for move detection
+    ///
+    /// Memory usage: ~30 MB for 100K files with average 100-byte keys.
+    pub(crate) async fn l1_scan_load_known_files(&self) -> Result<KnownFiles, S3Error> {
+        type Row = (String, i64, Option<i64>, Option<i64>, Option<i64>);
+        let rows: Vec<Row> =
+            sqlx::query_as("SELECT name, parent_dir_id, inode, device_id, size FROM objects")
+                .fetch_all(&self.pool)
+                .await?;
+
+        let mut by_key = HashMap::with_capacity(rows.len());
+        let mut by_inode: HashMap<(i64, i64), (i64, String)> = HashMap::new();
+
+        for (name, parent_dir_id, inode, device_id, size) in rows {
+            by_key.insert(
+                (parent_dir_id, name.clone()),
+                FileIdentity {
+                    inode,
+                    device_id,
+                    size,
+                },
+            );
+            if let (Some(ino), Some(dev)) = (inode, device_id) {
+                by_inode.insert((ino, dev), (parent_dir_id, name));
+            }
+        }
+
+        Ok(KnownFiles { by_key, by_inode })
+    }
+
+    /// Delete stale objects whose keys were not seen during the incremental walk.
+    ///
+    /// Takes a set of `(parent_dir_id, name)` tuples representing all files that
+    /// were observed during the walk. Any object NOT in this set is deleted.
+    /// Returns the number of deleted rows.
+    pub(crate) async fn l1_scan_delete_stale(
+        &self,
+        seen: &std::collections::HashSet<(i64, String)>,
+        scan_start: SqliteTimestamp,
+    ) -> Result<u64, S3Error> {
+        // Only consider objects that existed before the scan started.
+        // Objects created after scan_start (e.g. via concurrent API uploads)
+        // are excluded to avoid a race where put_object inserts a record that
+        // the filesystem walk never saw.
+        let all_objects: Vec<(i64, String)> =
+            sqlx::query_as("SELECT parent_dir_id, name FROM objects WHERE created_at < ?")
+                .bind(scan_start)
+                .fetch_all(&self.pool)
+                .await?;
+
+        let mut deleted: u64 = 0;
+        for (parent_dir_id, name) in all_objects {
+            if !seen.contains(&(parent_dir_id, name.clone())) {
+                let result =
+                    sqlx::query("DELETE FROM objects WHERE parent_dir_id = ? AND name = ?")
+                        .bind(parent_dir_id)
+                        .bind(&name)
+                        .execute(&self.pool)
+                        .await?;
+                deleted += result.rows_affected();
+            }
+        }
+
+        Ok(deleted)
+    }
+
+    /// Apply a file move detected during incremental L1 scanning.
+    ///
+    /// Updates the existing object row to reflect the new location, preserving
+    /// the object ID and all other metadata.
+    pub(crate) async fn l1_scan_apply_move(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        old_parent_dir_id: i64,
+        old_name: &str,
+        new_parent_dir_id: i64,
+        new_name: &str,
+        now: SqliteTimestamp,
+    ) -> Result<(), S3Error> {
+        sqlx::query(
+            "UPDATE objects SET name = ?, parent_dir_id = ?, last_modified = ? \
+             WHERE parent_dir_id = ? AND name = ?",
+        )
+        .bind(new_name)
+        .bind(new_parent_dir_id)
+        .bind(now)
+        .bind(old_parent_dir_id)
+        .bind(old_name)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     /// Begin an L1 scan session by acquiring a dedicated connection and creating
     /// a temp table to collect discovered disk keys. The returned connection must
     /// be reused for all subsequent `l1_scan_*` calls so the temp table remains
@@ -1426,7 +1547,11 @@ impl MetadataStore {
         Ok(conn)
     }
 
-    /// Batch-insert discovered disk files into the L1 temp table.
+    /// Batch-insert discovered disk files into the L1 temp table using
+    /// multi-value INSERT statements to reduce per-statement overhead.
+    ///
+    /// Each statement inserts up to `MULTI_INSERT_CHUNK` rows (500 × 11 cols =
+    /// 5500 bind params, well within SQLite's 32766 limit).
     pub(crate) async fn l1_scan_insert_batch(
         conn: &mut sqlx::SqliteConnection,
         records: &[ObjectRecord],
@@ -1434,27 +1559,38 @@ impl MetadataStore {
         if records.is_empty() {
             return Ok(());
         }
+
+        /// Max rows per multi-value INSERT (500 × 11 cols = 5500 params).
+        const MULTI_INSERT_CHUNK: usize = 500;
+
         let mut tx = sqlx::Acquire::begin(&mut *conn).await?;
-        for obj in records {
-            sqlx::query(
+        for chunk in records.chunks(MULTI_INSERT_CHUNK) {
+            let placeholders: String = (0..chunk.len())
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
                 "INSERT OR IGNORE INTO l1_disk (
                     name, parent_dir_id, id, is_symlink, symlink_target,
                     size, inode, device_id, content_type_id, last_modified, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&obj.name)
-            .bind(obj.parent_dir_id)
-            .bind(&obj.id)
-            .bind(obj.is_symlink)
-            .bind(&obj.symlink_target)
-            .bind(obj.size)
-            .bind(obj.inode)
-            .bind(obj.device_id)
-            .bind(obj.content_type_id)
-            .bind(obj.last_modified)
-            .bind(obj.created_at)
-            .execute(&mut *tx)
-            .await?;
+                ) VALUES {placeholders}"
+            );
+            let mut query = sqlx::query(&sql);
+            for obj in chunk {
+                query = query
+                    .bind(&obj.name)
+                    .bind(obj.parent_dir_id)
+                    .bind(&obj.id)
+                    .bind(obj.is_symlink)
+                    .bind(&obj.symlink_target)
+                    .bind(obj.size)
+                    .bind(obj.inode)
+                    .bind(obj.device_id)
+                    .bind(obj.content_type_id)
+                    .bind(obj.last_modified)
+                    .bind(obj.created_at);
+            }
+            query.execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(())
