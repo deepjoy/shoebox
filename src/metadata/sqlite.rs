@@ -1547,7 +1547,11 @@ impl MetadataStore {
         Ok(conn)
     }
 
-    /// Batch-insert discovered disk files into the L1 temp table.
+    /// Batch-insert discovered disk files into the L1 temp table using
+    /// multi-value INSERT statements to reduce per-statement overhead.
+    ///
+    /// Each statement inserts up to `MULTI_INSERT_CHUNK` rows (500 × 11 cols =
+    /// 5500 bind params, well within SQLite's 32766 limit).
     pub(crate) async fn l1_scan_insert_batch(
         conn: &mut sqlx::SqliteConnection,
         records: &[ObjectRecord],
@@ -1555,27 +1559,38 @@ impl MetadataStore {
         if records.is_empty() {
             return Ok(());
         }
+
+        /// Max rows per multi-value INSERT (500 × 11 cols = 5500 params).
+        const MULTI_INSERT_CHUNK: usize = 500;
+
         let mut tx = sqlx::Acquire::begin(&mut *conn).await?;
-        for obj in records {
-            sqlx::query(
+        for chunk in records.chunks(MULTI_INSERT_CHUNK) {
+            let placeholders: String = (0..chunk.len())
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
                 "INSERT OR IGNORE INTO l1_disk (
                     name, parent_dir_id, id, is_symlink, symlink_target,
                     size, inode, device_id, content_type_id, last_modified, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&obj.name)
-            .bind(obj.parent_dir_id)
-            .bind(&obj.id)
-            .bind(obj.is_symlink)
-            .bind(&obj.symlink_target)
-            .bind(obj.size)
-            .bind(obj.inode)
-            .bind(obj.device_id)
-            .bind(obj.content_type_id)
-            .bind(obj.last_modified)
-            .bind(obj.created_at)
-            .execute(&mut *tx)
-            .await?;
+                ) VALUES {placeholders}"
+            );
+            let mut query = sqlx::query(&sql);
+            for obj in chunk {
+                query = query
+                    .bind(&obj.name)
+                    .bind(obj.parent_dir_id)
+                    .bind(&obj.id)
+                    .bind(obj.is_symlink)
+                    .bind(&obj.symlink_target)
+                    .bind(obj.size)
+                    .bind(obj.inode)
+                    .bind(obj.device_id)
+                    .bind(obj.content_type_id)
+                    .bind(obj.last_modified)
+                    .bind(obj.created_at);
+            }
+            query.execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(())

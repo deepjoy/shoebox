@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use async_walkdir::{Filtering, WalkDir};
@@ -87,6 +87,10 @@ pub async fn scan_l1(
 
     // Phase 2: Acquire a dedicated connection and create a temp table for NEW disk keys.
     let mut conn = metadata.l1_scan_begin().await?;
+
+    // Local caches to avoid per-file DB round-trips
+    let mut dir_cache: HashMap<String, i64> = HashMap::with_capacity(known_count / 10);
+    let mut ct_cache: HashMap<String, i64> = HashMap::new();
 
     // Track all seen keys for deletion detection
     let mut seen: HashSet<(i64, String)> = HashSet::with_capacity(known_count);
@@ -178,7 +182,14 @@ pub async fn scan_l1(
             .rsplit_once('/')
             .map(|(p, _)| p.to_string())
             .unwrap_or_default();
-        let dir_id = metadata.get_or_create_dir_id(&parent).await?;
+        let dir_id = match dir_cache.get(&parent) {
+            Some(&id) => id,
+            None => {
+                let id = metadata.get_or_create_dir_id(&parent).await?;
+                dir_cache.insert(parent.clone(), id);
+                id
+            }
+        };
         let (_, filename) = crate::metadata::sqlite::split_key(&key);
         let filename = filename.to_string();
 
@@ -237,9 +248,16 @@ pub async fn scan_l1(
         let content_type = mime_guess::from_path(&key)
             .first_or_octet_stream()
             .to_string();
-        let ct_id = metadata
-            .get_or_create_content_type_id(&content_type)
-            .await?;
+        let ct_id = match ct_cache.get(&content_type) {
+            Some(&id) => id,
+            None => {
+                let id = metadata
+                    .get_or_create_content_type_id(&content_type)
+                    .await?;
+                ct_cache.insert(content_type.clone(), id);
+                id
+            }
+        };
 
         let now = SqliteTimestamp::now();
         let obj = ObjectRecord {
