@@ -24,7 +24,10 @@ fn write_outputs(
     collapsed_out: &mut impl Write,
     label: &str,
 ) {
-    let report = guard.report().build().expect("failed to build profile report");
+    let report = guard
+        .report()
+        .build()
+        .expect("failed to build profile report");
 
     // Write SVG flamegraph
     let mut file = File::create(svg_path).expect("failed to create SVG file");
@@ -38,9 +41,12 @@ fn write_outputs(
     // Append collapsed stacks to text file
     writeln!(collapsed_out, "=== {label} ===").unwrap();
     for (frames, count) in report.data.iter() {
-        let stack: Vec<String> = frames.frames.iter().rev().map(|f| {
-            f.iter().map(|s| s.name()).collect::<Vec<_>>().join("|")
-        }).collect();
+        let stack: Vec<String> = frames
+            .frames
+            .iter()
+            .rev()
+            .map(|f| f.iter().map(|s| s.name()).collect::<Vec<_>>().join("|"))
+            .collect();
         writeln!(collapsed_out, "{} {}", stack.join(";"), count).unwrap();
     }
     writeln!(collapsed_out).unwrap();
@@ -81,7 +87,13 @@ async fn main() {
     let report = scan_l1(&metadata, &root, &ScanScope::Bucket).await.unwrap();
     let elapsed = t0.elapsed();
     eprintln!("  {elapsed:.2?} — {report:#?}");
-    write_outputs(guard, "flamegraph_l1_cold.svg", format!("L1 cold scan: {dir} ({elapsed:.2?})"), &mut collapsed, &format!("COLD ({elapsed:.2?}, {dir})"));
+    write_outputs(
+        guard,
+        "flamegraph_l1_cold.svg",
+        format!("L1 cold scan: {dir} ({elapsed:.2?})"),
+        &mut collapsed,
+        &format!("COLD ({elapsed:.2?}, {dir})"),
+    );
 
     // === Pass 2: Warm scan (full catalog → all skips) ===
     eprintln!("=== Pass 2 (warm): {dir} ===");
@@ -90,7 +102,13 @@ async fn main() {
     let report = scan_l1(&metadata, &root, &ScanScope::Bucket).await.unwrap();
     let elapsed = t0.elapsed();
     eprintln!("  {elapsed:.2?} — {report:#?}");
-    write_outputs(guard, "flamegraph_l1_warm.svg", format!("L1 warm scan: {dir} ({elapsed:.2?})"), &mut collapsed, &format!("WARM ({elapsed:.2?}, {dir})"));
+    write_outputs(
+        guard,
+        "flamegraph_l1_warm.svg",
+        format!("L1 warm scan: {dir} ({elapsed:.2?})"),
+        &mut collapsed,
+        &format!("WARM ({elapsed:.2?}, {dir})"),
+    );
 
     eprintln!("=== Flamegraphs + profile_l1.txt written ===");
 }
