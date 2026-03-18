@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/deepjoy/shoebox/compare/v0.5.1...v0.5.2) - 2026-03-18
+
+### Fixed
+
+- remove debug symbols from release profile to reduce binary size ([#92](https://github.com/deepjoy/shoebox/pull/92))
+
 ## [0.5.1](https://github.com/deepjoy/shoebox/compare/v0.5.0...v0.5.1) - 2026-03-18
 
 ### Other
