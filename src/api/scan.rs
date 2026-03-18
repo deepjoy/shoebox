@@ -113,8 +113,8 @@ pub async fn scan_status(State(state): State<AppState>) -> XmlResponse<ScanStatu
                 .progress
                 .iter()
                 .map(|p| ProgressEntry {
-                    task_id: p.task_id,
-                    task_type: p.task_type.clone(),
+                    task_id: p.header.task_id,
+                    task_type: p.header.task_type.clone(),
                     percent: p.percent,
                 })
                 .collect(),

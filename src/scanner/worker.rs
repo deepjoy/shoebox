@@ -40,12 +40,15 @@ pub async fn run_watch_processor(
                         dropped_events = dropped,
                         "Watch channel overflow — scheduling full reconcile to catch missed files"
                     );
-                    let _ = scheduler.submit_typed_at(&ScanL1Task {
-                        bucket: bucket_name.clone(),
-                        scope: ScanScope::Bucket,
-                        target_level: 3,
-                        priority: None,
-                    }, taskmill::Priority::BACKGROUND).await;
+                    let _ = scheduler.module("scanner")
+                        .submit_typed(&ScanL1Task {
+                            bucket: bucket_name.clone(),
+                            scope: ScanScope::Bucket,
+                            target_level: 3,
+                            priority: None,
+                        })
+                        .priority(taskmill::Priority::BACKGROUND)
+                        .await;
                 }
             }
             event = rx.recv() => {
@@ -69,12 +72,13 @@ pub async fn run_watch_processor(
                                 if needs_scan {
                                     // Submit L2+L3 for the changed file.
                                     // The file is already in the DB at scan_level 1.
-                                    let _ = scheduler.submit_typed(&ScanL2Task {
+                                    let scanner = scheduler.module("scanner");
+                                    let _ = scanner.submit_typed(&ScanL2Task {
                                         bucket: bucket_name.clone(),
                                         cursor: None,
                                         priority: None,
                                     }).await;
-                                    let _ = scheduler.submit_typed(&ScanL3Task {
+                                    let _ = scanner.submit_typed(&ScanL3Task {
                                         bucket: bucket_name.clone(),
                                         cursor: None,
                                         bytes_per_sec: None,
