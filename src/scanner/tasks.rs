@@ -143,26 +143,24 @@ impl TaskExecutor for ScanL1Executor {
 
         if task.target_level >= 2 {
             let _ = ctx
-                .submit_typed_at(
-                    &ScanL2Task {
-                        bucket: task.bucket.clone(),
-                        cursor: None,
-                        priority: None,
-                    },
-                    priority,
-                )
+                .current_module()
+                .submit_typed(&ScanL2Task {
+                    bucket: task.bucket.clone(),
+                    cursor: None,
+                    priority: None,
+                })
+                .priority(priority)
                 .await;
         }
         if task.target_level >= 3 {
             let _ = ctx
-                .submit_typed_at(
-                    &ScanL3Task {
-                        bucket: task.bucket.clone(),
-                        cursor: None,
-                        bytes_per_sec: None,
-                    },
-                    priority,
-                )
+                .current_module()
+                .submit_typed(&ScanL3Task {
+                    bucket: task.bucket.clone(),
+                    cursor: None,
+                    bytes_per_sec: None,
+                })
+                .priority(priority)
                 .await;
         }
 
@@ -231,14 +229,13 @@ impl TaskExecutor for ScanL2Executor {
         // Schedule continuation if more keys remain.
         if has_remaining {
             let _ = ctx
-                .submit_typed_at(
-                    &ScanL2Task {
-                        bucket: task.bucket.clone(),
-                        cursor: keys.last().cloned(),
-                        priority: None,
-                    },
-                    ctx.record().priority,
-                )
+                .current_module()
+                .submit_typed(&ScanL2Task {
+                    bucket: task.bucket.clone(),
+                    cursor: keys.last().cloned(),
+                    priority: None,
+                })
+                .priority(ctx.record().priority)
                 .await;
         }
 
@@ -354,14 +351,13 @@ impl TaskExecutor for ScanL3Executor {
         // Schedule continuation if more keys remain.
         if has_remaining {
             let _ = ctx
-                .submit_typed_at(
-                    &ScanL3Task {
-                        bucket: task.bucket.clone(),
-                        cursor: keys.last().cloned(),
-                        bytes_per_sec: new_bytes_per_sec,
-                    },
-                    ctx.record().priority,
-                )
+                .current_module()
+                .submit_typed(&ScanL3Task {
+                    bucket: task.bucket.clone(),
+                    cursor: keys.last().cloned(),
+                    bytes_per_sec: new_bytes_per_sec,
+                })
+                .priority(ctx.record().priority)
                 .await;
         }
 

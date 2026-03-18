@@ -12,8 +12,10 @@ use crate::scanner::tasks::{ScanL1Task, ScanL2Task};
 ///
 /// Sync is always async — it returns immediately.
 pub async fn sync(scheduler: &taskmill::Scheduler, bucket: &str) -> Result<(), S3Error> {
+    let scanner = scheduler.module("scanner");
+
     // Submit L1 at HIGH — preempts any running background scan.
-    scheduler
+    scanner
         .submit_typed(&ScanL1Task {
             bucket: bucket.to_string(),
             scope: ScanScope::Bucket,
@@ -24,7 +26,7 @@ pub async fn sync(scheduler: &taskmill::Scheduler, bucket: &str) -> Result<(), S
         .map_err(|_| S3Error::InternalError)?;
 
     // Also submit L2 at NORMAL priority.
-    scheduler
+    scanner
         .submit_typed(&ScanL2Task {
             bucket: bucket.to_string(),
             cursor: None,

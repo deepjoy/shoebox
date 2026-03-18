@@ -65,10 +65,14 @@ use std::pin::Pin;
 ///     .await?;
 /// ```
 pub fn register_scan_executors(builder: taskmill::SchedulerBuilder) -> taskmill::SchedulerBuilder {
-    builder
-        .typed_executor::<ScanL1Task, _>(Arc::new(ScanL1Executor))
-        .typed_executor::<ScanL2Task, _>(Arc::new(ScanL2Executor))
-        .typed_executor::<ScanL3Task, _>(Arc::new(ScanL3Executor))
+    builder.module(
+        taskmill::Module::new("scanner")
+            .typed_executor::<ScanL1Task, _>(Arc::new(ScanL1Executor))
+            .typed_executor::<ScanL2Task, _>(Arc::new(ScanL2Executor))
+            .typed_executor::<ScanL3Task, _>(Arc::new(ScanL3Executor))
+            .default_priority(taskmill::Priority::BACKGROUND)
+            .max_concurrency(1),
+    )
 }
 
 /// A boxed, sendable stream of list entries.
@@ -974,10 +978,13 @@ impl ShoeboxBuilder {
 
                 let sched = taskmill::Scheduler::builder()
                     .store_path(&taskmill_db_str)
-                    .typed_executor::<ScanL1Task, _>(Arc::new(ScanL1Executor))
-                    .typed_executor::<ScanL2Task, _>(Arc::new(ScanL2Executor))
-                    .typed_executor::<ScanL3Task, _>(Arc::new(ScanL3Executor))
-                    .max_concurrency(1)
+                    .module(
+                        taskmill::Module::new("scanner")
+                            .typed_executor::<ScanL1Task, _>(Arc::new(ScanL1Executor))
+                            .typed_executor::<ScanL2Task, _>(Arc::new(ScanL2Executor))
+                            .typed_executor::<ScanL3Task, _>(Arc::new(ScanL3Executor))
+                            .max_concurrency(1),
+                    )
                     .pressure_source(Box::new(ScannerResources::new(100)))
                     .throttle_policy(taskmill::ThrottlePolicy::default_three_tier())
                     .app_state_arc(scan_app_state.clone())
@@ -997,6 +1004,7 @@ impl ShoeboxBuilder {
             // Submit background L1 scan that cascades to L2+L3.
             tracing::info!(bucket = %r.name, "L1 scan scheduled (background)");
             let _ = scheduler
+                .module("scanner")
                 .submit_typed(&ScanL1Task {
                     bucket: r.name.clone(),
                     scope: ScanScope::Bucket,
