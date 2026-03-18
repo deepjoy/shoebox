@@ -154,6 +154,10 @@ See [SECURITY.md](SECURITY.md) for the security model and how to report vulnerab
 
 MIT
 
+## Disclaimer
+
+Shoebox operates directly on your existing files — it does **not** copy data into a separate storage directory. S3 operations like `DeleteObject` and `PutObject` will modify or remove real files on disk. **Back up anything irreplaceable before use.** This is pre-1.0 software provided "as is" with no warranty. See [LICENSE](LICENSE) for details. The authors are not liable for any data loss.
+
 ## Background
 
 I had 2TB of photos across 3 drives — backups of backups, originals I was afraid to delete. I set out to find duplicate photos and accidentally designed a local S3 server. If an object store knows the content hash of every file, duplicates are just a query. This is a personal project built in public — expect breaking changes before 1.0. If you have thoughts on the approach, [open an issue](https://github.com/deepjoy/shoebox/issues) or start a discussion.
