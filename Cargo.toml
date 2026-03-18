@@ -83,6 +83,7 @@ serde_json = "1.0"
 tempfile = "3"
 pprof = { version = "0.14", features = ["flamegraph"] }
 
-# Release with debug symbols for flamegraph profiling
-[profile.release]
+# Custom profile for flamegraph profiling: cargo build --profile profiling
+[profile.profiling]
+inherits = "release"
 debug = true
