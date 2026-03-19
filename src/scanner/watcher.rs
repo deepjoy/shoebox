@@ -29,6 +29,11 @@ pub struct FilesystemWatcher {
     _debouncer: notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>,
 }
 
+/// Returns `true` if the error indicates an inotify watch-limit exhaustion.
+pub fn is_watch_limit_error(err: &notify::Error) -> bool {
+    matches!(err.kind, notify::ErrorKind::MaxFilesWatch)
+}
+
 impl FilesystemWatcher {
     /// Start watching `root` recursively, sending debounced events to `tx`.
     ///
@@ -44,9 +49,17 @@ impl FilesystemWatcher {
         let mut debouncer = new_debouncer(
             Duration::from_millis(200),
             move |result: DebounceEventResult| {
-                if let Ok(events) = result {
-                    for event in events {
-                        Self::handle_event(&event, &tx, &drop_counter);
+                match result {
+                    Ok(events) => {
+                        for event in events {
+                            Self::handle_event(&event, &tx, &drop_counter);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Filesystem watcher error — some events may have been lost");
+                        // Bump the drop counter so the watch processor schedules
+                        // a full reconcile scan to catch anything we missed.
+                        drop_counter.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             },

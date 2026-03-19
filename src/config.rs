@@ -34,6 +34,18 @@ pub struct GlobalConfig {
     /// than the watch processor can consume them.
     #[serde(default)]
     pub watch_channel_capacity: Option<usize>,
+
+    /// Interval in seconds for periodic filesystem scans when the native
+    /// watcher (inotify on Linux) cannot start — typically because the
+    /// bucket contains more directories than the OS watch limit allows.
+    ///
+    /// When set, a background L1 scan runs every `N` seconds to detect
+    /// changes that would otherwise be caught by the watcher. Set to `0`
+    /// to disable the fallback entirely (rely only on the initial scan).
+    ///
+    /// Default: 60 seconds.
+    #[serde(default)]
+    pub watch_poll_interval_secs: Option<u64>,
 }
 
 /// Load a global configuration file.
