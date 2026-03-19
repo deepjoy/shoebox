@@ -877,20 +877,39 @@ impl MetadataStore {
         let mut common_prefixes = std::collections::BTreeSet::new();
         let mut cursor: Option<String> = None;
 
-        let keys = self.fetch_keys(prefix, start_after).await?;
-        for key in keys {
+        // Fetch keys in bounded chunks to avoid loading millions of rows
+        // into memory when the bucket is large.
+        let chunk_size = (max as i64 + 1) * 10;
+        let mut fetch_after = start_after.map(|s| s.to_string());
+
+        loop {
+            let keys = self
+                .fetch_keys(prefix, fetch_after.as_deref(), chunk_size)
+                .await?;
+            let chunk_len = keys.len();
+
+            for key in keys {
+                let count = object_keys.len() + common_prefixes.len();
+                if count > max {
+                    break;
+                }
+                cursor = Some(key.clone());
+                let suffix = &key[prefix_len..];
+                if let Some(pos) = suffix.find(delim) {
+                    let cp = format!("{}{}", prefix, &suffix[..pos + delim.len()]);
+                    common_prefixes.insert(cp);
+                } else {
+                    object_keys.push(key);
+                }
+            }
+
             let count = object_keys.len() + common_prefixes.len();
-            if count > max {
+            // Stop if we have enough results, or the chunk was smaller than
+            // requested (table exhausted).
+            if count > max || (chunk_len as i64) < chunk_size {
                 break;
             }
-            cursor = Some(key.clone());
-            let suffix = &key[prefix_len..];
-            if let Some(pos) = suffix.find(delim) {
-                let cp = format!("{}{}", prefix, &suffix[..pos + delim.len()]);
-                common_prefixes.insert(cp);
-            } else {
-                object_keys.push(key);
-            }
+            fetch_after = cursor.clone();
         }
 
         let count = object_keys.len() + common_prefixes.len();
@@ -1037,9 +1056,14 @@ impl MetadataStore {
         }
     }
 
-    /// Fetch only reconstructed keys for all objects matching a prefix, optionally
-    /// starting after `after`.
-    async fn fetch_keys(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>, S3Error> {
+    /// Fetch only reconstructed keys for objects matching a prefix, optionally
+    /// starting after `after`, returning at most `limit` rows.
+    async fn fetch_keys(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, S3Error> {
         let (dir_prefix, name_prefix) = split_key(prefix);
         let after_parts = after.map(|a| {
             let (dp, n) = split_key(a);
@@ -1054,13 +1078,14 @@ impl MetadataStore {
                      JOIN directories d ON o.parent_dir_id = d.id \
                      WHERE d.prefix >= ? AND d.prefix < ? \
                        AND (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
-                     ORDER BY d.prefix, o.name",
+                     ORDER BY d.prefix, o.name LIMIT ?",
                 )
                 .bind(&dir_prefix)
                 .bind(&ub)
                 .bind(&ad)
                 .bind(&ad)
                 .bind(&an)
+                .bind(limit)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(Into::into),
@@ -1068,11 +1093,12 @@ impl MetadataStore {
                     "SELECT d.prefix || o.name FROM objects o \
                      JOIN directories d ON o.parent_dir_id = d.id \
                      WHERE (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
-                     ORDER BY d.prefix, o.name",
+                     ORDER BY d.prefix, o.name LIMIT ?",
                 )
                 .bind(&ad)
                 .bind(&ad)
                 .bind(&an)
+                .bind(limit)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(Into::into),
@@ -1080,18 +1106,20 @@ impl MetadataStore {
                     "SELECT d.prefix || o.name FROM objects o \
                      JOIN directories d ON o.parent_dir_id = d.id \
                      WHERE d.prefix >= ? AND d.prefix < ? \
-                     ORDER BY d.prefix, o.name",
+                     ORDER BY d.prefix, o.name LIMIT ?",
                 )
                 .bind(&dir_prefix)
                 .bind(&ub)
+                .bind(limit)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(Into::into),
                 (None, None) => sqlx::query_scalar(
                     "SELECT d.prefix || o.name FROM objects o \
                      JOIN directories d ON o.parent_dir_id = d.id \
-                     ORDER BY d.prefix, o.name",
+                     ORDER BY d.prefix, o.name LIMIT ?",
                 )
+                .bind(limit)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(Into::into),
@@ -1106,7 +1134,7 @@ impl MetadataStore {
                      WHERE ((d.prefix = ? AND o.name >= ? AND o.name < ?) \
                          OR (d.prefix > ? AND d.prefix < ?)) \
                        AND (d.prefix > ? OR (d.prefix = ? AND o.name > ?)) \
-                     ORDER BY d.prefix, o.name",
+                     ORDER BY d.prefix, o.name LIMIT ?",
                 )
                 .bind(&dir_prefix)
                 .bind(name_prefix)
@@ -1116,6 +1144,7 @@ impl MetadataStore {
                 .bind(&ad)
                 .bind(&ad)
                 .bind(&an)
+                .bind(limit)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(Into::into),
@@ -1124,13 +1153,14 @@ impl MetadataStore {
                      JOIN directories d ON o.parent_dir_id = d.id \
                      WHERE (d.prefix = ? AND o.name >= ? AND o.name < ?) \
                         OR (d.prefix > ? AND d.prefix < ?) \
-                     ORDER BY d.prefix, o.name",
+                     ORDER BY d.prefix, o.name LIMIT ?",
                 )
                 .bind(&dir_prefix)
                 .bind(name_prefix)
                 .bind(&name_upper)
                 .bind(&dir_prefix)
                 .bind(&du)
+                .bind(limit)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(Into::into),
