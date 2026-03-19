@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/deepjoy/shoebox/compare/v0.5.2...v0.6.0) - 2026-03-19
+
+### Fixed
+
+- gracefully handle unavailable mtime in integrity checks ([#99](https://github.com/deepjoy/shoebox/pull/99))
+- fall back to periodic scans when inotify watch limit is exceeded ([#98](https://github.com/deepjoy/shoebox/pull/98))
+
+### Other
+
+- migrate taskmill from 0.4 to 0.5 domain-centric API ([#97](https://github.com/deepjoy/shoebox/pull/97))
+- paginate fetch_keys to avoid loading all rows into memory ([#96](https://github.com/deepjoy/shoebox/pull/96))
+- add data loss disclaimer to README ([#94](https://github.com/deepjoy/shoebox/pull/94))
+
 ## [0.5.2](https://github.com/deepjoy/shoebox/compare/v0.5.1...v0.5.2) - 2026-03-18
 
 ### Fixed
