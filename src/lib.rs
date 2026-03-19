@@ -32,7 +32,7 @@ use crate::scanner::scope::ScanScope;
 use crate::scanner::tasks::{
     ScanL1Executor, ScanL1Task, ScanL2Executor, ScanL2Task, ScanL3Executor, ScanL3Task, Scanner,
 };
-use crate::scanner::watcher::FilesystemWatcher;
+use crate::scanner::watcher::{self as watcher_mod, FilesystemWatcher};
 use crate::scanner::worker;
 use crate::services::copy_service::{self, CopyConditions, CopyResult};
 use crate::services::object_service::{self, GetObjectResult, PutObjectInput, PutObjectResult};
@@ -1036,11 +1036,58 @@ impl ShoeboxBuilder {
                         Some(w)
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            bucket = %r.name,
-                            error = %e,
-                            "Failed to start filesystem watcher"
-                        );
+                        let is_limit = watcher_mod::is_watch_limit_error(&e);
+                        if is_limit {
+                            tracing::warn!(
+                                bucket = %r.name,
+                                "OS watch limit exceeded (inotify) — falling back to periodic scans. \
+                                 Increase fs.inotify.max_user_watches for real-time detection."
+                            );
+                        } else {
+                            tracing::warn!(
+                                bucket = %r.name,
+                                error = %e,
+                                "Failed to start filesystem watcher — falling back to periodic scans"
+                            );
+                        }
+
+                        // Fall back to periodic L1 scans so that external
+                        // filesystem changes are still detected, just with
+                        // higher latency.
+                        let poll_secs = global_config
+                            .as_ref()
+                            .and_then(|gc| gc.watch_poll_interval_secs)
+                            .unwrap_or(60);
+                        if poll_secs > 0 {
+                            let sched = scheduler.clone();
+                            let bucket_name = r.name.clone();
+                            let token = shutdown_token.clone();
+                            tracing::info!(
+                                bucket = %bucket_name,
+                                interval_secs = poll_secs,
+                                "Starting periodic scan fallback"
+                            );
+                            tokio::spawn(async move {
+                                let interval = std::time::Duration::from_secs(poll_secs);
+                                loop {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(interval) => {}
+                                        _ = token.cancelled() => break,
+                                    }
+                                    tracing::debug!(bucket = %bucket_name, "Periodic scan fallback: scheduling L1");
+                                    let _ = sched
+                                        .domain::<Scanner>()
+                                        .submit_with(ScanL1Task {
+                                            bucket: bucket_name.clone(),
+                                            scope: ScanScope::Bucket,
+                                            target_level: 2,
+                                        })
+                                        .priority(taskmill::Priority::BACKGROUND)
+                                        .await;
+                                }
+                            });
+                        }
+
                         None
                     }
                 }
