@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::S3Error;
 use crate::metadata::MetadataStore;
 use crate::scanner::scope::ScanScope;
-use crate::scanner::tasks::{ScanL1Task, ScanL2Task, ScanL3Task};
+use crate::scanner::tasks::{ScanL1Task, ScanL2Task, ScanL3Task, Scanner};
 
 /// Process filesystem watch events — converts WatchEvents to taskmill tasks.
 pub async fn run_watch_processor(
@@ -40,12 +40,11 @@ pub async fn run_watch_processor(
                         dropped_events = dropped,
                         "Watch channel overflow — scheduling full reconcile to catch missed files"
                     );
-                    let _ = scheduler.module("scanner")
-                        .submit_typed(&ScanL1Task {
+                    let _ = scheduler.domain::<Scanner>()
+                        .submit_with(ScanL1Task {
                             bucket: bucket_name.clone(),
                             scope: ScanScope::Bucket,
                             target_level: 3,
-                            priority: None,
                         })
                         .priority(taskmill::Priority::BACKGROUND)
                         .await;
@@ -72,13 +71,12 @@ pub async fn run_watch_processor(
                                 if needs_scan {
                                     // Submit L2+L3 for the changed file.
                                     // The file is already in the DB at scan_level 1.
-                                    let scanner = scheduler.module("scanner");
-                                    let _ = scanner.submit_typed(&ScanL2Task {
+                                    let scanner = scheduler.domain::<Scanner>();
+                                    let _ = scanner.submit(ScanL2Task {
                                         bucket: bucket_name.clone(),
                                         cursor: None,
-                                        priority: None,
                                     }).await;
-                                    let _ = scanner.submit_typed(&ScanL3Task {
+                                    let _ = scanner.submit(ScanL3Task {
                                         bucket: bucket_name.clone(),
                                         cursor: None,
                                         bytes_per_sec: None,

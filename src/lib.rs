@@ -30,7 +30,7 @@ use crate::scanner::backpressure::ScannerResources;
 use crate::scanner::levels;
 use crate::scanner::scope::ScanScope;
 use crate::scanner::tasks::{
-    ScanL1Executor, ScanL1Task, ScanL2Executor, ScanL2Task, ScanL3Executor, ScanL3Task,
+    ScanL1Executor, ScanL1Task, ScanL2Executor, ScanL2Task, ScanL3Executor, ScanL3Task, Scanner,
 };
 use crate::scanner::watcher::FilesystemWatcher;
 use crate::scanner::worker;
@@ -65,11 +65,11 @@ use std::pin::Pin;
 ///     .await?;
 /// ```
 pub fn register_scan_executors(builder: taskmill::SchedulerBuilder) -> taskmill::SchedulerBuilder {
-    builder.module(
-        taskmill::Module::new("scanner")
-            .typed_executor::<ScanL1Task, _>(Arc::new(ScanL1Executor))
-            .typed_executor::<ScanL2Task, _>(Arc::new(ScanL2Executor))
-            .typed_executor::<ScanL3Task, _>(Arc::new(ScanL3Executor))
+    builder.domain(
+        taskmill::Domain::<Scanner>::new()
+            .task::<ScanL1Task>(ScanL1Executor)
+            .task::<ScanL2Task>(ScanL2Executor)
+            .task::<ScanL3Task>(ScanL3Executor)
             .default_priority(taskmill::Priority::BACKGROUND)
             .max_concurrency(1),
     )
@@ -361,11 +361,11 @@ impl Shoebox {
     pub async fn scan(&self, bucket: &str, target_level: i32) -> Result<(), S3Error> {
         let b = self.get_bucket(bucket)?;
         b.scheduler
-            .submit_typed(&ScanL1Task {
+            .domain::<Scanner>()
+            .submit(ScanL1Task {
                 bucket: bucket.to_string(),
                 scope: ScanScope::Bucket,
                 target_level,
-                priority: None,
             })
             .await
             .map_err(|_| S3Error::InternalError)?;
@@ -978,11 +978,11 @@ impl ShoeboxBuilder {
 
                 let sched = taskmill::Scheduler::builder()
                     .store_path(&taskmill_db_str)
-                    .module(
-                        taskmill::Module::new("scanner")
-                            .typed_executor::<ScanL1Task, _>(Arc::new(ScanL1Executor))
-                            .typed_executor::<ScanL2Task, _>(Arc::new(ScanL2Executor))
-                            .typed_executor::<ScanL3Task, _>(Arc::new(ScanL3Executor))
+                    .domain(
+                        taskmill::Domain::<Scanner>::new()
+                            .task::<ScanL1Task>(ScanL1Executor)
+                            .task::<ScanL2Task>(ScanL2Executor)
+                            .task::<ScanL3Task>(ScanL3Executor)
                             .max_concurrency(1),
                     )
                     .pressure_source(Box::new(ScannerResources::new(100)))
@@ -1004,12 +1004,11 @@ impl ShoeboxBuilder {
             // Submit background L1 scan that cascades to L2+L3.
             tracing::info!(bucket = %r.name, "L1 scan scheduled (background)");
             let _ = scheduler
-                .module("scanner")
-                .submit_typed(&ScanL1Task {
+                .domain::<Scanner>()
+                .submit(ScanL1Task {
                     bucket: r.name.clone(),
                     scope: ScanScope::Bucket,
                     target_level: 3,
-                    priority: None,
                 })
                 .await;
 

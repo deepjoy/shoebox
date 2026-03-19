@@ -1,11 +1,19 @@
 use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
-use taskmill::{TaskContext, TaskError, TaskExecutor, TypedTask};
+use taskmill::{DomainKey, TaskContext, TaskError, TypedExecutor, TypedTask};
 
 use crate::scanner::app_state::ScanAppState;
 use crate::scanner::levels;
 use crate::scanner::scope::ScanScope;
+
+// ── Domain key ──────────────────────────────────────────────────────
+
+pub struct Scanner;
+
+impl DomainKey for Scanner {
+    const NAME: &'static str = "scanner";
+}
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -35,21 +43,11 @@ pub struct ScanL1Task {
     pub bucket: String,
     pub scope: ScanScope,
     pub target_level: i32,
-    /// Override the default priority. When `None`, uses `TypedTask::priority()`
-    /// default (NORMAL). Sync sets this to HIGH to preempt background work.
-    #[serde(default)]
-    pub priority: Option<u8>,
 }
 
 impl TypedTask for ScanL1Task {
+    type Domain = Scanner;
     const TASK_TYPE: &'static str = "scan-l1";
-
-    fn priority(&self) -> taskmill::Priority {
-        match self.priority {
-            Some(p) => taskmill::Priority::new(p),
-            None => taskmill::Priority::NORMAL,
-        }
-    }
 }
 
 /// L2: Collect filesystem metadata (size, mtime, ctime, inode) for objects
@@ -58,21 +56,11 @@ impl TypedTask for ScanL1Task {
 pub struct ScanL2Task {
     pub bucket: String,
     pub cursor: Option<String>,
-    /// Override the default priority. When `None`, uses `TypedTask::priority()`
-    /// default (NORMAL). Sync sets this to NORMAL to run before BACKGROUND tasks.
-    #[serde(default)]
-    pub priority: Option<u8>,
 }
 
 impl TypedTask for ScanL2Task {
+    type Domain = Scanner;
     const TASK_TYPE: &'static str = "scan-l2";
-
-    fn priority(&self) -> taskmill::Priority {
-        match self.priority {
-            Some(p) => taskmill::Priority::new(p),
-            None => taskmill::Priority::NORMAL,
-        }
-    }
 }
 
 /// L3: Read files and compute content hashes (MD5 + SHA-256).
@@ -84,6 +72,7 @@ pub struct ScanL3Task {
 }
 
 impl TypedTask for ScanL3Task {
+    type Domain = Scanner;
     const TASK_TYPE: &'static str = "scan-l3";
 }
 
@@ -91,10 +80,8 @@ impl TypedTask for ScanL3Task {
 
 pub struct ScanL1Executor;
 
-impl TaskExecutor for ScanL1Executor {
-    async fn execute<'a>(&'a self, ctx: &'a TaskContext) -> Result<(), TaskError> {
-        let task: ScanL1Task = ctx.payload()?;
-
+impl TypedExecutor<ScanL1Task> for ScanL1Executor {
+    async fn execute(&self, task: ScanL1Task, ctx: &TaskContext) -> Result<(), TaskError> {
         let app = ctx
             .state::<ScanAppState>()
             .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
@@ -143,19 +130,18 @@ impl TaskExecutor for ScanL1Executor {
 
         if task.target_level >= 2 {
             let _ = ctx
-                .current_module()
-                .submit_typed(&ScanL2Task {
+                .domain::<Scanner>()
+                .submit_with(ScanL2Task {
                     bucket: task.bucket.clone(),
                     cursor: None,
-                    priority: None,
                 })
                 .priority(priority)
                 .await;
         }
         if task.target_level >= 3 {
             let _ = ctx
-                .current_module()
-                .submit_typed(&ScanL3Task {
+                .domain::<Scanner>()
+                .submit_with(ScanL3Task {
                     bucket: task.bucket.clone(),
                     cursor: None,
                     bytes_per_sec: None,
@@ -170,10 +156,8 @@ impl TaskExecutor for ScanL1Executor {
 
 pub struct ScanL2Executor;
 
-impl TaskExecutor for ScanL2Executor {
-    async fn execute<'a>(&'a self, ctx: &'a TaskContext) -> Result<(), TaskError> {
-        let task: ScanL2Task = ctx.payload()?;
-
+impl TypedExecutor<ScanL2Task> for ScanL2Executor {
+    async fn execute(&self, task: ScanL2Task, ctx: &TaskContext) -> Result<(), TaskError> {
         let app = ctx
             .state::<ScanAppState>()
             .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
@@ -229,11 +213,10 @@ impl TaskExecutor for ScanL2Executor {
         // Schedule continuation if more keys remain.
         if has_remaining {
             let _ = ctx
-                .current_module()
-                .submit_typed(&ScanL2Task {
+                .domain::<Scanner>()
+                .submit_with(ScanL2Task {
                     bucket: task.bucket.clone(),
                     cursor: keys.last().cloned(),
-                    priority: None,
                 })
                 .priority(ctx.record().priority)
                 .await;
@@ -245,10 +228,8 @@ impl TaskExecutor for ScanL2Executor {
 
 pub struct ScanL3Executor;
 
-impl TaskExecutor for ScanL3Executor {
-    async fn execute<'a>(&'a self, ctx: &'a TaskContext) -> Result<(), TaskError> {
-        let task: ScanL3Task = ctx.payload()?;
-
+impl TypedExecutor<ScanL3Task> for ScanL3Executor {
+    async fn execute(&self, task: ScanL3Task, ctx: &TaskContext) -> Result<(), TaskError> {
         let app = ctx
             .state::<ScanAppState>()
             .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
@@ -351,8 +332,8 @@ impl TaskExecutor for ScanL3Executor {
         // Schedule continuation if more keys remain.
         if has_remaining {
             let _ = ctx
-                .current_module()
-                .submit_typed(&ScanL3Task {
+                .domain::<Scanner>()
+                .submit_with(ScanL3Task {
                     bucket: task.bucket.clone(),
                     cursor: keys.last().cloned(),
                     bytes_per_sec: new_bytes_per_sec,

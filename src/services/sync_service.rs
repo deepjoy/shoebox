@@ -1,6 +1,6 @@
 use crate::error::S3Error;
 use crate::scanner::scope::ScanScope;
-use crate::scanner::tasks::{ScanL1Task, ScanL2Task};
+use crate::scanner::tasks::{ScanL1Task, ScanL2Task, Scanner};
 
 /// Sync reconciles the SQLite metadata with the current filesystem state
 /// by submitting L1 + L2 scan tasks to TaskMill at elevated priorities.
@@ -12,26 +12,26 @@ use crate::scanner::tasks::{ScanL1Task, ScanL2Task};
 ///
 /// Sync is always async — it returns immediately.
 pub async fn sync(scheduler: &taskmill::Scheduler, bucket: &str) -> Result<(), S3Error> {
-    let scanner = scheduler.module("scanner");
+    let scanner = scheduler.domain::<Scanner>();
 
     // Submit L1 at HIGH — preempts any running background scan.
     scanner
-        .submit_typed(&ScanL1Task {
+        .submit_with(ScanL1Task {
             bucket: bucket.to_string(),
             scope: ScanScope::Bucket,
             target_level: 2,
-            priority: Some(taskmill::Priority::HIGH.value()),
         })
+        .priority(taskmill::Priority::HIGH)
         .await
         .map_err(|_| S3Error::InternalError)?;
 
     // Also submit L2 at NORMAL priority.
     scanner
-        .submit_typed(&ScanL2Task {
+        .submit_with(ScanL2Task {
             bucket: bucket.to_string(),
             cursor: None,
-            priority: Some(taskmill::Priority::NORMAL.value()),
         })
+        .priority(taskmill::Priority::NORMAL)
         .await
         .map_err(|_| S3Error::InternalError)?;
 
