@@ -96,16 +96,13 @@ async fn verify_file(root: &Path, record: &ObjectRecord) -> Result<(), Discrepan
     })?;
 
     // Check mtime
-    let current_mtime =
-        time::OffsetDateTime::from(fs_meta.modified().map_err(|_| Discrepancy {
-            key: record.key.clone(),
-            object_id: record.id.clone(),
-            reason: "read_error".to_string(),
-            ..Default::default()
-        })?);
+    let current_mtime: Option<crate::metadata::sqlite::SqliteTimestamp> = fs_meta
+        .modified()
+        .ok()
+        .map(time::OffsetDateTime::from)
+        .map(crate::metadata::sqlite::SqliteTimestamp);
 
-    let mtime_changed =
-        record.file_mtime != Some(crate::metadata::sqlite::SqliteTimestamp(current_mtime));
+    let mtime_changed = record.file_mtime != current_mtime;
 
     // Compute fresh SHA-256
     let computed_hash = compute_sha256(&path).await.map_err(|_| Discrepancy {
