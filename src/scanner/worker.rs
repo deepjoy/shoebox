@@ -127,7 +127,8 @@ async fn handle_file_changed(
         let current_mtime: Option<crate::metadata::sqlite::SqliteTimestamp> = fs_meta
             .modified()
             .ok()
-            .map(|t| crate::metadata::sqlite::SqliteTimestamp(time::OffsetDateTime::from(t)));
+            .map(time::OffsetDateTime::from)
+            .map(crate::metadata::sqlite::SqliteTimestamp);
         let current_size = fs_meta.len() as i64;
 
         if obj.file_mtime == current_mtime && obj.size == Some(current_size) {
