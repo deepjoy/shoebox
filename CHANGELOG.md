@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/deepjoy/shoebox/compare/v0.6.0...v0.6.1) - 2026-03-21
+
+### Other
+
+- migrate taskmill from 0.5 to 0.6 type-safe context API ([#100](https://github.com/deepjoy/shoebox/pull/100))
+
 ## [0.6.0](https://github.com/deepjoy/shoebox/compare/v0.5.2...v0.6.0) - 2026-03-19
 
 ### Fixed
