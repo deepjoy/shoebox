@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
-use taskmill::{DomainKey, TaskContext, TaskError, TypedExecutor, TypedTask};
+use taskmill::{DomainKey, DomainTaskContext, TaskError, TypedExecutor, TypedTask};
 
 use crate::scanner::app_state::ScanAppState;
 use crate::scanner::levels;
@@ -81,7 +81,11 @@ impl TypedTask for ScanL3Task {
 pub struct ScanL1Executor;
 
 impl TypedExecutor<ScanL1Task> for ScanL1Executor {
-    async fn execute(&self, task: ScanL1Task, ctx: &TaskContext) -> Result<(), TaskError> {
+    async fn execute(
+        &self,
+        task: ScanL1Task,
+        ctx: DomainTaskContext<'_, Scanner>,
+    ) -> Result<(), TaskError> {
         let app = ctx
             .state::<ScanAppState>()
             .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
@@ -157,7 +161,11 @@ impl TypedExecutor<ScanL1Task> for ScanL1Executor {
 pub struct ScanL2Executor;
 
 impl TypedExecutor<ScanL2Task> for ScanL2Executor {
-    async fn execute(&self, task: ScanL2Task, ctx: &TaskContext) -> Result<(), TaskError> {
+    async fn execute(
+        &self,
+        task: ScanL2Task,
+        ctx: DomainTaskContext<'_, Scanner>,
+    ) -> Result<(), TaskError> {
         let app = ctx
             .state::<ScanAppState>()
             .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
@@ -229,7 +237,11 @@ impl TypedExecutor<ScanL2Task> for ScanL2Executor {
 pub struct ScanL3Executor;
 
 impl TypedExecutor<ScanL3Task> for ScanL3Executor {
-    async fn execute(&self, task: ScanL3Task, ctx: &TaskContext) -> Result<(), TaskError> {
+    async fn execute(
+        &self,
+        task: ScanL3Task,
+        ctx: DomainTaskContext<'_, Scanner>,
+    ) -> Result<(), TaskError> {
         let app = ctx
             .state::<ScanAppState>()
             .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
