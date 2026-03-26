@@ -1703,10 +1703,12 @@ impl MetadataStore {
         .await?;
         let discovered = inserted.rows_affected();
 
-        // Step 3: Delete objects that are in the catalog but no longer on disk
+        // Step 3: Delete objects that are in the catalog but no longer on disk.
+        // Exclude folder markers (name = '') — they map to directories, not files,
+        // and are managed via the S3 API rather than the filesystem scanner.
         let deleted = if delete_stale {
             let result = sqlx::query(
-                "DELETE FROM objects WHERE NOT EXISTS ( \
+                "DELETE FROM objects WHERE name != '' AND NOT EXISTS ( \
                      SELECT 1 FROM l1_disk d \
                      WHERE d.parent_dir_id = objects.parent_dir_id AND d.name = objects.name \
                  )",
@@ -1736,11 +1738,10 @@ impl MetadataStore {
         } else {
             format!("{prefix}/")
         };
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM directories WHERE prefix = ?")
-                .bind(&canonical)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM directories WHERE prefix = ?")
+            .bind(&canonical)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.map(|(id,)| id))
     }
 
@@ -1763,7 +1764,14 @@ impl MetadataStore {
 
         let mut map = HashMap::with_capacity(rows.len());
         for (name, inode, device_id, size) in rows {
-            map.insert(name, FileIdentity { inode, device_id, size });
+            map.insert(
+                name,
+                FileIdentity {
+                    inode,
+                    device_id,
+                    size,
+                },
+            );
         }
         Ok(map)
     }
@@ -1837,13 +1845,12 @@ impl MetadataStore {
         scan_start_ns: i64,
     ) -> Result<u64, S3Error> {
         let scan_start = SqliteTimestamp::from_nanos(scan_start_ns);
-        let all: Vec<(String,)> = sqlx::query_as(
-            "SELECT name FROM objects WHERE parent_dir_id = ? AND created_at < ?",
-        )
-        .bind(dir_id)
-        .bind(scan_start)
-        .fetch_all(&self.pool)
-        .await?;
+        let all: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM objects WHERE parent_dir_id = ? AND created_at < ?")
+                .bind(dir_id)
+                .bind(scan_start)
+                .fetch_all(&self.pool)
+                .await?;
 
         let stale: Vec<String> = all
             .into_iter()
@@ -1916,13 +1923,12 @@ impl MetadataStore {
             };
 
             if !dir_path.exists() {
-                let result = sqlx::query(
-                    "DELETE FROM objects WHERE parent_dir_id = ? AND created_at < ?",
-                )
-                .bind(dir_id)
-                .bind(scan_start)
-                .execute(&self.pool)
-                .await?;
+                let result =
+                    sqlx::query("DELETE FROM objects WHERE parent_dir_id = ? AND created_at < ?")
+                        .bind(dir_id)
+                        .bind(scan_start)
+                        .execute(&self.pool)
+                        .await?;
                 total_deleted += result.rows_affected();
             }
         }
@@ -1934,11 +1940,10 @@ impl MetadataStore {
     /// during the current scan). Used for progress stats in `finalize()`.
     pub(crate) async fn count_objects_since(&self, scan_start_ns: i64) -> Result<u64, S3Error> {
         let scan_start = SqliteTimestamp::from_nanos(scan_start_ns);
-        let row: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM objects WHERE created_at >= ?")
-                .bind(scan_start)
-                .fetch_one(&self.pool)
-                .await?;
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM objects WHERE created_at >= ?")
+            .bind(scan_start)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.0 as u64)
     }
 

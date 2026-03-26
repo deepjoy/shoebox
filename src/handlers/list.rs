@@ -20,7 +20,7 @@ use crate::types::s3::*;
 /// - `"photos/2024/v"` → `"photos/2024/"`
 fn dir_prefix_for_listing(prefix: &str) -> String {
     match prefix.rsplit_once('/') {
-        Some((parent, _)) if parent.is_empty() => String::new(),
+        Some(("", _)) => String::new(),
         Some((parent, _)) => format!("{parent}/"),
         None => String::new(),
     }

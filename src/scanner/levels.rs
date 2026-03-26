@@ -487,7 +487,9 @@ pub async fn scan_l1_dir(
         let ct_id = match ct_cache.get(&content_type) {
             Some(&id) => id,
             None => {
-                let id = metadata.get_or_create_content_type_id(&content_type).await?;
+                let id = metadata
+                    .get_or_create_content_type_id(&content_type)
+                    .await?;
                 ct_cache.insert(content_type.clone(), id);
                 id
             }

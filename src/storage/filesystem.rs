@@ -19,6 +19,8 @@ pub enum FileContent {
     Regular(tokio::fs::File),
     /// Symlink — content is the link target path (UTF-8 lossy).
     Symlink { target: String, len: u64 },
+    /// Folder marker — zero-byte object whose key ends with `/`.
+    Folder,
 }
 
 /// Result of a successful write: bytes written, hex-encoded MD5 digest, and
@@ -28,6 +30,22 @@ pub struct WriteResult {
     pub bytes_written: u64,
     pub md5_hex: String,
     pub checksums: ChecksumValues,
+}
+
+/// Compute a `WriteResult` for zero bytes of content.
+fn empty_write_result() -> WriteResult {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    WriteResult {
+        bytes_written: 0,
+        md5_hex: hex::encode(Md5::new().finalize()),
+        checksums: ChecksumValues {
+            sha256: Some(b64.encode(Sha256::new().finalize())),
+            sha1: Some(b64.encode(Sha1::new().finalize())),
+            crc32: Some(b64.encode(crc32fast::Hasher::new().finalize().to_be_bytes())),
+            crc32c: Some(b64.encode(0u32.to_be_bytes())),
+        },
+    }
 }
 
 /// Filesystem-backed storage layer for a single bucket.
@@ -105,9 +123,17 @@ impl FilesystemStorage {
         Ok(path)
     }
 
-    /// Check if a key exists as a file on disk (symlink-aware — does not follow links).
-    /// Returns `false` for directories.
+    /// Check if a key exists on disk (symlink-aware — does not follow links).
+    /// For folder keys (ending with `/`) returns `true` if the directory exists.
+    /// For all other keys returns `false` for directories.
     pub async fn exists(&self, key: &str) -> Result<bool, S3Error> {
+        if key.ends_with('/') {
+            let dir_path = self.resolve_path(key.trim_end_matches('/')).await?;
+            return match tokio::fs::metadata(&dir_path).await {
+                Ok(m) => Ok(m.is_dir()),
+                Err(_) => Ok(false),
+            };
+        }
         let path = self.resolve_path(key).await?;
         match tokio::fs::symlink_metadata(&path).await {
             Ok(meta) => Ok(!meta.is_dir()),
@@ -118,8 +144,18 @@ impl FilesystemStorage {
     /// Open a key for streaming read.
     ///
     /// Regular files return a file handle; symlinks return their target
-    /// string as content (the link is never followed).
+    /// string as content (the link is never followed). Folder markers
+    /// (keys ending with `/`) return `FileContent::Folder` if the
+    /// corresponding directory exists.
     pub async fn get(&self, key: &str) -> Result<FileContent, S3Error> {
+        if key.ends_with('/') {
+            let dir_path = self.resolve_path(key.trim_end_matches('/')).await?;
+            match tokio::fs::metadata(&dir_path).await {
+                Ok(m) if m.is_dir() => return Ok(FileContent::Folder),
+                _ => return Err(S3Error::NoSuchKey),
+            }
+        }
+
         let path = self.resolve_path(key).await?;
 
         let meta = tokio::fs::symlink_metadata(&path).await.map_err(|e| {
@@ -197,6 +233,17 @@ impl FilesystemStorage {
         key: &str,
         mut stream: impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
     ) -> Result<WriteResult, S3Error> {
+        // Folder marker: key ends with '/'. Ensure the directory exists on disk
+        // and return an empty-content WriteResult without creating a file.
+        if key.ends_with('/') {
+            let dir_path = self.resolve_path(key.trim_end_matches('/')).await?;
+            tokio::fs::create_dir_all(&dir_path).await?;
+            while let Some(chunk) = stream.next().await {
+                chunk.map_err(|_| S3Error::InternalError)?;
+            }
+            return Ok(empty_write_result());
+        }
+
         let path = self.resolve_path(key).await?;
 
         // Create parent directories
@@ -250,7 +297,13 @@ impl FilesystemStorage {
 
     /// Delete a key from disk.  For symlinks this removes the link itself,
     /// not the target — no special handling required.
+    /// For folder markers (keys ending with `/`) the underlying directory is
+    /// left in place so objects stored inside it are not affected; only the
+    /// metadata record is removed by the caller.
     pub async fn delete(&self, key: &str) -> Result<(), S3Error> {
+        if key.ends_with('/') {
+            return Ok(());
+        }
         let path = self.resolve_path(key).await?;
         tokio::fs::remove_file(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -321,7 +374,7 @@ mod tests {
                 file.read_to_end(&mut buf).await.unwrap();
                 assert_eq!(buf, data);
             }
-            FileContent::Symlink { .. } => panic!("Expected regular file"),
+            FileContent::Symlink { .. } | FileContent::Folder => panic!("Expected regular file"),
         }
     }
 
@@ -405,7 +458,7 @@ mod tests {
                 assert_eq!(target, "/some/target/path");
                 assert_eq!(len, target.len() as u64);
             }
-            FileContent::Regular(_) => panic!("Expected symlink content"),
+            FileContent::Regular(_) | FileContent::Folder => panic!("Expected symlink content"),
         }
     }
 

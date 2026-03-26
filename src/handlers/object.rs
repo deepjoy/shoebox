@@ -251,6 +251,16 @@ pub async fn get_object(
             }
             .into_response())
         }
+        FileContent::Folder => Ok(ObjectResponse {
+            body: axum::body::Body::empty(),
+            content_length: 0,
+            content_type,
+            etag,
+            last_modified,
+            metadata: user_meta,
+            checksums,
+        }
+        .into_response()),
     }
 }
 

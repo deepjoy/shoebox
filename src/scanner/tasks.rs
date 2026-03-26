@@ -161,8 +161,7 @@ impl TypedExecutor<ScanL1Task, ScanL1Memo> for ScanL1Executor {
                 }
             })?;
             // For Files scope there are no children, so finalize() runs immediately.
-            let scan_start_ns =
-                time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64;
+            let scan_start_ns = time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64;
             return Ok(ScanL1Memo { scan_start_ns });
         }
 
@@ -210,7 +209,7 @@ impl TypedExecutor<ScanL1Task, ScanL1Memo> for ScanL1Executor {
                     Ok(taskmill::TaskEvent::Completed { record, .. }) => {
                         if record.parent_id == Some(orchestrator_id) {
                             dirs_completed += 1;
-                            if dirs_completed % 1000 == 0 {
+                            if dirs_completed.is_multiple_of(1000) {
                                 let discovered = metadata
                                     .count_objects_since(scan_start_ns)
                                     .await
@@ -244,7 +243,10 @@ impl TypedExecutor<ScanL1Task, ScanL1Memo> for ScanL1Executor {
             .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
 
         let bucket_state = app.buckets.get(&task.bucket).ok_or_else(|| {
-            TaskError::new(format!("bucket '{}' not found in ScanAppState", task.bucket))
+            TaskError::new(format!(
+                "bucket '{}' not found in ScanAppState",
+                task.bucket
+            ))
         })?;
 
         let scan_start_ns = memo.scan_start_ns;
@@ -279,17 +281,14 @@ impl TypedExecutor<ScanL1Task, ScanL1Memo> for ScanL1Executor {
             .await
             .map_err(|e| TaskError::new(format!("count_deleted_during_scan failed: {e}")))?;
 
-        tracing::info!(
-            discovered,
-            deleted,
-            orphan_deleted,
-            "L1 scan complete"
-        );
+        tracing::info!(discovered, deleted, orphan_deleted, "L1 scan complete");
 
         // 3. Mark scan as complete and notify waiters.
         if matches!(task.scope, ScanScope::Bucket) {
             bucket_state.l1_running.store(false, Ordering::Release);
-            bucket_state.l1_completed_once.store(true, Ordering::Release);
+            bucket_state
+                .l1_completed_once
+                .store(true, Ordering::Release);
             app.l1_notify.notify_waiters();
         }
 
@@ -358,7 +357,10 @@ impl TypedExecutor<ScanL1DirTask> for ScanL1DirExecutor {
             .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
 
         let bucket_state = app.buckets.get(&task.bucket).ok_or_else(|| {
-            TaskError::new(format!("bucket '{}' not found in ScanAppState", task.bucket))
+            TaskError::new(format!(
+                "bucket '{}' not found in ScanAppState",
+                task.bucket
+            ))
         })?;
 
         let report = levels::scan_l1_dir(
