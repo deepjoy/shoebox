@@ -336,6 +336,198 @@ pub async fn scan_l1(
     })
 }
 
+// ── BFS L1 per-directory scan ──────────────────────────────────────────────
+
+/// Result of a single BFS directory scan task.
+#[derive(Debug, Default)]
+pub struct L1DirReport {
+    /// Relative prefixes of immediate subdirectories to enqueue as sibling tasks.
+    /// Each entry is a full dir_prefix (e.g. `"photos/2024/"`).
+    pub child_dirs: Vec<String>,
+    pub discovered: u64,
+    pub deleted: u64,
+    pub unchanged: u64,
+}
+
+/// Scan a single directory for the BFS L1 pass.
+///
+/// Reads immediate children of `root.join(dir_prefix)` via `tokio::fs::read_dir`,
+/// compares files against the per-directory catalog snapshot, upserts new/changed
+/// files, deletes stale entries, and returns the list of subdirectory prefixes to
+/// enqueue next.
+///
+/// `scan_start_ns` is the epoch-nanosecond timestamp at which the orchestrator
+/// started the scan; it is used as the stale-deletion boundary (objects created
+/// after this timestamp by concurrent API uploads are excluded from deletion).
+pub async fn scan_l1_dir(
+    metadata: &MetadataStore,
+    root: &Path,
+    dir_prefix: &str,
+    scan_start_ns: i64,
+    scope: &ScanScope,
+) -> Result<L1DirReport, S3Error> {
+    let dir_path = if dir_prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(dir_prefix.trim_end_matches('/'))
+    };
+
+    // Resolve (or create) the directory id for this prefix.
+    let parent_key = if dir_prefix.is_empty() {
+        String::new()
+    } else {
+        // dir_prefix is "photos/2024/" — strip trailing slash for get_or_create_dir_id
+        dir_prefix.trim_end_matches('/').to_string()
+    };
+    let dir_id = metadata.get_or_create_dir_id(&parent_key).await?;
+
+    // Load known files in this directory for unchanged-detection.
+    let known = metadata.l1_load_dir_objects(dir_id).await?;
+
+    let mut child_dirs: Vec<String> = Vec::new();
+    let mut batch: Vec<ObjectRecord> = Vec::new();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut unchanged: u64 = 0;
+
+    let mut read_dir = match tokio::fs::read_dir(&dir_path).await {
+        Ok(rd) => rd,
+        Err(e) => {
+            tracing::warn!(dir = %dir_path.display(), "L1 dir scan: read_dir failed: {e}");
+            return Ok(L1DirReport::default());
+        }
+    };
+
+    let mut ct_cache: HashMap<String, i64> = HashMap::new();
+
+    while let Some(entry) = read_dir.next_entry().await.transpose() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(dir = %dir_path.display(), "L1 dir scan entry error: {e}");
+                continue;
+            }
+        };
+
+        let entry_name = entry.file_name().to_string_lossy().to_string();
+
+        // Build the full key for scope filtering
+        let key = if dir_prefix.is_empty() {
+            entry_name.clone()
+        } else {
+            format!("{}{}", dir_prefix, entry_name)
+        };
+
+        let file_type = match entry.file_type().await {
+            Ok(ft) => ft,
+            Err(e) => {
+                tracing::warn!(path = %entry.path().display(), "L1 dir scan: file_type error: {e}");
+                continue;
+            }
+        };
+
+        if file_type.is_dir() {
+            // Skip .shoebox directory
+            if entry_name == SHOEBOX_DIR {
+                continue;
+            }
+            // Collect subdirectory prefix (always ends with '/')
+            let sub_prefix = format!("{key}/");
+            if scope.includes(&key) || scope.includes(&sub_prefix) {
+                child_dirs.push(sub_prefix);
+            }
+            continue;
+        }
+
+        // Only catalog regular files and symlinks
+        let is_symlink = file_type.is_symlink();
+        if !(file_type.is_file() || is_symlink) {
+            continue;
+        }
+
+        if !scope.includes(&key) {
+            continue;
+        }
+
+        seen_names.insert(entry_name.clone());
+
+        // Stat the file to detect changes
+        let path = entry.path();
+        let fs_meta = tokio::fs::symlink_metadata(&path).await.ok();
+        let size = fs_meta.as_ref().map(|m| m.len() as i64);
+        let (inode, device_id) = fs_meta
+            .as_ref()
+            .map(platform::file_identity)
+            .unwrap_or((None, None));
+        let inode_i64 = inode.map(|v| v as i64);
+        let device_id_i64 = device_id.map(|v| v as i64);
+
+        // Skip unchanged files (identity matches catalog)
+        if let Some(identity) = known.get(&entry_name) {
+            if identity.inode == inode_i64
+                && identity.device_id == device_id_i64
+                && identity.size == size
+            {
+                unchanged += 1;
+                continue;
+            }
+        }
+
+        // New or changed file — prepare for upsert
+        let symlink_target = if is_symlink {
+            std::fs::read_link(&path)
+                .ok()
+                .map(|t| t.to_string_lossy().to_string())
+        } else {
+            None
+        };
+
+        let content_type = mime_guess::from_path(&key)
+            .first_or_octet_stream()
+            .to_string();
+        let ct_id = match ct_cache.get(&content_type) {
+            Some(&id) => id,
+            None => {
+                let id = metadata.get_or_create_content_type_id(&content_type).await?;
+                ct_cache.insert(content_type.clone(), id);
+                id
+            }
+        };
+
+        let now = crate::metadata::sqlite::SqliteTimestamp::now();
+        batch.push(ObjectRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: entry_name,
+            parent_dir_id: dir_id,
+            key,
+            is_symlink,
+            symlink_target,
+            size,
+            inode: inode_i64,
+            device_id: device_id_i64,
+            content_type_id: Some(ct_id),
+            scan_level: 1,
+            last_modified: now,
+            created_at: now,
+            ..Default::default()
+        });
+    }
+
+    // Upsert new/changed files
+    let discovered = metadata.l1_upsert_dir_files(&batch).await?;
+
+    // Delete stale objects (files no longer on disk in this directory)
+    let deleted = metadata
+        .l1_delete_stale_in_dir(dir_id, &seen_names, scan_start_ns)
+        .await?;
+
+    Ok(L1DirReport {
+        child_dirs,
+        discovered,
+        deleted,
+        unchanged,
+    })
+}
+
 /// Helper: get directory prefix for logging move detection.
 async fn parent_prefix_for_log(metadata: &MetadataStore, parent_dir_id: i64) -> String {
     metadata

@@ -30,7 +30,8 @@ use crate::scanner::backpressure::ScannerResources;
 use crate::scanner::levels;
 use crate::scanner::scope::ScanScope;
 use crate::scanner::tasks::{
-    ScanL1Executor, ScanL1Task, ScanL2Executor, ScanL2Task, ScanL3Executor, ScanL3Task, Scanner,
+    ScanL1DirExecutor, ScanL1DirTask, ScanL1Executor, ScanL1Task, ScanL2Executor, ScanL2Task,
+    ScanL3Executor, ScanL3Task, Scanner,
 };
 use crate::scanner::watcher::{self as watcher_mod, FilesystemWatcher};
 use crate::scanner::worker;
@@ -65,14 +66,22 @@ use std::pin::Pin;
 ///     .await?;
 /// ```
 pub fn register_scan_executors(builder: taskmill::SchedulerBuilder) -> taskmill::SchedulerBuilder {
-    builder.domain(
-        taskmill::Domain::<Scanner>::new()
-            .task::<ScanL1Task>(ScanL1Executor)
-            .task::<ScanL2Task>(ScanL2Executor)
-            .task::<ScanL3Task>(ScanL3Executor)
-            .default_priority(taskmill::Priority::BACKGROUND)
-            .max_concurrency(1),
-    )
+    builder
+        .domain(
+            taskmill::Domain::<Scanner>::new()
+                .task_memo::<ScanL1Task, _>(ScanL1Executor)
+                .task::<ScanL1DirTask>(ScanL1DirExecutor)
+                .task::<ScanL2Task>(ScanL2Executor)
+                .task::<ScanL3Task>(ScanL3Executor)
+                .default_priority(taskmill::Priority::BACKGROUND)
+                .max_concurrency(1),
+        )
+        .priority_aging(taskmill::AgingConfig {
+            grace_period: std::time::Duration::from_secs(300),
+            aging_interval: std::time::Duration::from_secs(60),
+            max_effective_priority: taskmill::Priority::NORMAL,
+            urgent_threshold: None,
+        })
 }
 
 /// A boxed, sendable stream of list entries.
@@ -980,11 +989,18 @@ impl ShoeboxBuilder {
                     .store_path(&taskmill_db_str)
                     .domain(
                         taskmill::Domain::<Scanner>::new()
-                            .task::<ScanL1Task>(ScanL1Executor)
+                            .task_memo::<ScanL1Task, _>(ScanL1Executor)
+                            .task::<ScanL1DirTask>(ScanL1DirExecutor)
                             .task::<ScanL2Task>(ScanL2Executor)
                             .task::<ScanL3Task>(ScanL3Executor)
                             .max_concurrency(1),
                     )
+                    .priority_aging(taskmill::AgingConfig {
+                        grace_period: std::time::Duration::from_secs(300),
+                        aging_interval: std::time::Duration::from_secs(60),
+                        max_effective_priority: taskmill::Priority::NORMAL,
+                        urgent_threshold: None,
+                    })
                     .pressure_source(Box::new(ScannerResources::new(100)))
                     .throttle_policy(taskmill::ThrottlePolicy::default_three_tier())
                     .app_state_arc(scan_app_state.clone())

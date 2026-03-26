@@ -37,6 +37,15 @@ const EWMA_ALPHA: f64 = 0.3;
 
 // ── Task types ───────────────────────────────────────────────────────
 
+/// Memo persisted by `ScanL1Executor::execute()` and received by `finalize()`.
+///
+/// Holds the epoch-nanosecond scan start time so post-scan reconciliation
+/// can distinguish newly discovered objects from pre-existing ones.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScanL1Memo {
+    pub scan_start_ns: i64,
+}
+
 /// L1: Discover files on disk and insert new records into the metadata DB.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScanL1Task {
@@ -48,6 +57,35 @@ pub struct ScanL1Task {
 impl TypedTask for ScanL1Task {
     type Domain = Scanner;
     const TASK_TYPE: &'static str = "scan-l1";
+}
+
+/// L1 directory task: scan one directory and enqueue its subdirectories.
+///
+/// Submitted by `ScanL1Executor` (root dir via `spawn_child_with`) and by
+/// `ScanL1DirExecutor` itself (subdirs via `spawn_sibling_with`).  The `key()`
+/// implementation enables dedup — duplicate submissions for the same directory
+/// return `Upgraded`, `Requeued`, or `Duplicate` instead of creating redundant work.
+///
+/// API handlers may also submit this task at `Priority::REALTIME` to trigger
+/// an on-demand scan before serving a listing.  Tasks without a `parent_id`
+/// scan one directory without enqueuing children (standalone mode).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScanL1DirTask {
+    pub bucket: String,
+    /// Directory prefix to scan (e.g. `""` for root, `"photos/2024/"` for nested).
+    pub dir_prefix: String,
+    /// Epoch nanoseconds at which the orchestrating `ScanL1Task` started.
+    pub scan_start_ns: i64,
+    pub scope: ScanScope,
+}
+
+impl TypedTask for ScanL1DirTask {
+    type Domain = Scanner;
+    const TASK_TYPE: &'static str = "scan-l1-dir";
+
+    fn key(&self) -> Option<String> {
+        Some(format!("{}:{}", self.bucket, self.dir_prefix))
+    }
 }
 
 /// L2: Collect filesystem metadata (size, mtime, ctime, inode) for objects
@@ -80,12 +118,16 @@ impl TypedTask for ScanL3Task {
 
 pub struct ScanL1Executor;
 
-impl TypedExecutor<ScanL1Task> for ScanL1Executor {
+/// `ScanL1Task` orchestrator: records scan_start_ns, spawns the root
+/// `ScanL1DirTask` as a child, then waits.  When all directory children
+/// settle, `finalize()` runs orphan cleanup, schedules L2/L3, and marks
+/// the scan as complete.
+impl TypedExecutor<ScanL1Task, ScanL1Memo> for ScanL1Executor {
     async fn execute(
         &self,
         task: ScanL1Task,
         ctx: DomainTaskContext<'_, Scanner>,
-    ) -> Result<(), TaskError> {
+    ) -> Result<ScanL1Memo, TaskError> {
         let app = ctx
             .state::<ScanAppState>()
             .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
@@ -97,41 +139,162 @@ impl TypedExecutor<ScanL1Task> for ScanL1Executor {
             ))
         })?;
 
-        if matches!(task.scope, ScanScope::Bucket) {
+        // Handle Files scope directly (no BFS needed)
+        if let ScanScope::Files(_) = &task.scope {
             bucket_state.l1_running.store(true, Ordering::Release);
-        }
-
-        let result = levels::scan_l1(&bucket_state.metadata, &bucket_state.root, &task.scope).await;
-
-        if matches!(task.scope, ScanScope::Bucket) {
+            let result =
+                levels::scan_l1(&bucket_state.metadata, &bucket_state.root, &task.scope).await;
             bucket_state.l1_running.store(false, Ordering::Release);
             match &result {
-                Ok(_) => {
-                    bucket_state
-                        .l1_completed_once
-                        .store(true, Ordering::Release);
-                    app.l1_notify.notify_waiters();
-                }
+                Ok(_) => {}
                 Err(e) if !e.is_retryable() => {
                     bucket_state.l1_failed.store(true, Ordering::Release);
                     app.l1_notify.notify_waiters();
                 }
-                Err(_) => {} // retryable — will be retried by taskmill
+                Err(_) => {}
             }
+            result.map_err(|e| {
+                if e.is_retryable() {
+                    TaskError::retryable(format!("L1 scan failed: {e}"))
+                } else {
+                    TaskError::new(format!("L1 scan failed: {e}"))
+                }
+            })?;
+            // For Files scope there are no children, so finalize() runs immediately.
+            let scan_start_ns =
+                time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64;
+            return Ok(ScanL1Memo { scan_start_ns });
         }
 
-        result.map_err(|e| {
-            if e.is_retryable() {
-                TaskError::retryable(format!("L1 scan failed: {e}"))
-            } else {
-                TaskError::new(format!("L1 scan failed: {e}"))
+        if matches!(task.scope, ScanScope::Bucket) {
+            bucket_state.l1_running.store(true, Ordering::Release);
+        }
+
+        let scan_start_ns = time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64;
+
+        // Derive root dir_prefix from scope
+        let root_dir_prefix = match &task.scope {
+            ScanScope::Bucket => String::new(),
+            ScanScope::Subtree { prefix } => {
+                // Normalise to a directory prefix ending in '/'
+                if prefix.ends_with('/') {
+                    prefix.clone()
+                } else {
+                    // e.g. "photos/2024" → "photos/2024/"
+                    format!("{prefix}/")
+                }
             }
+            ScanScope::Files(_) => unreachable!("handled above"),
+        };
+
+        // Spawn the root directory task as a direct child of this orchestrator.
+        // All subdirectory tasks will be spawned as siblings (inheriting this
+        // task as their parent) via `spawn_sibling_with` inside ScanL1DirExecutor.
+        ctx.spawn_child_with(ScanL1DirTask {
+            bucket: task.bucket.clone(),
+            dir_prefix: root_dir_prefix,
+            scan_start_ns,
+            scope: task.scope.clone(),
+        })
+        .await
+        .map_err(|e| TaskError::new(format!("spawn root dir task failed: {e}")))?;
+
+        // Spawn a lightweight progress reporter that tallies completed dir tasks.
+        let orchestrator_id = ctx.record().id;
+        let metadata = bucket_state.metadata.clone();
+        let mut event_stream = ctx.domain::<Scanner>().task_events::<ScanL1DirTask>();
+        tokio::spawn(async move {
+            let mut dirs_completed = 0u64;
+            loop {
+                match event_stream.recv().await {
+                    Ok(taskmill::TaskEvent::Completed { record, .. }) => {
+                        if record.parent_id == Some(orchestrator_id) {
+                            dirs_completed += 1;
+                            if dirs_completed % 1000 == 0 {
+                                let discovered = metadata
+                                    .count_objects_since(scan_start_ns)
+                                    .await
+                                    .unwrap_or(0);
+                                tracing::info!(
+                                    dirs_completed,
+                                    objects_discovered = discovered,
+                                    "L1 scan progress"
+                                );
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break, // channel closed or lagged
+                }
+            }
+        });
+
+        // Return memo — orchestrator enters Waiting state until all children settle.
+        Ok(ScanL1Memo { scan_start_ns })
+    }
+
+    async fn finalize(
+        &self,
+        task: ScanL1Task,
+        memo: ScanL1Memo,
+        ctx: DomainTaskContext<'_, Scanner>,
+    ) -> Result<(), TaskError> {
+        let app = ctx
+            .state::<ScanAppState>()
+            .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
+
+        let bucket_state = app.buckets.get(&task.bucket).ok_or_else(|| {
+            TaskError::new(format!("bucket '{}' not found in ScanAppState", task.bucket))
         })?;
 
-        // Schedule downstream L2 (and optionally L3) if target_level warrants it.
-        // Propagate the current task's priority to downstream scans.
-        let priority = ctx.record().priority;
+        let scan_start_ns = memo.scan_start_ns;
 
+        // 1. Cross-directory move reconciliation (no-op: stale deletion removes
+        //    old entries before finalize runs; moves result in new object_ids).
+        let _moved = bucket_state
+            .metadata
+            .l1_reconcile_moves(scan_start_ns)
+            .await
+            .map_err(|e| TaskError::new(format!("move reconciliation failed: {e}")))?;
+
+        // 2. Orphan directory cleanup (bucket-wide scans only).
+        let orphan_deleted = if matches!(task.scope, ScanScope::Bucket) {
+            bucket_state
+                .metadata
+                .l1_cleanup_orphan_dirs(&bucket_state.root, scan_start_ns)
+                .await
+                .map_err(|e| TaskError::new(format!("orphan dir cleanup failed: {e}")))?
+        } else {
+            0
+        };
+
+        let discovered = bucket_state
+            .metadata
+            .count_objects_since(scan_start_ns)
+            .await
+            .map_err(|e| TaskError::new(format!("count_objects_since failed: {e}")))?;
+        let deleted = bucket_state
+            .metadata
+            .count_deleted_during_scan(scan_start_ns)
+            .await
+            .map_err(|e| TaskError::new(format!("count_deleted_during_scan failed: {e}")))?;
+
+        tracing::info!(
+            discovered,
+            deleted,
+            orphan_deleted,
+            "L1 scan complete"
+        );
+
+        // 3. Mark scan as complete and notify waiters.
+        if matches!(task.scope, ScanScope::Bucket) {
+            bucket_state.l1_running.store(false, Ordering::Release);
+            bucket_state.l1_completed_once.store(true, Ordering::Release);
+            app.l1_notify.notify_waiters();
+        }
+
+        // 4. Schedule downstream L2/L3.
+        let priority = ctx.record().priority;
         if task.target_level >= 2 {
             let _ = ctx
                 .domain::<Scanner>()
@@ -152,6 +315,90 @@ impl TypedExecutor<ScanL1Task> for ScanL1Executor {
                 })
                 .priority(priority)
                 .await;
+        }
+
+        Ok(())
+    }
+
+    async fn on_cancel(
+        &self,
+        task: ScanL1Task,
+        ctx: DomainTaskContext<'_, Scanner>,
+    ) -> Result<(), TaskError> {
+        let app = ctx
+            .state::<ScanAppState>()
+            .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
+        if let Some(bucket_state) = app.buckets.get(&task.bucket) {
+            if matches!(task.scope, ScanScope::Bucket) {
+                bucket_state.l1_running.store(false, Ordering::Release);
+                bucket_state.l1_failed.store(true, Ordering::Release);
+                app.l1_notify.notify_waiters();
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct ScanL1DirExecutor;
+
+/// Execute a single-directory BFS scan task.
+///
+/// Reads the directory, upserts new/changed files, deletes stale entries, and
+/// enqueues subdirectory tasks as siblings of the orchestrating `ScanL1Task`.
+/// Tasks submitted without a `parent_id` (API on-demand scans) scan one
+/// directory only and do not enqueue children.
+impl TypedExecutor<ScanL1DirTask> for ScanL1DirExecutor {
+    async fn execute(
+        &self,
+        task: ScanL1DirTask,
+        ctx: DomainTaskContext<'_, Scanner>,
+    ) -> Result<(), TaskError> {
+        let app = ctx
+            .state::<ScanAppState>()
+            .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
+
+        let bucket_state = app.buckets.get(&task.bucket).ok_or_else(|| {
+            TaskError::new(format!("bucket '{}' not found in ScanAppState", task.bucket))
+        })?;
+
+        let report = levels::scan_l1_dir(
+            &bucket_state.metadata,
+            &bucket_state.root,
+            &task.dir_prefix,
+            task.scan_start_ns,
+            &task.scope,
+        )
+        .await
+        .map_err(|e| {
+            if e.is_retryable() {
+                TaskError::retryable(format!("L1 dir scan failed: {e}"))
+            } else {
+                TaskError::new(format!("L1 dir scan failed: {e}"))
+            }
+        })?;
+
+        tracing::debug!(
+            dir = %task.dir_prefix,
+            discovered = report.discovered,
+            deleted = report.deleted,
+            unchanged = report.unchanged,
+            subdirs = report.child_dirs.len(),
+            "L1 dir scan"
+        );
+
+        // Only enqueue children when this task is a BFS child (has a parent_id).
+        // Standalone API-submitted tasks have no parent and scan one directory only.
+        if ctx.record().parent_id.is_some() {
+            for subdir in report.child_dirs {
+                let _ = ctx
+                    .spawn_sibling_with(ScanL1DirTask {
+                        bucket: task.bucket.clone(),
+                        dir_prefix: subdir,
+                        scan_start_ns: task.scan_start_ns,
+                        scope: task.scope.clone(),
+                    })
+                    .await;
+            }
         }
 
         Ok(())

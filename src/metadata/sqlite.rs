@@ -55,7 +55,7 @@ impl SqliteTimestamp {
         self.0.unix_timestamp_nanos() as i64
     }
 
-    fn from_nanos(ns: i64) -> Self {
+    pub(crate) fn from_nanos(ns: i64) -> Self {
         Self(
             time::OffsetDateTime::from_unix_timestamp_nanos(ns as i128)
                 .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
@@ -1724,6 +1724,231 @@ impl MetadataStore {
             .await?;
 
         Ok((discovered, deleted, moved))
+    }
+
+    // ── BFS L1 per-directory helpers ────────────────────────────────────────
+
+    /// Check if a directory entry exists in the catalog (without creating it).
+    /// Returns `None` if the directory has never been scanned.
+    pub(crate) async fn get_dir_id(&self, prefix: &str) -> Result<Option<i64>, S3Error> {
+        let canonical = if prefix.is_empty() || prefix.ends_with('/') {
+            prefix.to_string()
+        } else {
+            format!("{prefix}/")
+        };
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM directories WHERE prefix = ?")
+                .bind(&canonical)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(id,)| id))
+    }
+
+    /// Load known files for a single directory (BFS per-directory L1 scanning).
+    ///
+    /// Returns a map of `name → FileIdentity` containing only objects whose
+    /// `parent_dir_id` matches `dir_id`. Used to detect unchanged files and
+    /// avoid redundant upserts.
+    pub(crate) async fn l1_load_dir_objects(
+        &self,
+        dir_id: i64,
+    ) -> Result<HashMap<String, FileIdentity>, S3Error> {
+        type Row = (String, Option<i64>, Option<i64>, Option<i64>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT name, inode, device_id, size FROM objects WHERE parent_dir_id = ?",
+        )
+        .bind(dir_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut map = HashMap::with_capacity(rows.len());
+        for (name, inode, device_id, size) in rows {
+            map.insert(name, FileIdentity { inode, device_id, size });
+        }
+        Ok(map)
+    }
+
+    /// Batch-insert newly discovered files during a BFS per-directory scan.
+    ///
+    /// Uses `INSERT OR IGNORE` — L1 is discovery-only. Files that already exist
+    /// in the catalog (e.g. API-uploaded objects or previously scanned files) are
+    /// silently skipped; their metadata is left untouched for L2 to update later.
+    /// Returns the number of newly inserted rows.
+    pub(crate) async fn l1_upsert_dir_files(
+        &self,
+        records: &[ObjectRecord],
+    ) -> Result<u64, S3Error> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        /// Max rows per multi-value INSERT (500 × 12 cols = 6000 params — within
+        /// SQLite's 32766 limit).
+        const CHUNK: usize = 500;
+
+        let mut total = 0u64;
+        let mut tx = self.pool.begin().await?;
+
+        for chunk in records.chunks(CHUNK) {
+            let placeholders: String = (0..chunk.len())
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT OR IGNORE INTO objects (
+                    id, name, parent_dir_id, is_symlink, symlink_target,
+                    size, inode, device_id, content_type_id,
+                    last_modified, created_at, scan_level
+                ) VALUES {placeholders}"
+            );
+            let mut query = sqlx::query(&sql);
+            for obj in chunk {
+                query = query
+                    .bind(&obj.id)
+                    .bind(&obj.name)
+                    .bind(obj.parent_dir_id)
+                    .bind(obj.is_symlink)
+                    .bind(&obj.symlink_target)
+                    .bind(obj.size)
+                    .bind(obj.inode)
+                    .bind(obj.device_id)
+                    .bind(obj.content_type_id)
+                    .bind(obj.last_modified)
+                    .bind(obj.created_at)
+                    .bind(1i32);
+            }
+            let result = query.execute(&mut *tx).await?;
+            total += result.rows_affected();
+        }
+
+        tx.commit().await?;
+        Ok(total)
+    }
+
+    /// Delete stale objects in one directory that were not seen during the
+    /// current scan pass. Only objects created before `scan_start_ns` are
+    /// considered (concurrent API uploads are excluded).
+    ///
+    /// Returns the number of deleted rows.
+    pub(crate) async fn l1_delete_stale_in_dir(
+        &self,
+        dir_id: i64,
+        seen_names: &std::collections::HashSet<String>,
+        scan_start_ns: i64,
+    ) -> Result<u64, S3Error> {
+        let scan_start = SqliteTimestamp::from_nanos(scan_start_ns);
+        let all: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM objects WHERE parent_dir_id = ? AND created_at < ?",
+        )
+        .bind(dir_id)
+        .bind(scan_start)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let stale: Vec<String> = all
+            .into_iter()
+            .map(|(n,)| n)
+            .filter(|n| !seen_names.contains(n))
+            .collect();
+
+        if stale.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        for name in &stale {
+            sqlx::query("DELETE FROM objects WHERE parent_dir_id = ? AND name = ?")
+                .bind(dir_id)
+                .bind(name)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(stale.len() as u64)
+    }
+
+    /// Post-scan cross-directory move reconciliation.
+    ///
+    /// With per-directory stale deletion, old entries are removed inline before
+    /// `finalize()` runs, so there are typically no inode duplicates to reconcile.
+    /// This is a no-op placeholder — cross-directory moves result in a new
+    /// object_id for the destination. Intra-directory renames are handled by
+    /// the per-directory stale-deletion + upsert cycle.
+    pub(crate) async fn l1_reconcile_moves(&self, _scan_start_ns: i64) -> Result<u64, S3Error> {
+        Ok(0)
+    }
+
+    /// Delete objects in directories that were removed from disk between scans.
+    ///
+    /// Since the BFS traversal only enqueues tasks for directories it finds
+    /// during `read_dir`, deleted directories never get a task and their catalog
+    /// entries accumulate as stale. This post-scan pass finds any directory whose
+    /// pre-scan-start objects still exist in the catalog but whose path on disk is
+    /// gone, then deletes those objects.
+    ///
+    /// Only run for bucket-wide scans (`ScanScope::Bucket`).
+    pub(crate) async fn l1_cleanup_orphan_dirs(
+        &self,
+        root: &std::path::Path,
+        scan_start_ns: i64,
+    ) -> Result<u64, S3Error> {
+        let scan_start = SqliteTimestamp::from_nanos(scan_start_ns);
+        // Find directories that have pre-scan-start objects (i.e. were scanned
+        // before) — the existence of such objects implies the directory existed.
+        let dirs: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT d.id, d.prefix FROM directories d \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM objects o \
+                 WHERE o.parent_dir_id = d.id AND o.created_at < ? \
+             )",
+        )
+        .bind(scan_start)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut total_deleted = 0u64;
+        for (dir_id, prefix) in dirs {
+            let dir_path = if prefix.is_empty() {
+                root.to_path_buf()
+            } else {
+                // prefix always ends with '/' (stored that way in directories table)
+                root.join(prefix.trim_end_matches('/'))
+            };
+
+            if !dir_path.exists() {
+                let result = sqlx::query(
+                    "DELETE FROM objects WHERE parent_dir_id = ? AND created_at < ?",
+                )
+                .bind(dir_id)
+                .bind(scan_start)
+                .execute(&self.pool)
+                .await?;
+                total_deleted += result.rows_affected();
+            }
+        }
+
+        Ok(total_deleted)
+    }
+
+    /// Count objects created at or after `scan_start_ns` (newly discovered
+    /// during the current scan). Used for progress stats in `finalize()`.
+    pub(crate) async fn count_objects_since(&self, scan_start_ns: i64) -> Result<u64, S3Error> {
+        let scan_start = SqliteTimestamp::from_nanos(scan_start_ns);
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM objects WHERE created_at >= ?")
+                .bind(scan_start)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.0 as u64)
+    }
+
+    /// Count objects deleted during the scan window. Deletion timestamps are
+    /// not tracked in the current schema, so this always returns 0.
+    pub(crate) async fn count_deleted_during_scan(
+        &self,
+        _scan_start_ns: i64,
+    ) -> Result<u64, S3Error> {
+        Ok(0)
     }
 
     /// Reset an object's scan level (e.g. after a file is modified on disk).
