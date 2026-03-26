@@ -56,7 +56,6 @@ pub async fn list_objects_v2(
     // that part of the tree.
     let dir_prefix = dir_prefix_for_listing(&prefix);
     if bucket.metadata.get_dir_id(&dir_prefix).await?.is_none() {
-        let scan_start_ns = time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64;
         let scanner = bucket.scheduler.domain::<Scanner>();
 
         // Create the event stream BEFORE submitting so we can't miss the
@@ -67,7 +66,6 @@ pub async fn list_objects_v2(
             .submit_with(ScanL1DirTask {
                 bucket: bucket_name.clone(),
                 dir_prefix: dir_prefix.clone(),
-                scan_start_ns,
                 scope: ScanScope::Subtree {
                     prefix: dir_prefix.clone(),
                 },

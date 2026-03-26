@@ -1,8 +1,10 @@
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use taskmill::{DomainKey, DomainTaskContext, TaskError, TypedExecutor, TypedTask};
 
+use crate::metadata::sqlite::L1WriteOp;
 use crate::scanner::app_state::ScanAppState;
 use crate::scanner::levels;
 use crate::scanner::scope::ScanScope;
@@ -74,8 +76,6 @@ pub struct ScanL1DirTask {
     pub bucket: String,
     /// Directory prefix to scan (e.g. `""` for root, `"photos/2024/"` for nested).
     pub dir_prefix: String,
-    /// Epoch nanoseconds at which the orchestrating `ScanL1Task` started.
-    pub scan_start_ns: i64,
     pub scope: ScanScope,
 }
 
@@ -186,13 +186,29 @@ impl TypedExecutor<ScanL1Task, ScanL1Memo> for ScanL1Executor {
             ScanScope::Files(_) => unreachable!("handled above"),
         };
 
+        // Set up the write channel: a single writer task drains L1WriteOps from
+        // all concurrent ScanL1DirExecutors and commits them in large batches,
+        // eliminating per-directory write-transaction contention on SQLite.
+        let (write_tx, write_rx) = tokio::sync::mpsc::channel::<L1WriteOp>(4096);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let mut guard = bucket_state.l1_write_tx.lock().await;
+            *guard = Some(write_tx);
+            let mut done_guard = bucket_state.l1_write_done.lock().await;
+            *done_guard = Some(done_rx);
+        }
+        let metadata_for_writer = bucket_state.metadata.clone();
+        tokio::spawn(async move {
+            run_l1_batch_writer(write_rx, metadata_for_writer).await;
+            let _ = done_tx.send(());
+        });
+
         // Spawn the root directory task as a direct child of this orchestrator.
         // All subdirectory tasks will be spawned as siblings (inheriting this
         // task as their parent) via `spawn_sibling_with` inside ScanL1DirExecutor.
         ctx.spawn_child_with(ScanL1DirTask {
             bucket: task.bucket.clone(),
             dir_prefix: root_dir_prefix,
-            scan_start_ns,
             scope: task.scope.clone(),
         })
         .await
@@ -251,7 +267,23 @@ impl TypedExecutor<ScanL1Task, ScanL1Memo> for ScanL1Executor {
 
         let scan_start_ns = memo.scan_start_ns;
 
-        // 1. Cross-directory move reconciliation (no-op: stale deletion removes
+        // 1. Close the write channel (drop stored Sender) and wait for the batch
+        //    writer to flush all pending ops.  By the time finalize() is called,
+        //    all ScanL1DirExecutor tasks have completed and dropped their own
+        //    Sender clones, so dropping the stored copy here closes the channel.
+        {
+            let mut guard = bucket_state.l1_write_tx.lock().await;
+            *guard = None; // drop stored Sender → channel closes when last clone drops
+        }
+        let done_rx = {
+            let mut guard = bucket_state.l1_write_done.lock().await;
+            guard.take()
+        };
+        if let Some(rx) = done_rx {
+            let _ = rx.await; // wait for writer to flush remaining ops
+        }
+
+        // 2. Cross-directory move reconciliation (no-op: stale deletion removes
         //    old entries before finalize runs; moves result in new object_ids).
         let _moved = bucket_state
             .metadata
@@ -363,11 +395,10 @@ impl TypedExecutor<ScanL1DirTask> for ScanL1DirExecutor {
             ))
         })?;
 
-        let report = levels::scan_l1_dir(
+        let scan = levels::scan_l1_dir(
             &bucket_state.metadata,
             &bucket_state.root,
             &task.dir_prefix,
-            task.scan_start_ns,
             &task.scope,
         )
         .await
@@ -381,22 +412,42 @@ impl TypedExecutor<ScanL1DirTask> for ScanL1DirExecutor {
 
         tracing::debug!(
             dir = %task.dir_prefix,
-            discovered = report.discovered,
-            deleted = report.deleted,
-            unchanged = report.unchanged,
-            subdirs = report.child_dirs.len(),
+            new = scan.new_count,
+            stale = scan.stale_count,
+            unchanged = scan.unchanged,
+            subdirs = scan.child_dirs.len(),
             "L1 dir scan"
         );
+
+        // Send the write op to the shared writer task (only when there is
+        // something to write). Standalone API-submitted tasks (no parent_id)
+        // also send here so their writes are batched the same way.
+        if !scan.write_op.inserts.is_empty() || !scan.write_op.stale_names.is_empty() {
+            let maybe_tx = bucket_state.l1_write_tx.lock().await.clone();
+            if let Some(tx) = maybe_tx {
+                // Channel is large (4096); send is only backpressure if the
+                // writer can't keep up, which slows this worker gracefully.
+                let _ = tx.send(scan.write_op).await;
+            } else {
+                // No channel (standalone mode or Files scope): write directly.
+                if let Err(e) = bucket_state
+                    .metadata
+                    .l1_batch_write(&[scan.write_op])
+                    .await
+                {
+                    tracing::warn!("L1 standalone write failed: {e}");
+                }
+            }
+        }
 
         // Only enqueue children when this task is a BFS child (has a parent_id).
         // Standalone API-submitted tasks have no parent and scan one directory only.
         if ctx.record().parent_id.is_some() {
-            for subdir in report.child_dirs {
+            for subdir in scan.child_dirs {
                 let _ = ctx
                     .spawn_sibling_with(ScanL1DirTask {
                         bucket: task.bucket.clone(),
                         dir_prefix: subdir,
-                        scan_start_ns: task.scan_start_ns,
                         scope: task.scope.clone(),
                     })
                     .await;
@@ -604,6 +655,85 @@ impl TypedExecutor<ScanL3Task> for ScanL3Executor {
         }
 
         Ok(())
+    }
+}
+
+// ── L1 batch writer ───────────────────────────────────────────────────────────
+
+/// Drain `L1WriteOp`s from the channel and commit them in large batches.
+///
+/// Runs as a single background task per bucket per L1 scan, eliminating the
+/// write-lock contention that occurs when N taskmill workers each try to commit
+/// their own per-directory transaction concurrently.
+///
+/// Flushes when the pending row count reaches `MAX_BATCH_ROWS` OR when
+/// `FLUSH_INTERVAL` elapses without a new op — whichever comes first.  Exits
+/// when the channel is closed (all dir-task senders have been dropped).
+async fn run_l1_batch_writer(
+    mut rx: tokio::sync::mpsc::Receiver<L1WriteOp>,
+    metadata: crate::metadata::MetadataStore,
+) {
+    const MAX_BATCH_ROWS: usize = 2_000;
+    const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+    let mut pending: Vec<L1WriteOp> = Vec::new();
+    let mut pending_rows: usize = 0;
+    let mut flush_deadline = tokio::time::Instant::now() + FLUSH_INTERVAL;
+
+    loop {
+        tokio::select! {
+            biased; // prefer draining the channel over the timeout
+            msg = rx.recv() => {
+                match msg {
+                    Some(op) => {
+                        pending_rows += op.inserts.len() + op.stale_names.len();
+                        pending.push(op);
+                        if pending_rows >= MAX_BATCH_ROWS {
+                            l1_flush_batch(&metadata, &mut pending, &mut pending_rows).await;
+                            flush_deadline = tokio::time::Instant::now() + FLUSH_INTERVAL;
+                        }
+                    }
+                    None => break, // all Senders dropped → scan complete
+                }
+            }
+            _ = tokio::time::sleep_until(flush_deadline) => {
+                if !pending.is_empty() {
+                    l1_flush_batch(&metadata, &mut pending, &mut pending_rows).await;
+                }
+                flush_deadline = tokio::time::Instant::now() + FLUSH_INTERVAL;
+            }
+        }
+    }
+
+    // Final flush for any ops that arrived after the last timed flush.
+    if !pending.is_empty() {
+        l1_flush_batch(&metadata, &mut pending, &mut pending_rows).await;
+    }
+}
+
+async fn l1_flush_batch(
+    metadata: &crate::metadata::MetadataStore,
+    pending: &mut Vec<L1WriteOp>,
+    pending_rows: &mut usize,
+) {
+    let ops = std::mem::take(pending);
+    *pending_rows = 0;
+    let total_inserts: usize = ops.iter().map(|o| o.inserts.len()).sum();
+    let total_deletes: usize = ops.iter().map(|o| o.stale_names.len()).sum();
+    if let Err(e) = metadata.l1_batch_write(&ops).await {
+        tracing::error!(
+            dirs = ops.len(),
+            inserts = total_inserts,
+            deletes = total_deletes,
+            "L1 batch write failed: {e}"
+        );
+    } else {
+        tracing::debug!(
+            dirs = ops.len(),
+            inserts = total_inserts,
+            deletes = total_deletes,
+            "L1 batch write committed"
+        );
     }
 }
 

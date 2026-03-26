@@ -963,6 +963,8 @@ impl ShoeboxBuilder {
                             l1_running: AtomicBool::new(false),
                             l1_completed_once: AtomicBool::new(false),
                             l1_failed: AtomicBool::new(false),
+                            l1_write_tx: tokio::sync::Mutex::new(None),
+                            l1_write_done: tokio::sync::Mutex::new(None),
                         },
                     )
                 })

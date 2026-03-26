@@ -249,6 +249,19 @@ pub struct MetadataStore {
     content_types: Arc<RwLock<HashMap<i64, String>>>,
 }
 
+/// Payload produced by one BFS directory scan task.
+///
+/// Sent to the shared write channel for batch-commit by a single writer task,
+/// eliminating concurrent write-transaction contention on the SQLite pool.
+pub struct L1WriteOp {
+    pub dir_id: i64,
+    /// New or changed files to insert (INSERT OR IGNORE).
+    pub inserts: Vec<ObjectRecord>,
+    /// File names that existed in the catalog but were absent on disk —
+    /// computed from `known - seen_names` without a second SELECT.
+    pub stale_names: Vec<String>,
+}
+
 impl MetadataStore {
     /// Open (or create) the metadata database at the given path and run migrations.
     pub async fn new(db_path: &Path) -> Result<Self, S3Error> {
@@ -1776,29 +1789,27 @@ impl MetadataStore {
         Ok(map)
     }
 
-    /// Batch-insert newly discovered files during a BFS per-directory scan.
+    /// Commit a batch of BFS directory-scan results in a single transaction.
     ///
-    /// Uses `INSERT OR IGNORE` — L1 is discovery-only. Files that already exist
-    /// in the catalog (e.g. API-uploaded objects or previously scanned files) are
-    /// silently skipped; their metadata is left untouched for L2 to update later.
-    /// Returns the number of newly inserted rows.
-    pub(crate) async fn l1_upsert_dir_files(
-        &self,
-        records: &[ObjectRecord],
-    ) -> Result<u64, S3Error> {
-        if records.is_empty() {
-            return Ok(0);
+    /// All inserts across every op are combined into chunked multi-value INSERTs
+    /// (≤ 500 rows each). Stale deletes are one `DELETE … IN (…)` per directory.
+    /// Collapsing N per-directory transactions into one eliminates the write-lock
+    /// contention that slows concurrent taskmill workers.
+    pub async fn l1_batch_write(&self, ops: &[L1WriteOp]) -> Result<(), S3Error> {
+        if ops.is_empty() {
+            return Ok(());
         }
 
-        /// Max rows per multi-value INSERT (500 × 12 cols = 6000 params — within
-        /// SQLite's 32766 limit).
-        const CHUNK: usize = 500;
-
-        let mut total = 0u64;
         let mut tx = self.pool.begin().await?;
 
-        for chunk in records.chunks(CHUNK) {
-            let placeholders: String = (0..chunk.len())
+        // ── Inserts: one chunked multi-value INSERT for the whole batch ──────
+        let all_inserts: Vec<&ObjectRecord> =
+            ops.iter().flat_map(|op| op.inserts.iter()).collect();
+
+        const CHUNK: usize = 500; // 500 × 12 cols = 6000 params < SQLite's 32766 limit
+        for chunk in all_inserts.chunks(CHUNK) {
+            let placeholders = chunk
+                .iter()
                 .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1825,53 +1836,32 @@ impl MetadataStore {
                     .bind(obj.created_at)
                     .bind(1i32);
             }
-            let result = query.execute(&mut *tx).await?;
-            total += result.rows_affected();
+            query.execute(&mut *tx).await?;
+        }
+
+        // ── Deletes: one bulk DELETE per directory ────────────────────────────
+        for op in ops {
+            if op.stale_names.is_empty() {
+                continue;
+            }
+            let placeholders = op
+                .stale_names
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "DELETE FROM objects WHERE parent_dir_id = ? AND name IN ({placeholders})"
+            );
+            let mut query = sqlx::query(&sql).bind(op.dir_id);
+            for name in &op.stale_names {
+                query = query.bind(name);
+            }
+            query.execute(&mut *tx).await?;
         }
 
         tx.commit().await?;
-        Ok(total)
-    }
-
-    /// Delete stale objects in one directory that were not seen during the
-    /// current scan pass. Only objects created before `scan_start_ns` are
-    /// considered (concurrent API uploads are excluded).
-    ///
-    /// Returns the number of deleted rows.
-    pub(crate) async fn l1_delete_stale_in_dir(
-        &self,
-        dir_id: i64,
-        seen_names: &std::collections::HashSet<String>,
-        scan_start_ns: i64,
-    ) -> Result<u64, S3Error> {
-        let scan_start = SqliteTimestamp::from_nanos(scan_start_ns);
-        let all: Vec<(String,)> =
-            sqlx::query_as("SELECT name FROM objects WHERE parent_dir_id = ? AND created_at < ?")
-                .bind(dir_id)
-                .bind(scan_start)
-                .fetch_all(&self.pool)
-                .await?;
-
-        let stale: Vec<String> = all
-            .into_iter()
-            .map(|(n,)| n)
-            .filter(|n| !seen_names.contains(n))
-            .collect();
-
-        if stale.is_empty() {
-            return Ok(0);
-        }
-
-        let mut tx = self.pool.begin().await?;
-        for name in &stale {
-            sqlx::query("DELETE FROM objects WHERE parent_dir_id = ? AND name = ?")
-                .bind(dir_id)
-                .bind(name)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(stale.len() as u64)
+        Ok(())
     }
 
     /// Post-scan cross-directory move reconciliation.

@@ -339,14 +339,19 @@ pub async fn scan_l1(
 // ── BFS L1 per-directory scan ──────────────────────────────────────────────
 
 /// Result of a single BFS directory scan task.
-#[derive(Debug, Default)]
-pub struct L1DirReport {
+///
+/// The `write_op` field carries the inserts and stale-deletes for this directory.
+/// The caller (executor) sends it to the shared write channel; the single writer
+/// task commits it in a large batch together with other directories' ops.
+pub struct L1DirScan {
     /// Relative prefixes of immediate subdirectories to enqueue as sibling tasks.
-    /// Each entry is a full dir_prefix (e.g. `"photos/2024/"`).
     pub child_dirs: Vec<String>,
-    pub discovered: u64,
-    pub deleted: u64,
     pub unchanged: u64,
+    /// Estimated new files (= inserts queued; actual rows affected known after commit).
+    pub new_count: u64,
+    /// Estimated stale files (= deletes queued).
+    pub stale_count: u64,
+    pub write_op: crate::metadata::sqlite::L1WriteOp,
 }
 
 /// Scan a single directory for the BFS L1 pass.
@@ -363,9 +368,8 @@ pub async fn scan_l1_dir(
     metadata: &MetadataStore,
     root: &Path,
     dir_prefix: &str,
-    scan_start_ns: i64,
     scope: &ScanScope,
-) -> Result<L1DirReport, S3Error> {
+) -> Result<L1DirScan, S3Error> {
     let dir_path = if dir_prefix.is_empty() {
         root.to_path_buf()
     } else {
@@ -393,7 +397,17 @@ pub async fn scan_l1_dir(
         Ok(rd) => rd,
         Err(e) => {
             tracing::warn!(dir = %dir_path.display(), "L1 dir scan: read_dir failed: {e}");
-            return Ok(L1DirReport::default());
+            return Ok(L1DirScan {
+                child_dirs: Vec::new(),
+                unchanged: 0,
+                new_count: 0,
+                stale_count: 0,
+                write_op: crate::metadata::sqlite::L1WriteOp {
+                    dir_id,
+                    inserts: Vec::new(),
+                    stale_names: Vec::new(),
+                },
+            });
         }
     };
 
@@ -514,19 +528,27 @@ pub async fn scan_l1_dir(
         });
     }
 
-    // Upsert new/changed files
-    let discovered = metadata.l1_upsert_dir_files(&batch).await?;
+    // Compute stale names from the snapshot we already loaded — no second SELECT.
+    // `known` was populated before the directory walk; any file in the catalog
+    // at that moment that we did not see on disk is considered stale.
+    let stale_names: Vec<String> = known
+        .into_keys()
+        .filter(|name| !seen_names.contains(name))
+        .collect();
 
-    // Delete stale objects (files no longer on disk in this directory)
-    let deleted = metadata
-        .l1_delete_stale_in_dir(dir_id, &seen_names, scan_start_ns)
-        .await?;
+    let new_count = batch.len() as u64;
+    let stale_count = stale_names.len() as u64;
 
-    Ok(L1DirReport {
+    Ok(L1DirScan {
         child_dirs,
-        discovered,
-        deleted,
         unchanged,
+        new_count,
+        stale_count,
+        write_op: crate::metadata::sqlite::L1WriteOp {
+            dir_id,
+            inserts: batch,
+            stale_names,
+        },
     })
 }
 
