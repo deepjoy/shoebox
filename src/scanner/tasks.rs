@@ -1,5 +1,6 @@
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use taskmill::{DomainKey, DomainTaskContext, TaskError, TypedExecutor, TypedTask};
@@ -88,6 +89,39 @@ impl TypedTask for ScanL1DirTask {
     }
 }
 
+/// Soft deadline: target wall-clock duration per BFS chunk.  The chunk
+/// yields after this duration PROVIDED the remaining frontier fits in a
+/// single continuation payload.
+const CHUNK_TARGET: Duration = Duration::from_secs(1);
+
+/// Hard deadline: maximum wall-clock duration per chunk.  If the frontier
+/// still exceeds one payload at this point, the chunk yields and splits
+/// (rare — only for extremely wide trees).  Bounds worst-case preemption
+/// latency for REALTIME API tasks.
+const CHUNK_HARD_LIMIT: Duration = Duration::from_secs(5);
+
+/// Byte budget for the `queue` array in each continuation chunk.
+/// 800 KB leaves ~200 KB headroom for the `bucket`, `scope`, and JSON
+/// framing within taskmill's 1 MB payload limit.
+const CHUNK_QUEUE_BYTE_BUDGET: usize = 800_000;
+
+/// A time-boxed BFS chunk.  Scans directories from `queue` for up to
+/// ~1 second, then spawns a continuation chunk with the remaining frontier.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScanL1ChunkTask {
+    pub bucket: String,
+    /// BFS frontier: directory prefixes to scan in this chunk and beyond.
+    pub queue: Vec<String>,
+    pub scope: ScanScope,
+}
+
+impl TypedTask for ScanL1ChunkTask {
+    type Domain = Scanner;
+    const TASK_TYPE: &'static str = "scan-l1-chunk";
+    // No dedup key — chunks are spawned in a controlled sequence by the
+    // orchestrator / previous chunk.  External code never submits these.
+}
+
 /// L2: Collect filesystem metadata (size, mtime, ctime, inode) for objects
 /// that haven't reached scan_level 2 yet.
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,7 +153,7 @@ impl TypedTask for ScanL3Task {
 pub struct ScanL1Executor;
 
 /// `ScanL1Task` orchestrator: records scan_start_ns, spawns the root
-/// `ScanL1DirTask` as a child, then waits.  When all directory children
+/// `ScanL1ChunkTask` as a child, then waits.  When all chunk children
 /// settle, `finalize()` runs orphan cleanup, schedules L2/L3, and marks
 /// the scan as complete.
 impl TypedExecutor<ScanL1Task, ScanL1Memo> for ScanL1Executor {
@@ -203,35 +237,48 @@ impl TypedExecutor<ScanL1Task, ScanL1Memo> for ScanL1Executor {
             let _ = done_tx.send(());
         });
 
-        // Spawn the root directory task as a direct child of this orchestrator.
-        // All subdirectory tasks will be spawned as siblings (inheriting this
-        // task as their parent) via `spawn_sibling_with` inside ScanL1DirExecutor.
-        ctx.spawn_child_with(ScanL1DirTask {
+        // Initialize the chunk counter (1 = the root chunk we're about to spawn).
+        bucket_state
+            .l1_chunks_remaining
+            .store(1, Ordering::Release);
+
+        // Spawn the root BFS chunk as a direct child of this orchestrator.
+        // The chunk will scan directories for ~1 second, then spawn continuation
+        // chunks as siblings (inheriting this task as their parent).
+        ctx.spawn_child_with(ScanL1ChunkTask {
             bucket: task.bucket.clone(),
-            dir_prefix: root_dir_prefix,
+            queue: vec![root_dir_prefix],
             scope: task.scope.clone(),
         })
         .await
-        .map_err(|e| TaskError::new(format!("spawn root dir task failed: {e}")))?;
+        .map_err(|e| TaskError::new(format!("spawn root chunk task failed: {e}")))?;
 
-        // Spawn a lightweight progress reporter that tallies completed dir tasks.
+        // Spawn a lightweight progress reporter that logs periodically on
+        // chunk completions.  Throttled to every 10 chunks to avoid flooding
+        // logs on warm scans where chunks complete in rapid succession.
         let orchestrator_id = ctx.record().id;
+        let bucket_for_reporter = task.bucket.clone();
         let metadata = bucket_state.metadata.clone();
-        let mut event_stream = ctx.domain::<Scanner>().task_events::<ScanL1DirTask>();
+        let chunks_remaining = bucket_state.l1_chunks_remaining.clone();
+        let mut event_stream = ctx.domain::<Scanner>().task_events::<ScanL1ChunkTask>();
         tokio::spawn(async move {
-            let mut dirs_completed = 0u64;
+            let mut chunks_completed = 0u64;
             loop {
                 match event_stream.recv().await {
                     Ok(taskmill::TaskEvent::Completed { record, .. }) => {
                         if record.parent_id == Some(orchestrator_id) {
-                            dirs_completed += 1;
-                            if dirs_completed.is_multiple_of(1000) {
+                            chunks_completed += 1;
+                            if chunks_completed.is_multiple_of(10) {
+                                let remaining =
+                                    chunks_remaining.load(Ordering::Acquire);
                                 let discovered = metadata
                                     .count_objects_since(scan_start_ns)
                                     .await
                                     .unwrap_or(0);
                                 tracing::info!(
-                                    dirs_completed,
+                                    bucket = %bucket_for_reporter,
+                                    chunks_completed,
+                                    chunks_remaining = remaining,
                                     objects_discovered = discovered,
                                     "L1 scan progress"
                                 );
@@ -453,6 +500,179 @@ impl TypedExecutor<ScanL1DirTask> for ScanL1DirExecutor {
                     .await;
             }
         }
+
+        Ok(())
+    }
+}
+
+pub struct ScanL1ChunkExecutor;
+
+/// Execute a time-boxed BFS chunk: scan directories from the frontier,
+/// then spawn a single continuation with the remaining frontier.
+///
+/// Two deadlines govern yielding:
+/// - **Soft deadline** (`CHUNK_TARGET`, 1 s): yield only if the remaining
+///   frontier fits in a single continuation payload.  This keeps the chunk
+///   chain linear (one continuation per chunk) in the common case.
+/// - **Hard deadline** (`CHUNK_HARD_LIMIT`, 5 s): yield unconditionally.
+///   If the frontier still exceeds one payload (extremely wide trees), fall
+///   back to byte-budget splitting.  This caps worst-case preemption latency.
+impl TypedExecutor<ScanL1ChunkTask> for ScanL1ChunkExecutor {
+    async fn execute(
+        &self,
+        task: ScanL1ChunkTask,
+        ctx: DomainTaskContext<'_, Scanner>,
+    ) -> Result<(), TaskError> {
+        let app = ctx
+            .state::<ScanAppState>()
+            .ok_or_else(|| TaskError::new("ScanAppState not set"))?;
+
+        let bucket_state = app.buckets.get(&task.bucket).ok_or_else(|| {
+            TaskError::new(format!(
+                "bucket '{}' not found in ScanAppState",
+                task.bucket
+            ))
+        })?;
+
+        let ScanL1ChunkTask {
+            bucket,
+            queue: initial_queue,
+            scope,
+        } = task;
+        let mut queue: VecDeque<String> = initial_queue.into();
+        // Track estimated serialized byte size of the queue incrementally
+        // so we can check the payload-fits condition without iterating.
+        let mut queue_bytes: usize = queue.iter().map(|p| p.len() + 4).sum();
+        let now = Instant::now();
+        let soft_deadline = now + CHUNK_TARGET;
+        let hard_deadline = now + CHUNK_HARD_LIMIT;
+        let mut dirs_scanned: u64 = 0;
+        let mut dirs_failed: u64 = 0;
+
+        // Clone the write-channel sender once for the entire chunk rather
+        // than re-acquiring the mutex on every directory iteration.
+        let write_tx = bucket_state.l1_write_tx.lock().await.clone();
+
+        while let Some(prefix) = queue.pop_front() {
+            queue_bytes -= prefix.len() + 4;
+
+            let scan = match levels::scan_l1_dir(
+                &bucket_state.metadata,
+                &bucket_state.root,
+                &prefix,
+                &scope,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    // Log and skip — a single directory failure (e.g.
+                    // permission denied) must not kill the entire chunk.
+                    tracing::warn!(dir = %prefix, "L1 dir scan failed, skipping: {e}");
+                    dirs_failed += 1;
+                    continue;
+                }
+            };
+
+            // Send write op to the shared batch writer (same channel as before).
+            if !scan.write_op.inserts.is_empty() || !scan.write_op.stale_names.is_empty() {
+                if let Some(ref tx) = write_tx {
+                    let _ = tx.send(scan.write_op).await;
+                }
+            }
+
+            // BFS expansion: discovered subdirs join the frontier.
+            for dir in scan.child_dirs {
+                queue_bytes += dir.len() + 4;
+                queue.push_back(dir);
+            }
+            dirs_scanned += 1;
+
+            // Yield decision — two-level deadline:
+            if !queue.is_empty() {
+                let now = Instant::now();
+                if now >= hard_deadline {
+                    break;
+                }
+                if now >= soft_deadline && queue_bytes <= CHUNK_QUEUE_BYTE_BUDGET {
+                    break;
+                }
+            }
+        }
+
+        tracing::debug!(
+            dirs_scanned,
+            dirs_failed,
+            remaining = queue.len(),
+            queue_bytes,
+            "L1 chunk complete"
+        );
+
+        // Spawn continuation(s) with remaining frontier and update the
+        // chunks-remaining counter for progress reporting.
+        let mut continuations_spawned = 0u64;
+        if !queue.is_empty() {
+            if queue_bytes <= CHUNK_QUEUE_BYTE_BUDGET {
+                // Common case: single continuation (linear chain).
+                ctx.spawn_sibling_with(ScanL1ChunkTask {
+                    bucket: bucket.clone(),
+                    queue: queue.into_iter().collect(),
+                    scope: scope.clone(),
+                })
+                .await
+                .map_err(|e| TaskError::new(format!("spawn continuation chunk: {e}")))?;
+                continuations_spawned = 1;
+            } else {
+                // Rare fallback (hard deadline hit on extremely wide tree):
+                // split into the minimum number of continuations that fit.
+                let mut chunk_queue: Vec<String> = Vec::new();
+                let mut chunk_bytes: usize = 0;
+
+                for path in queue {
+                    let entry_bytes = path.len() + 4;
+                    if !chunk_queue.is_empty()
+                        && chunk_bytes + entry_bytes > CHUNK_QUEUE_BYTE_BUDGET
+                    {
+                        ctx.spawn_sibling_with(ScanL1ChunkTask {
+                            bucket: bucket.clone(),
+                            queue: std::mem::take(&mut chunk_queue),
+                            scope: scope.clone(),
+                        })
+                        .await
+                        .map_err(|e| {
+                            TaskError::new(format!("spawn continuation chunk: {e}"))
+                        })?;
+                        continuations_spawned += 1;
+                        chunk_bytes = 0;
+                    }
+                    chunk_bytes += entry_bytes;
+                    chunk_queue.push(path);
+                }
+
+                if !chunk_queue.is_empty() {
+                    ctx.spawn_sibling_with(ScanL1ChunkTask {
+                        bucket: bucket.clone(),
+                        queue: chunk_queue,
+                        scope: scope.clone(),
+                    })
+                    .await
+                    .map_err(|e| TaskError::new(format!("spawn continuation chunk: {e}")))?;
+                    continuations_spawned += 1;
+                }
+            }
+        }
+
+        // Update counter: +continuations spawned, −1 for this chunk completing.
+        // A single fetch_add(spawned - 1) would underflow when spawned == 0,
+        // so split into two operations.
+        if continuations_spawned > 0 {
+            bucket_state
+                .l1_chunks_remaining
+                .fetch_add(continuations_spawned, Ordering::Relaxed);
+        }
+        bucket_state
+            .l1_chunks_remaining
+            .fetch_sub(1, Ordering::Release);
 
         Ok(())
     }

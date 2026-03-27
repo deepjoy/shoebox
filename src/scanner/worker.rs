@@ -47,6 +47,7 @@ pub async fn run_watch_processor(
                             target_level: 3,
                         })
                         .priority(taskmill::Priority::BACKGROUND)
+                        .fail_fast(false)
                         .await;
                 }
             }

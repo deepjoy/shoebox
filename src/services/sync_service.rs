@@ -22,6 +22,7 @@ pub async fn sync(scheduler: &taskmill::Scheduler, bucket: &str) -> Result<(), S
             target_level: 2,
         })
         .priority(taskmill::Priority::HIGH)
+        .fail_fast(false)
         .await
         .map_err(|_| S3Error::InternalError)?;
 

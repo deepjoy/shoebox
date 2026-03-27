@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::Arc;
 
 use crate::metadata::sqlite::L1WriteOp;
 use crate::metadata::MetadataStore;
@@ -29,6 +30,12 @@ pub struct BucketScanState {
     /// Set to `true` if L1 scan fails permanently (non-retryable error).
     /// Used by `Shoebox::wait_for_initial_scan()` to avoid hanging forever.
     pub l1_failed: AtomicBool,
+
+    /// Number of L1 chunk tasks that are pending or running.  Set to 1 by the
+    /// orchestrator before spawning the initial chunk.  Each chunk executor
+    /// increments for continuations spawned and decrements for itself on
+    /// completion.  Read by the progress reporter for logging.
+    pub l1_chunks_remaining: Arc<AtomicU64>,
 
     /// Write channel set by `ScanL1Executor::execute()` for the duration of a
     /// bucket-wide L1 scan.  Each `ScanL1DirExecutor` clones the sender and

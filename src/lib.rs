@@ -30,8 +30,8 @@ use crate::scanner::backpressure::ScannerResources;
 use crate::scanner::levels;
 use crate::scanner::scope::ScanScope;
 use crate::scanner::tasks::{
-    ScanL1DirExecutor, ScanL1DirTask, ScanL1Executor, ScanL1Task, ScanL2Executor, ScanL2Task,
-    ScanL3Executor, ScanL3Task, Scanner,
+    ScanL1ChunkExecutor, ScanL1ChunkTask, ScanL1DirExecutor, ScanL1DirTask, ScanL1Executor,
+    ScanL1Task, ScanL2Executor, ScanL2Task, ScanL3Executor, ScanL3Task, Scanner,
 };
 use crate::scanner::watcher::{self as watcher_mod, FilesystemWatcher};
 use crate::scanner::worker;
@@ -71,6 +71,7 @@ pub fn register_scan_executors(builder: taskmill::SchedulerBuilder) -> taskmill:
             taskmill::Domain::<Scanner>::new()
                 .task_memo::<ScanL1Task, _>(ScanL1Executor)
                 .task::<ScanL1DirTask>(ScanL1DirExecutor)
+                .task::<ScanL1ChunkTask>(ScanL1ChunkExecutor)
                 .task::<ScanL2Task>(ScanL2Executor)
                 .task::<ScanL3Task>(ScanL3Executor)
                 .default_priority(taskmill::Priority::BACKGROUND)
@@ -371,11 +372,12 @@ impl Shoebox {
         let b = self.get_bucket(bucket)?;
         b.scheduler
             .domain::<Scanner>()
-            .submit(ScanL1Task {
+            .submit_with(ScanL1Task {
                 bucket: bucket.to_string(),
                 scope: ScanScope::Bucket,
                 target_level,
             })
+            .fail_fast(false)
             .await
             .map_err(|_| S3Error::InternalError)?;
         Ok(())
@@ -963,6 +965,7 @@ impl ShoeboxBuilder {
                             l1_running: AtomicBool::new(false),
                             l1_completed_once: AtomicBool::new(false),
                             l1_failed: AtomicBool::new(false),
+                            l1_chunks_remaining: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                             l1_write_tx: tokio::sync::Mutex::new(None),
                             l1_write_done: tokio::sync::Mutex::new(None),
                         },
@@ -993,6 +996,7 @@ impl ShoeboxBuilder {
                         taskmill::Domain::<Scanner>::new()
                             .task_memo::<ScanL1Task, _>(ScanL1Executor)
                             .task::<ScanL1DirTask>(ScanL1DirExecutor)
+                            .task::<ScanL1ChunkTask>(ScanL1ChunkExecutor)
                             .task::<ScanL2Task>(ScanL2Executor)
                             .task::<ScanL3Task>(ScanL3Executor)
                             .max_concurrency(1),
@@ -1023,11 +1027,12 @@ impl ShoeboxBuilder {
             tracing::info!(bucket = %r.name, "L1 scan scheduled (background)");
             let _ = scheduler
                 .domain::<Scanner>()
-                .submit(ScanL1Task {
+                .submit_with(ScanL1Task {
                     bucket: r.name.clone(),
                     scope: ScanScope::Bucket,
                     target_level: 3,
                 })
+                .fail_fast(false)
                 .await;
 
             // Start filesystem watcher
@@ -1101,6 +1106,7 @@ impl ShoeboxBuilder {
                                             target_level: 2,
                                         })
                                         .priority(taskmill::Priority::BACKGROUND)
+                                        .fail_fast(false)
                                         .await;
                                 }
                             });

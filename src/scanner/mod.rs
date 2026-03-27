@@ -11,5 +11,6 @@ pub use backpressure::ScannerResources;
 pub use levels::{L1Report, L2Report, L3Report};
 pub use scope::ScanScope;
 pub use tasks::{
-    ScanL1Executor, ScanL1Task, ScanL2Executor, ScanL2Task, ScanL3Executor, ScanL3Task,
+    ScanL1ChunkExecutor, ScanL1ChunkTask, ScanL1Executor, ScanL1Task, ScanL2Executor, ScanL2Task,
+    ScanL3Executor, ScanL3Task,
 };
