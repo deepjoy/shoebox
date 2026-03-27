@@ -99,7 +99,7 @@ async fn verify_file(root: &Path, record: &ObjectRecord) -> Result<(), Discrepan
     let current_mtime: Option<crate::metadata::sqlite::SqliteTimestamp> = fs_meta
         .modified()
         .ok()
-        .map(time::OffsetDateTime::from)
+        .and_then(crate::scanner::levels::system_time_to_odt)
         .map(crate::metadata::sqlite::SqliteTimestamp);
 
     let mtime_changed = record.file_mtime != current_mtime;

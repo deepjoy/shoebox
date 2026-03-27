@@ -128,7 +128,7 @@ async fn handle_file_changed(
         let current_mtime: Option<crate::metadata::sqlite::SqliteTimestamp> = fs_meta
             .modified()
             .ok()
-            .map(time::OffsetDateTime::from)
+            .and_then(crate::scanner::levels::system_time_to_odt)
             .map(crate::metadata::sqlite::SqliteTimestamp);
         let current_size = fs_meta.len() as i64;
 

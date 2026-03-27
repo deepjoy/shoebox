@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::SystemTime;
 
 use async_walkdir::{Filtering, WalkDir};
 use base64::Engine;
@@ -13,6 +14,19 @@ use crate::config::SHOEBOX_DIR;
 use crate::error::S3Error;
 use crate::metadata::sqlite::{L3HashUpdate, ObjectMetadataUpdate, ObjectRecord, SqliteTimestamp};
 use crate::metadata::MetadataStore;
+
+/// Convert a `SystemTime` to `OffsetDateTime` without panicking.
+///
+/// `time::OffsetDateTime::from(SystemTime)` panics on overflow (e.g. corrupt
+/// timestamps, far-future dates).  This helper goes through
+/// `from_unix_timestamp_nanos` which returns `Result` instead.
+pub fn system_time_to_odt(t: SystemTime) -> Option<time::OffsetDateTime> {
+    let nanos: i128 = match t.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i128,
+        Err(e) => -(e.duration().as_nanos() as i128),
+    };
+    time::OffsetDateTime::from_unix_timestamp_nanos(nanos).ok()
+}
 use crate::scanner::platform;
 use crate::scanner::scope::ScanScope;
 use crate::services::duplicates_service;
@@ -592,8 +606,8 @@ pub async fn scan_l2(
         let (inode, device_id) = platform::file_identity(&fs_meta);
 
         let size = fs_meta.len() as i64;
-        let file_mtime = fs_meta.modified().ok().map(time::OffsetDateTime::from);
-        let file_ctime = fs_meta.created().ok().map(time::OffsetDateTime::from);
+        let file_mtime = fs_meta.modified().ok().and_then(system_time_to_odt);
+        let file_ctime = fs_meta.created().ok().and_then(system_time_to_odt);
 
         let update = ObjectMetadataUpdate {
             size,
