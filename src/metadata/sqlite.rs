@@ -836,6 +836,14 @@ impl MetadataStore {
 
     /// Gracefully close the metadata store, flushing WAL to the main database.
     pub async fn close(&self) {
+        // Explicitly checkpoint and truncate the WAL before closing.
+        // pool.close() alone only passively checkpoints which may leave WAL files behind.
+        if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await
+        {
+            tracing::warn!("WAL checkpoint failed during shutdown: {e}");
+        }
         self.pool.close().await;
     }
 
