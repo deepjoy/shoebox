@@ -2547,9 +2547,9 @@ dependencies = [
 
 [[package]]
 name = "taskmill"
-version = "0.6.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4bed5675d4bd340cf473e83a04c76971beb32969c8e38f88528f7c041d412c9"
+checksum = "59ab6a0518d1171c61e1fab95c3985cb30f86d65c98ff4662ea028375f5ac3ce"
 dependencies = [
  "chrono",
  "fastrand",
