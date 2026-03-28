@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/deepjoy/shoebox/compare/v0.6.1...v0.6.2) - 2026-03-28
+
+### Fixed
+
+- explicitly checkpoint WAL on shutdown to ensure consolidation ([#105](https://github.com/deepjoy/shoebox/pull/105))
+
+### Other
+
+- update taskmill from 0.6 to 0.7.1 ([#103](https://github.com/deepjoy/shoebox/pull/103))
+
 ## [0.6.1](https://github.com/deepjoy/shoebox/compare/v0.6.0...v0.6.1) - 2026-03-21
 
 ### Other
